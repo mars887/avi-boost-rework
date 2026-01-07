@@ -1,8 +1,11 @@
+import com.google.gson.Gson
+import utils.SummaryRow
 import utils.enterNumbers
 import utils.summarizeTracksWithPython
 import java.io.File
 
 val videoExtensions = listOf("mp4", "mkv")
+private val gson = Gson()
 
 fun runMain(args: Array<String>) {
     println("Enter file or directory path:")
@@ -35,18 +38,42 @@ fun runMain(args: Array<String>) {
 
     val tracksSummary = summarizeTracksWithPython(
         Paths.PYTHON_EXE,
-        Paths.FILE_TRACKS_INFO_PY,
+        resolveFileTracksInfoPath(),
         videoFiles.map { it.toString() }
     )
+
 
     println("\nTracks summary:")
     tracksSummary.forEach {
         println("  ${it.first}")
     }
 
+    val result = openTrackConfigGui(
+        pythonExe = Paths.PYTHON_EXE,
+        scriptPath = resolveTrackConfigGuiPath(),
+        files = videoFiles,
+        summary = tracksSummary
+    )
+    if (result.isEmpty()) {
+        println("No GUI result received.")
+        return
+    }
+    result.forEach {
+        println(it.key)
+        it.value.forEach {
+            if(it.trackStatus != TrackStatus.SKIP) {
+                println("  ${it.trackId} - ${it.trackStatus}: ${it.trackMux} -> ${it.trackParam}")
+            } else {
+                println("   ${it.trackId} - ${it.trackStatus}")
+            }
+        }
+    }
+}
 
-    val result = mutableMapOf<String, List<TrackInFile>>
-    // open config gui
+enum class TrackStatus {
+    COPY,
+    EDIT,
+    SKIP
 }
 
 data class TrackInFile(
@@ -55,4 +82,139 @@ data class TrackInFile(
     val trackStatus: TrackStatus,
     val trackParam: Map<String, String>,
     val trackMux: Map<String, String>,
+)
+
+private fun resolveTrackConfigGuiPath(): String {
+    val direct = File(Paths.TRACK_CONFIG_GUI_PY)
+    if (direct.exists()) {
+        return direct.absolutePath
+    }
+    val fallback = File("src/main/java/${Paths.TRACK_CONFIG_GUI_PY}")
+    if (fallback.exists()) {
+        return fallback.absolutePath
+    }
+    error("track_config_gui.py not found. Checked: ${direct.path}, ${fallback.path}")
+}
+
+private fun resolveFileTracksInfoPath(): String {
+    val local = File("utils/file-tracks-info.py")
+    if (local.exists()) {
+        return local.absolutePath
+    }
+    val fallback = File("src/main/java/utils/file-tracks-info.py")
+    if (fallback.exists()) {
+        return fallback.absolutePath
+    }
+    val direct = File(Paths.FILE_TRACKS_INFO_PY)
+    if (direct.exists()) {
+        return direct.absolutePath
+    }
+    error(
+        "file-tracks-info.py not found. Checked: ${local.path}, ${fallback.path}, ${direct.path}"
+    )
+}
+
+private fun openTrackConfigGui(
+    pythonExe: String,
+    scriptPath: String,
+    files: List<File>,
+    summary: List<Pair<String, SummaryRow>>
+): Map<String, List<TrackInFile>> {
+    val inputJson = gson.toJson(buildGuiInput(files, summary))
+    val cmd = listOf(pythonExe, scriptPath)
+    val process = ProcessBuilder(cmd)
+        .redirectErrorStream(false)
+        .apply {
+            environment()["PYTHONIOENCODING"] = "utf-8"
+            environment()["PYTHONUTF8"] = "1"
+        }
+        .start()
+
+    process.outputStream.use { stream ->
+        stream.write(inputJson.toByteArray(Charsets.UTF_8))
+    }
+
+    val stdout = process.inputStream.bufferedReader(Charsets.UTF_8).readText()
+    val stderr = process.errorStream.bufferedReader(Charsets.UTF_8).readText()
+    val exitCode = process.waitFor()
+    if (exitCode != 0) {
+        error("Track config GUI failed with code $exitCode\n$stderr")
+    }
+
+    if (stdout.isBlank()) {
+        return emptyMap()
+    }
+
+    val output = runCatching { gson.fromJson(stdout, GuiOutput::class.java) }
+        .getOrElse { error("Invalid JSON output: ${it.message}") }
+    val status = output?.status ?: "ok"
+    if (status.lowercase() != "ok") {
+        return emptyMap()
+    }
+
+    val resultAny = output?.result ?: return emptyMap()
+    return parseGuiResult(resultAny)
+}
+
+private fun buildGuiInput(
+    files: List<File>,
+    summary: List<Pair<String, SummaryRow>>
+): GuiInput {
+    val fileList = files.map { it.toString() }
+    val summaryRows = summary.map { (line, row) ->
+        GuiSummaryRow(
+            line = line,
+            index = row.index,
+            type = row.type,
+            displayName = row.displayName,
+            lang = row.lang,
+            presentIn = row.presentIn.sorted()
+        )
+    }
+    return GuiInput(fileList, summaryRows)
+}
+
+private fun parseGuiResult(resultAny: Map<String, List<GuiTrackEntry>>): Map<String, List<TrackInFile>> {
+    val result = mutableMapOf<String, List<TrackInFile>>()
+    for ((fileKeyAny, trackListAny) in resultAny) {
+        val tracks = trackListAny.map { entry ->
+            val status = TrackStatus.valueOf(entry.trackStatus.uppercase())
+            TrackInFile(
+                entry.fileIndex,
+                entry.trackId,
+                status,
+                entry.trackParam ?: emptyMap(),
+                entry.trackMux ?: emptyMap()
+            )
+        }
+        result[fileKeyAny] = tracks
+    }
+    return result
+}
+
+private data class GuiSummaryRow(
+    val line: String,
+    val index: Int,
+    val type: String,
+    val displayName: String,
+    val lang: String,
+    val presentIn: List<Int>
+)
+
+private data class GuiInput(
+    val files: List<String>,
+    val summary: List<GuiSummaryRow>
+)
+
+private data class GuiOutput(
+    val status: String?,
+    val result: Map<String, List<GuiTrackEntry>>?
+)
+
+private data class GuiTrackEntry(
+    val fileIndex: Int,
+    val trackId: Int,
+    val trackStatus: String,
+    val trackParam: Map<String, String>?,
+    val trackMux: Map<String, String>?
 )

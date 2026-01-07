@@ -36,9 +36,13 @@ fun summarizeTracksWithPython(
 
     val process = ProcessBuilder(cmd)
         .redirectErrorStream(true)
+        .apply {
+            environment()["PYTHONIOENCODING"] = "utf-8"
+            environment()["PYTHONUTF8"] = "1"
+        }
         .start()
 
-    val output = process.inputStream.bufferedReader().use(BufferedReader::readText)
+    val output = process.inputStream.bufferedReader(Charsets.UTF_8).use(BufferedReader::readText)
     val exitCode = process.waitFor()
     if (exitCode != 0) {
         throw IllegalStateException("Python exited with code $exitCode\n$output")
