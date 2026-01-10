@@ -5,7 +5,7 @@ import kotlin.collections.forEach
 
 data class RawTrack(
     val fileIndex: Int,   // 1-based file index
-    val ffIndex: Int,     // ffprobe stream index
+    val trackId: Int,     // mkvmerge track id
     val type: String,     // "Video", "Audio", "Subtitle", ...
     val title: String,
     val language: String,
@@ -80,7 +80,7 @@ fun parseTracksFromScriptOutput(
         if (parts.size < 4) return@forEach
 
         val type = parts[0]                  // "Video" | "Audio" | "Subtitle" ...
-        val idx = parts[1].toIntOrNull() ?: return@forEach
+        val trackId = parts[1].toIntOrNull() ?: return@forEach
         val title = parts[2]
         val lang = parts[3]
 
@@ -89,9 +89,12 @@ fun parseTracksFromScriptOutput(
             return@forEach
         }
 
-        if(type != "attachment") result += RawTrack(
+        if (type.equals("attachment", ignoreCase = true)) {
+            return@forEach
+        }
+        result += RawTrack(
             fileIndex = currentFileIndex, // make it 1-based
-            ffIndex = idx,
+            trackId = trackId,
             type = type,
             title = title,
             language = lang
@@ -139,12 +142,12 @@ fun buildSummary(
 
     data class TrackKey(val type: String, val ident: String, val lang: String)
 
-    // Build trackKey -> (fileIndex -> ffIndex)
+    // Build trackKey -> (fileIndex -> trackId)
     val trackMap = mutableMapOf<TrackKey, MutableMap<Int, Int>>()
     for (t in tracks) {
         val key = TrackKey(t.type, identFor(t), t.language)
         val byFile = trackMap.getOrPut(key) { mutableMapOf() }
-        byFile[t.fileIndex] = t.ffIndex
+        byFile[t.fileIndex] = t.trackId
     }
 
     // Anchored tracks: present in ALL files and always at the same index.
@@ -164,8 +167,8 @@ fun buildSummary(
     val shiftingIndexMap: Map<TrackKey, Set<Int>> =
         shiftingKeys.associateWith { key -> trackMap[key]!!.values.toSet() }
 
-    // Group tracks by ffIndex
-    val tracksByIndex: Map<Int, List<RawTrack>> = tracks.groupBy { it.ffIndex }
+    // Group tracks by trackId
+    val tracksByIndex: Map<Int, List<RawTrack>> = tracks.groupBy { it.trackId }
     val allIndexes = tracksByIndex.keys.sorted()
 
     // Decide which indexes are starred

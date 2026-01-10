@@ -160,6 +160,9 @@ def build_results(files, tracks_by_file, settings):
                 {
                     "fileIndex": file_index,
                     "trackId": track["track_id"],
+                    "type": track.get("type") or "",
+                    "origName": track.get("name") or "",
+                    "origLang": track.get("lang") or "",
                     "trackStatus": mode,
                     "trackParam": track_param,
                     "trackMux": track_mux,

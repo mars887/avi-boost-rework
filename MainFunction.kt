@@ -79,6 +79,9 @@ enum class TrackStatus {
 data class TrackInFile(
     val fileIndex: Int,
     val trackId: Int,
+    val type: String,
+    val origName: String,
+    val origLang: String,
     val trackStatus: TrackStatus,
     val trackParam: Map<String, String>,
     val trackMux: Map<String, String>,
@@ -182,6 +185,9 @@ private fun parseGuiResult(resultAny: Map<String, List<GuiTrackEntry>>): Map<Str
             TrackInFile(
                 entry.fileIndex,
                 entry.trackId,
+                entry.type ?: "",
+                entry.origName ?: "",
+                entry.origLang ?: "",
                 status,
                 entry.trackParam ?: emptyMap(),
                 entry.trackMux ?: emptyMap()
@@ -214,6 +220,9 @@ private data class GuiOutput(
 private data class GuiTrackEntry(
     val fileIndex: Int,
     val trackId: Int,
+    val type: String?,
+    val origName: String?,
+    val origLang: String?,
     val trackStatus: String,
     val trackParam: Map<String, String>?,
     val trackMux: Map<String, String>?

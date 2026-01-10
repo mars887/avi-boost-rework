@@ -7,14 +7,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-def run_ffprobe(path: Path) -> Optional[Dict[str, Any]]:
-    """Run ffprobe and return parsed JSON, or None on error."""
+def run_mkvmerge(path: Path) -> Optional[Dict[str, Any]]:
+    """Run mkvmerge and return parsed JSON, or None on error."""
     cmd = [
-        "ffprobe",
-        "-v", "error",
-        "-print_format", "json",
-        "-show_streams",
-        "-show_format",
+        "mkvmerge",
+        "-J",
         str(path),
     ]
     try:
@@ -28,7 +25,10 @@ def run_ffprobe(path: Path) -> Optional[Dict[str, Any]]:
             check=False,
         )
     except FileNotFoundError:
-        print("Error: ffprobe not found. Make sure FFmpeg/ffprobe is in PATH.", file=sys.stderr)
+        print(
+            "Error: mkvmerge not found. Make sure MKVToolNix/mkvmerge is in PATH.",
+            file=sys.stderr,
+        )
         return None
 
     if result.returncode != 0:
@@ -38,7 +38,7 @@ def run_ffprobe(path: Path) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as e:
-        print(f"Error parsing ffprobe JSON for {path}: {e}", file=sys.stderr)
+        print(f"Error parsing mkvmerge JSON for {path}: {e}", file=sys.stderr)
         return None
 
 
@@ -53,88 +53,84 @@ def safe_get(d: Dict[str, Any], *keys, default=None):
 
 
 def normalize_language(lang: Optional[str]) -> str:
-    if not lang or lang.upper() == "N/A":
+    if not lang or str(lang).upper() == "N/A":
         return "und"
-    return lang
+    return str(lang)
 
 
 def normalize_title(title: Optional[str]) -> str:
-    if not title or title.upper() == "N/A":
+    if not title or str(title).upper() == "N/A":
         return "-"
-    return title
+    return str(title)
 
 
-def pick_bitrate(stream: Dict[str, Any]) -> str:
+def pick_bitrate(props: Dict[str, Any]) -> str:
     """
-    Try to get bitrate:
-    - stream["bit_rate"]
-    - stream["tags"]["BPS"]
+    Try to get bitrate from mkvmerge properties.
     Return human-readable kb/s if possible, otherwise 'N/A'.
     """
-    bit_rate = stream.get("bit_rate")
-    if not bit_rate or str(bit_rate).upper() == "N/A":
-        bit_rate = safe_get(stream, "tags", "BPS")
-
+    bit_rate = props.get("bit_rate") or props.get("audio_bit_rate")
     if not bit_rate or str(bit_rate).upper() == "N/A":
         return "N/A"
 
-    # Convert to kb/s if possible
     try:
-        br_int = int(bit_rate)
+        br_int = int(float(bit_rate))
         kbps = br_int / 1000.0
-        # Format like "123 kb/s"
         return f"{kbps:.0f} kb/s"
     except (TypeError, ValueError):
-        # Just return raw value
         return str(bit_rate)
 
 
-def track_type_from_codec(codec_type: Optional[str]) -> str:
-    if codec_type == "video":
+def track_type_from_mkv(track_type: Optional[str]) -> str:
+    if not track_type:
+        return "Unknown"
+    lowered = track_type.strip().lower()
+    if lowered == "video":
         return "Video"
-    if codec_type == "audio":
+    if lowered == "audio":
         return "Audio"
-    if codec_type == "subtitle":
+    if lowered in ("subtitle", "subtitles"):
         return "Subtitle"
-    if codec_type:
-        return codec_type
-    return "Unknown"
+    return track_type
 
 
-def build_extra_info(stream: Dict[str, Any]) -> str:
-    codec_type = stream.get("codec_type")
+def build_extra_info(track_type: str, props: Dict[str, Any]) -> str:
+    lowered = (track_type or "").strip().lower()
 
-    if codec_type == "video":
-        width = stream.get("width")
-        height = stream.get("height")
-        # r_frame_rate may be "24000/1001"
-        fps_str = stream.get("r_frame_rate")
-        fps_human = None
-        if fps_str and fps_str != "0/0":
+    if lowered == "video":
+        dims = props.get("display_dimensions")
+        if not dims:
+            width = props.get("pixel_width") or props.get("display_width")
+            height = props.get("pixel_height") or props.get("display_height")
+            if width and height:
+                dims = f"{width}x{height}"
+
+        fps = None
+        default_duration = props.get("default_duration")
+        if default_duration:
             try:
-                num, den = fps_str.split("/")
-                fps_val = float(num) / float(den)
-                fps_human = f"{fps_val:.3f}fps"
-            except Exception:
-                fps_human = fps_str
+                fps_val = 1_000_000_000 / float(default_duration)
+                fps = f"@ {fps_val:.3f}fps"
+            except (TypeError, ValueError, ZeroDivisionError):
+                fps = None
 
         parts: List[str] = []
-        if width and height:
-            parts.append(f"{width}x{height}")
-        if fps_human:
-            parts.append(f"@ {fps_human}")
+        if dims:
+            parts.append(str(dims))
+        if fps:
+            parts.append(fps)
         return " ".join(parts) if parts else ""
 
-    if codec_type == "audio":
-        sample_rate = stream.get("sample_rate")
-        channels = stream.get("channels")
-        ch_layout = stream.get("channel_layout")
+    if lowered == "audio":
+        sample_rate = props.get("audio_sampling_frequency")
+        channels = props.get("audio_channels")
+        ch_layout = props.get("audio_channel_layout")
 
-        parts: List[str] = []
+        parts = []
         if sample_rate:
             try:
-                parts.append(f"{int(sample_rate)} Hz")
-            except ValueError:
+                parts.append(f"{int(float(sample_rate))} Hz")
+            except (TypeError, ValueError):
                 parts.append(f"{sample_rate} Hz")
         if channels:
             parts.append(f"{channels} ch")
@@ -142,38 +138,41 @@ def build_extra_info(stream: Dict[str, Any]) -> str:
             parts.append(f"({ch_layout})")
         return ", ".join(parts) if parts else ""
 
-    if codec_type == "subtitle":
+    if lowered in ("subtitle", "subtitles"):
         return "subtitle"
 
     return ""
 
 
 def print_file_info(path: Path):
-    data = run_ffprobe(path)
+    data = run_mkvmerge(path)
     if data is None:
         return
 
     print(f"=== {path} ===")
 
-    streams = data.get("streams", [])
-    if not streams:
-        print("No streams found")
+    tracks = data.get("tracks") or []
+    if not tracks:
+        print("No tracks found")
         return
 
-    for stream in streams:
-        codec_type = stream.get("codec_type")
-        track_type = track_type_from_codec(codec_type)
-        idx = stream.get("index", "-")
+    for track in tracks:
+        raw_type = track.get("type") or ""
+        track_type = track_type_from_mkv(raw_type)
+        if raw_type.strip().lower() == "attachment":
+            continue
 
-        tags = stream.get("tags", {}) or {}
-        title = normalize_title(tags.get("title"))
-        lang = normalize_language(tags.get("language"))
+        idx = track.get("id", "-")
+        props = track.get("properties") or {}
 
-        bitrate = pick_bitrate(stream)
-        is_default = safe_get(stream, "disposition", "default", default=0)
+        title = normalize_title(props.get("track_name") or props.get("name"))
+        lang = normalize_language(props.get("language") or props.get("language_ietf"))
 
-        codec_name = stream.get("codec_name", "-")
-        extra = build_extra_info(stream)
+        bitrate = pick_bitrate(props)
+        is_default = 1 if props.get("default_track") else 0
+
+        codec_name = track.get("codec") or props.get("codec_name") or props.get("codec_id") or "-"
+        extra = build_extra_info(raw_type, props)
 
         # Final line:
         # {trackType} | {id} | {Title} | {language} | {bitrate} | {isDefault} | {codec} | {extraInfo}
@@ -187,7 +186,7 @@ def print_file_info(path: Path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Print stream info for media files using ffprobe."
+        description="Print track info for media files using mkvmerge."
     )
     parser.add_argument(
         "files",
