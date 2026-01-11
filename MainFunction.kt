@@ -1,4 +1,5 @@
 import com.google.gson.Gson
+import utils.BdremBatGenerator
 import utils.SummaryRow
 import utils.enterNumbers
 import utils.summarizeTracksWithPython
@@ -68,6 +69,16 @@ fun runMain(args: Array<String>) {
             }
         }
     }
+    val gen = BdremBatGenerator(
+        pythonExe = Paths.PYTHON_EXE,          // подставьте ваш путь
+        pipelineDir = "C:\\projects\\PBBatchProcessUtil\\src\\main\\java\\utils"           // где лежат demux.py/mux.py/verify.py/...
+    )
+
+    for ((filePath, trackList) in result) {
+        val bat = gen.generateBat(filePath, trackList)
+        println("Generated: ${bat.absolutePath}")
+    }
+
 }
 
 enum class TrackStatus {
@@ -174,7 +185,21 @@ private fun buildGuiInput(
             presentIn = row.presentIn.sorted()
         )
     }
-    return GuiInput(fileList, summaryRows)
+    return GuiInput(fileList, summaryRows, buildGuiDefaults())
+}
+
+private fun buildGuiDefaults(): GuiDefaults {
+    return GuiDefaults(
+        params = "--variance-boost-strength 2 --variance-octile 6 --variance-boost-curve 3 --tune 0 --qm-min 7 --chroma-qm-min 10 --scm 0 --enable-dlf 2 --sharp-tx 1 --enable-restoration 0 --color-primaries 9 --transfer-characteristics 16 --matrix-coefficients 9 --lp 3 --sharpness 1 --hbd-mds 1 --ac-bias 2.00",
+        lastParams = "--film-grain 14 --complex-hvs 1",
+        zoning = "",
+        fastpass = "",
+        mainpass = "",
+        workers = "8",
+        abMultiplier = "0.9",
+        abPosDev = "3",
+        abNegDev = "3"
+    )
 }
 
 private fun parseGuiResult(resultAny: Map<String, List<GuiTrackEntry>>): Map<String, List<TrackInFile>> {
@@ -207,9 +232,22 @@ private data class GuiSummaryRow(
     val presentIn: List<Int>
 )
 
+private data class GuiDefaults(
+    val params: String,
+    val lastParams: String,
+    val zoning: String,
+    val fastpass: String,
+    val mainpass: String,
+    val workers: String,
+    val abMultiplier: String,
+    val abPosDev: String,
+    val abNegDev: String
+)
+
 private data class GuiInput(
     val files: List<String>,
-    val summary: List<GuiSummaryRow>
+    val summary: List<GuiSummaryRow>,
+    val defaults: GuiDefaults
 )
 
 private data class GuiOutput(

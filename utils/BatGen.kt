@@ -3,6 +3,7 @@ package utils
 import TrackInFile
 import com.google.gson.GsonBuilder
 import java.io.File
+import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets
 
 /**
@@ -90,7 +91,7 @@ class BdremBatGenerator(
 
         // Generate BAT next to source file
         val batFile = File(src.parentFile, "$baseName.bat")
-        batFile.writeText(buildBatText(src, workDir, logDir, tracks, planEntries), StandardCharsets.UTF_8)
+        batFile.writeText(buildBatText(src, workDir, logDir, tracks, planEntries), Charset.forName("windows-1251"))
         return batFile
     }
 
@@ -111,6 +112,7 @@ class BdremBatGenerator(
 
         val demuxPy = File(pipelineDir, "demux.py").absolutePath
         val attCleanPy = File(pipelineDir, "attachments-cleaner.py").absolutePath
+        val audioToolPy = File(pipelineDir, "audio_tool.py").absolutePath
         val autoBoostPy = File(pipelineDir, "auto_boost_2.9.py").absolutePath
         val hdrPatchPy = File(pipelineDir, "hdr_patch.py").absolutePath
         val zoneEditorPy = File(pipelineDir, "zone_editor.py").absolutePath
@@ -120,30 +122,50 @@ class BdremBatGenerator(
         // Tracks block
         val tracksComment = buildTracksComment(tracks)
 
-        // Audio EDIT tracks
-        val audioEdit = tracks.filter { normalizeType(it.type) == "audio" && it.trackStatus == TrackStatus.EDIT }
-        val audioEditBlocks = buildAudioEditBlocks(audioEdit)
-
         // Video expectations
         val videoEdit = tracks.filter { normalizeType(it.type) == "video" && it.trackStatus == TrackStatus.EDIT }
         require(videoEdit.size == 1) {
             "Expected exactly 1 VIDEO EDIT track for AV1 pipeline; got ${videoEdit.size}. " +
                     "If you want VIDEO COPY support, extend mux.py/contract accordingly."
         }
+        val videoTrack = videoEdit.first()
+        val workers = getTrackMuxValue(videoTrack, "workers", "8")
+        val abMultiplier = getTrackMuxValue(videoTrack, "abMultiplier", "0.9")
+        val abPosDev = getTrackMuxValue(videoTrack, "abPosDev", "3")
+        val abNegDev = getTrackMuxValue(videoTrack, "abNegDev", "3")
+        val fastpass = buildParamString(videoTrack.trackParam, { key -> key.startsWith("--") })
+        val mainpass = buildParamString(
+            videoTrack.trackParam,
+            { key -> key.startsWith("^^") },
+            { key -> key.replace("^", "-") }
+        )
+        val fastpassVf = getTrackMuxValue(videoTrack, "fastpass", "")
+        val mainpassVf = getTrackMuxValue(videoTrack, "mainpass", "")
+        val fastpassVfLine = if (fastpassVf.isBlank()) {
+            "REM  --vf \"%FASTPASS_VF%\" ^"
+        } else {
+            "  --vf \"%FASTPASS_VF%\" ^"
+        }
+        val mainpassVfLine = if (mainpassVf.isBlank()) {
+            "REM  --vf \"%MAINPASS_VF%\" ^"
+        } else {
+            "  --vf \"%MAINPASS_VF%\" ^"
+        }
 
         sb.appendLine("@echo off")
-        sb.appendLine("setlocal EnableExtensions EnableDelayedExpansion")
-        sb.appendLine("chcp 65001 >nul")
+        sb.appendLine("setlocal EnableExtensions DisableDelayedExpansion")
+        sb.appendLine("chcp 1251 >nul")
+        sb.appendLine("pushd \"%~dp0\"")
         sb.appendLine()
-        sb.appendLine("set \"WORKERS=8\"")
-        sb.appendLine("set \"FASTPASS=--tune 3 --lp 3 --sharpness 1\"")
-        sb.appendLine("set \"MAINPASS=--film-grain 10 --complex-hvs 1\"")
-        sb.appendLine("set \"AB_MULTIPIER=0.9\"")
-        sb.appendLine("set \"AB_POS_DEV=3\"")
-        sb.appendLine("set \"AB_NEG_DEV=3\"")
+        sb.appendLine("set \"WORKERS=$workers\"")
+        sb.appendLine("set \"FASTPASS=$fastpass\"")
+        sb.appendLine("set \"MAINPASS=$mainpass\"")
+        sb.appendLine("set \"AB_MULTIPIER=$abMultiplier\"")
+        sb.appendLine("set \"AB_POS_DEV=$abPosDev\"")
+        sb.appendLine("set \"AB_NEG_DEV=$abNegDev\"")
         sb.appendLine()
-        sb.appendLine("set \"FASTPASS_VF=\"")
-        sb.appendLine("set \"MAINPASS_VF=\"")
+        sb.appendLine("set \"FASTPASS_VF=$fastpassVf\"") //~2
+        sb.appendLine("set \"MAINPASS_VF=$mainpassVf\"") //~2
         sb.appendLine()
         sb.appendLine("set \"MAINPASS_AUDIO=-an -sn\"")
         sb.appendLine()
@@ -203,7 +225,7 @@ class BdremBatGenerator(
         sb.appendLine("  --boost-multiplier \"%AB_MULTIPIER%\" ^")
         sb.appendLine("  --max-pos-dev \"%AB_POS_DEV%\" ^")
         sb.appendLine("  --max-neg-dev \"%AB_NEG_DEV%\" ^")
-        sb.appendLine("  --vf \"%FASTPASS_VF%\" ^")
+        sb.appendLine(fastpassVfLine)
         sb.appendLine("  > \"%LOGDIR%\\03_autoboost.log\" 2>&1")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
@@ -235,17 +257,18 @@ class BdremBatGenerator(
         sb.appendLine("  --pix-format yuv420p10le ^")
         sb.appendLine("  --no-defaults ^")
         sb.appendLine("  -a=\"%MAINPASS_AUDIO%\" ^")
-        sb.appendLine("  --vf \"%MAINPASS_VF%\" ^")
+        sb.appendLine(mainpassVfLine)
         sb.appendLine("  > \"%LOGDIR%\\06_av1an_mainpass.log\" 2>&1")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
 
-        // Audio EDIT blocks (wav intermediate)
+        // Audio tool (external)
         sb.appendLine("REM ==========================================================")
-        sb.appendLine("REM  3) AUDIO (explicit per-track commands, WAV intermediate)")
+        sb.appendLine("REM  3) AUDIO")
         sb.appendLine("REM ==========================================================")
         sb.appendLine()
-        sb.append(audioEditBlocks)
+        sb.appendLine("${pythonExe} ${q(audioToolPy)} --source \"%SRC%\" --workdir \"%WORKDIR%\" --tracksData \"tracks.json\" > \"%LOGDIR%\\07_audio.log\" 2>&1") //~1
+        sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
 
         // Subs stage (typically none)
@@ -346,44 +369,32 @@ class BdremBatGenerator(
         return sb.toString()
     }
 
-    private fun buildAudioEditBlocks(audioEdit: List<TrackInFile>): String {
-        if (audioEdit.isEmpty()) return "REM No AUDIO EDIT tracks\n"
-
-        val sb = StringBuilder()
-        val sorted = audioEdit.sortedBy { it.trackId }
-        var logIndex = 7 // after 06_av1an_mainpass
-        for (t in sorted) {
-            val fileBase = buildFileBase(t)
-            val inMka = "%WORKDIR%\\audio\\$fileBase.mka"
-            val tmpWav = "%WORKDIR%\\audio\\$fileBase.wav"
-            val outOpus = "%WORKDIR%\\audio\\$fileBase.opus"
-
-            val bitrate = parseOpusBitrateKbps(t.trackParam["params"])
-            val safeLabel = sanitizeComponentForWindowsFileName(
-                (t.trackMux["name"] ?: t.origName).ifBlank { "track${t.trackId}" },
-                maxLen = 32
-            )
-
-            sb.appendLine("REM 3) Track ${t.trackId} EDIT -> Opus ${bitrate}k (via WAV)")
-            sb.appendLine("${ffmpegExe} -v error -y -i \"$inMka\" -map 0:a:0 -vn -sn -c:a pcm_s16le -f wav \"$tmpWav\" ^")
-            sb.appendLine("  > \"%LOGDIR%\\0${logIndex}_audio_${t.trackId}_${safeLabel}_wav.log\" 2>&1")
-            sb.appendLine("if errorlevel 1 goto :fail")
-            logIndex++
-
-            sb.appendLine("${opusEncExe} --quiet --bitrate $bitrate --vbr \"$tmpWav\" \"$outOpus\" ^")
-            sb.appendLine("  > \"%LOGDIR%\\0${logIndex}_audio_${t.trackId}_${safeLabel}_opus.log\" 2>&1")
-            sb.appendLine("if errorlevel 1 goto :fail")
-            logIndex++
-
-            sb.appendLine("del /q \"$tmpWav\" >nul 2>nul")
-            sb.appendLine()
-        }
-        return sb.toString()
-    }
-
     // ----------------------------
     // Naming / parsing helpers
     // ----------------------------
+
+    private fun getTrackMuxValue(track: TrackInFile, key: String, fallback: String): String {
+        val value = track.trackMux[key]?.trim()
+        return if (value.isNullOrBlank()) fallback else value
+    }
+
+    private fun buildParamString(
+        params: Map<String, String>,
+        keyFilter: (String) -> Boolean,
+        keyTransform: (String) -> String = { it }
+    ): String {
+        val parts = mutableListOf<String>()
+        for ((key, value) in params) {
+            if (!keyFilter(key)) continue
+            val normalizedKey = keyTransform(key)
+            if (value.isBlank()) {
+                parts.add(normalizedKey)
+            } else {
+                parts.add("$normalizedKey $value")
+            }
+        }
+        return parts.joinToString(" ")
+    }
 
     private fun normalizeType(raw: String): String {
         val v = raw.trim().lowercase()
@@ -432,14 +443,6 @@ class BdremBatGenerator(
         if (out.isBlank()) out = "untitled"
         if (out.length > maxLen) out = out.take(maxLen).trimEnd('.', ' ')
         return out
-    }
-
-    private fun parseOpusBitrateKbps(params: String?): Int {
-        // Accept: "192", "opus 160", "--bitrate 192", etc. First reasonable int wins.
-        if (params.isNullOrBlank()) return 192
-        val m = Regex("(\\d{2,3})").find(params)
-        val v = m?.groupValues?.getOrNull(1)?.toIntOrNull() ?: return 192
-        return v.coerceIn(48, 320)
     }
 
     private fun mkdirsOrThrow(dir: File) {
