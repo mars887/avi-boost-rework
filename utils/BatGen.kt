@@ -1,5 +1,6 @@
 package utils
 
+import Paths
 import TrackInFile
 import com.google.gson.GsonBuilder
 import java.io.File
@@ -16,11 +17,8 @@ import java.nio.charset.StandardCharsets
  * - audio/sub filenames follow: {trackId}-d{0|1}-{lang}-{trackName}.{ext}
  */
 class BdremBatGenerator(
-    private val pythonExe: String,
+    private val paths: Paths,
     private val pipelineDir: String,
-    private val av1anExe: String = "av1an.exe",
-    private val ffmpegExe: String = "ffmpeg",
-    private val opusEncExe: String = "opusenc",
 ) {
     private val gson = GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create()
 
@@ -113,9 +111,9 @@ class BdremBatGenerator(
         val demuxPy = File(pipelineDir, "demux.py").absolutePath
         val attCleanPy = File(pipelineDir, "attachments-cleaner.py").absolutePath
         val audioToolPy = File(pipelineDir, "audio-tool-v2.py").absolutePath
-        val autoBoostPy = File(pipelineDir, "auto_boost_2.9.py").absolutePath
-        val hdrPatchPy = File(pipelineDir, "hdr_patch.py").absolutePath
-        val zoneEditorPy = File(pipelineDir, "zone_editor.py").absolutePath
+        val autoBoostPy = File(pipelineDir, "auto-boost_2.9.py").absolutePath
+        val hdrPatchPy = File(pipelineDir, "av1an_hdr_metadata_patch_v2.py").absolutePath
+        val zoneEditorPy = File(pipelineDir, "zone-editor.py").absolutePath
         val verifyPy = File(pipelineDir, "verify.py").absolutePath
         val muxPy = File(pipelineDir, "mux.py").absolutePath
 
@@ -141,16 +139,6 @@ class BdremBatGenerator(
         )
         val fastpassVf = getTrackMuxValue(videoTrack, "fastpass", "")
         val mainpassVf = getTrackMuxValue(videoTrack, "mainpass", "")
-        val fastpassVfLine = if (fastpassVf.isBlank()) {
-            "REM  --vf \"%FASTPASS_VF%\" ^"
-        } else {
-            "  --vf \"%FASTPASS_VF%\" ^"
-        }
-        val mainpassVfLine = if (mainpassVf.isBlank()) {
-            "REM  --vf \"%MAINPASS_VF%\" ^"
-        } else {
-            "  --vf \"%MAINPASS_VF%\" ^"
-        }
 
         sb.appendLine("@echo off")
         sb.appendLine("setlocal EnableExtensions DisableDelayedExpansion")
@@ -187,7 +175,7 @@ class BdremBatGenerator(
         sb.append(tracksComment)
         sb.appendLine("REM ==========================================================")
         sb.appendLine()
-        sb.appendLine("${pythonExe} ${q(demuxPy)} ^")
+        sb.appendLine("${Paths.PYTHON_EXE} ${q(demuxPy)} ^")
         sb.appendLine("  --source \"%SRC%\" ^")
         sb.appendLine("  --workdir \"%WORKDIR%\" ^")
         sb.appendLine("  --tracksData \"tracks.json\" ^")
@@ -195,7 +183,7 @@ class BdremBatGenerator(
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
         sb.appendLine("REM Optional but recommended")
-        sb.appendLine("${pythonExe} ${q(attCleanPy)} ^")
+        sb.appendLine("${Paths.PYTHON_EXE} ${q(attCleanPy)} ^")
         sb.appendLine("  --subs \"%WORKDIR%\\sub\" ^")
         sb.appendLine("  --attachments \"%WORKDIR%\\attachments\" ^")
         sb.appendLine("  > \"%LOGDIR%\\02_att_clean.log\" 2>&1")
@@ -215,22 +203,23 @@ class BdremBatGenerator(
         sb.appendLine("set \"AV1AN_TEMP=%WORKDIR%\\video\\av1an_tmp\"")
         sb.appendLine()
         sb.appendLine("REM 2.1 auto-boost -> scenes.json")
-        sb.appendLine("${pythonExe} ${q(autoBoostPy)} ^")
-        sb.appendLine("  --source \"%SRC%\" ^")
+        sb.appendLine("${Paths.VS_PYTHON_EXE} ${q(autoBoostPy)} ^")
+        sb.appendLine("  --psd-script \"${Paths.PSD_SCRIPT_PY}\" ^")
+        sb.appendLine("  --input \"%SRC%\" ^")
         sb.appendLine("  --out-scenes \"%SCENES%\" ^")
         sb.appendLine("  --temp \"%AV1AN_TEMP%\\fastpass\" ^")
         sb.appendLine("  --workers \"%WORKERS%\" ^")
-        sb.appendLine("  --v-params \"%FASTPASS%\" ^")
+        sb.appendLine("  -v \"%FASTPASS%\" ^")
         sb.appendLine("  --final-override \"%MAINPASS%\" ^")
-        sb.appendLine("  --boost-multiplier \"%AB_MULTIPIER%\" ^")
-        sb.appendLine("  --max-pos-dev \"%AB_POS_DEV%\" ^")
-        sb.appendLine("  --max-neg-dev \"%AB_NEG_DEV%\" ^")
-        sb.appendLine(fastpassVfLine)
+        sb.appendLine("  -a \"%AB_MULTIPIER%\" ^")
+        sb.appendLine("  --max-positive-dev \"%AB_POS_DEV%\" ^")
+        sb.appendLine("  --max-negative-dev \"%AB_NEG_DEV%\" ^")
+        if(fastpassVf.isNotBlank()) sb.appendLine("  --vf \"%FASTPASS_VF%\" ^")
         sb.appendLine("  > \"%LOGDIR%\\03_autoboost.log\" 2>&1")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
         sb.appendLine("REM 2.2 hdr-patch -> scenes-hdr.json")
-        sb.appendLine("${pythonExe} ${q(hdrPatchPy)} ^")
+        sb.appendLine("${Paths.VS_PYTHON_EXE} ${q(hdrPatchPy)} ^")
         sb.appendLine("  --source \"%SRC%\" ^")
         sb.appendLine("  --in-scenes \"%SCENES%\" ^")
         sb.appendLine("  --out-scenes \"%SCENES_HDR%\" ^")
@@ -239,7 +228,7 @@ class BdremBatGenerator(
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
         sb.appendLine("REM 2.3 zone-editor -> scenes-final.json")
-        sb.appendLine("${pythonExe} ${q(zoneEditorPy)} ^")
+        sb.appendLine("${Paths.VS_PYTHON_EXE} ${q(zoneEditorPy)} ^")
         sb.appendLine("  --in \"%SCENES_HDR%\" ^")
         sb.appendLine("  --out \"%SCENES_FINAL%\" ^")
         sb.appendLine("  --command-file \"%WORKDIR%\\zone_edit_command.txt\" ^")
@@ -247,7 +236,7 @@ class BdremBatGenerator(
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
         sb.appendLine("REM 2.4 mainpass av1an (video only)")
-        sb.appendLine("${av1anExe} -i \"%SRC%\" -o \"%VIDEO_OUT%\" ^")
+        sb.appendLine("${Paths.AV1AN_EXE} -i \"%SRC%\" -o \"%VIDEO_OUT%\" ^")
         sb.appendLine("  --scenes \"%SCENES_FINAL%\" ^")
         sb.appendLine("  --workers \"%WORKERS%\" ^")
         sb.appendLine("  --temp \"%AV1AN_TEMP%\\mainpass\" ^")
@@ -257,17 +246,16 @@ class BdremBatGenerator(
         sb.appendLine("  --pix-format yuv420p10le ^")
         sb.appendLine("  --no-defaults ^")
         sb.appendLine("  -a=\"%MAINPASS_AUDIO%\" ^")
-        sb.appendLine(mainpassVfLine)
+        if(mainpassVf.isNotBlank()) sb.appendLine("  --vf \"%MAINPASS_VF%\" ^")
         sb.appendLine("  > \"%LOGDIR%\\06_av1an_mainpass.log\" 2>&1")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
 
         // Audio tool (external)
-        sb.appendLine("REM ==========================================================")
         sb.appendLine("REM  3) AUDIO")
         sb.appendLine("REM ==========================================================")
         sb.appendLine()
-        sb.appendLine("${pythonExe} ${q(audioToolPy)} --copy-container mka --no-preserve-special --source \"%SRC%\" --workdir \"%WORKDIR%\" --tracksData \"tracks.json\" > \"%LOGDIR%\\07_audio.log\" 2>&1") //~1
+        sb.appendLine("${Paths.PYTHON_EXE} ${q(audioToolPy)} --copy-container mka --no-preserve-special --source \"%SRC%\" --workdir \"%WORKDIR%\" --tracksData \"tracks.json\" > \"%LOGDIR%\\07_audio.log\" 2>&1") //~1
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
 
@@ -286,7 +274,7 @@ class BdremBatGenerator(
         sb.appendLine("REM  verify.py should write a single-line sanitized errorInfo to: %WORKDIR%\\00_logs\\verify_error.txt")
         sb.appendLine("REM ==========================================================")
         sb.appendLine()
-        sb.appendLine("${pythonExe} ${q(verifyPy)} ^")
+        sb.appendLine("${Paths.PYTHON_EXE} ${q(verifyPy)} ^")
         sb.appendLine("  --source \"%SRC%\" ^")
         sb.appendLine("  --workdir \"%WORKDIR%\" ^")
         sb.appendLine("  --tracksData \"tracks.json\" ^")
@@ -306,7 +294,7 @@ class BdremBatGenerator(
         sb.appendLine("REM  5) MUX -> output рядом с исходником: *-av1.mkv")
         sb.appendLine("REM ==========================================================")
         sb.appendLine()
-        sb.appendLine("${pythonExe} ${q(muxPy)} --source \"%SRC%\" --workdir \"%WORKDIR%\" > \"%LOGDIR%\\09_mux.log\" 2>&1")
+        sb.appendLine("${Paths.VS_PYTHON_EXE} ${q(muxPy)} --source \"%SRC%\" --workdir \"%WORKDIR%\" > \"%LOGDIR%\\09_mux.log\" 2>&1")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
         sb.appendLine("echo OK")

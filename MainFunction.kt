@@ -70,7 +70,7 @@ fun runMain(args: Array<String>) {
         }
     }
     val gen = BdremBatGenerator(
-        pythonExe = Paths.PYTHON_EXE,          // подставьте ваш путь
+        paths = Paths,
         pipelineDir = "C:\\projects\\PBBatchProcessUtil\\src\\main\\java\\utils"           // где лежат demux.py/mux.py/verify.py/...
     )
 
