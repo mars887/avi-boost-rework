@@ -176,9 +176,21 @@ def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
     atexit.register(_cleanup)
 
 
-def run_cmd(cmd: Sequence[str], *, cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
+def run_cmd(
+    cmd: Sequence[str],
+    *,
+    cwd: Optional[Path] = None,
+    check: bool = True,
+    inherit_output: bool = False,
+) -> subprocess.CompletedProcess:
     cmd_str = " ".join(shlex.quote(str(x)) for x in cmd)
     print(f"[cmd] {cmd_str}")
+    if inherit_output:
+        return subprocess.run(
+            list(map(str, cmd)),
+            cwd=str(cwd) if cwd else None,
+            check=check,
+        )
     p = subprocess.Popen(
         list(map(str, cmd)),
         cwd=str(cwd) if cwd else None,
@@ -451,7 +463,7 @@ def run_psd(psd_script: Path, psd_python: Optional[Path], input_file: Path, base
     if extra_args:
         cmd.extend(shlex.split(extra_args))
 
-    run_cmd(cmd, check=True)
+    run_cmd(cmd, check=True, cwd=base_scenes_path.parent)
 
     # Normalise to the exact "base scenes" contract we want downstream.
     raw = load_json(base_scenes_path)
@@ -495,6 +507,8 @@ def run_fastpass_av1an(
     ffmpeg_arg: str,
     verbose: bool,
     keep: bool,
+    log_file: Optional[Path],
+    log_level: Optional[str],
 ) -> None:
     if scenes_path is not None:
         ensure_exists(scenes_path, "Base scenes.json")
@@ -510,6 +524,10 @@ def run_fastpass_av1an(
         cmd.append("--verbose")
     if keep:
         cmd.append("--keep")
+    if log_level:
+        cmd.extend(["--log-level", str(log_level)])
+    if log_file is not None:
+        cmd.extend(["--log-file", str(log_file)])
 
     # Provide scenes file (skip scene detection)
     if scenes_path is not None:
@@ -532,7 +550,7 @@ def run_fastpass_av1an(
     cmd.extend(["-w", str(int(workers))])
     cmd.extend(["-o", str(output_file)])
 
-    run_cmd(cmd, check=True)
+    run_cmd(cmd, check=True, inherit_output=True, cwd=av1an_temp.parent)
     print(f"[ok] fast-pass output: {output_file}")
 
 
@@ -2119,6 +2137,10 @@ def main() -> int:
                         help="FFmpeg options for av1an. If it starts with '-', passed as-is to av1an -f. Otherwise treated as a filtergraph and wrapped as -vf \"...\".")
     parser.add_argument("--verbose", action="store_true", help="Verbose output (fast-pass + rules logging).")
     parser.add_argument("--keep", action="store_true", help="Pass --keep to av1an (keep temp files).")
+    parser.add_argument("--av1an-log-file", default="auto",
+                        help="av1an --log-file path. 'auto' => <project>/av1an.log, 'none' => disable.")
+    parser.add_argument("--av1an-log-level", default="info",
+                        help="av1an --log-level (e.g. info, debug, warn).")
 
     # Rules
     rules_group = parser.add_mutually_exclusive_group()
@@ -2165,15 +2187,31 @@ def main() -> int:
     ensure_dir(project_dir)
     setup_logging(args.log, project_dir)
 
-    av1an_temp = project_dir / "av1an_temp"
+    psd_dir = project_dir / "psd"
+    fastpass_dir = project_dir / "fastpass"
+    ensure_dir(psd_dir)
+    ensure_dir(fastpass_dir)
+
+    av1an_temp = fastpass_dir / "av1an_temp"
     ensure_dir(av1an_temp)
 
-    base_scenes_path = Path(args.base_scenes).expanduser().resolve() if args.base_scenes else (project_dir / "scenes.psd.json")
+    base_scenes_path = Path(args.base_scenes).expanduser().resolve() if args.base_scenes else (psd_dir / "scenes.psd.json")
     out_scenes_path = Path(args.out_scenes).expanduser().resolve() if args.out_scenes else (project_dir / "scenes.final.json")
-    fastpass_out = Path(args.fastpass_out).expanduser().resolve() if args.fastpass_out else (project_dir / f"{input_file.stem}.fastpass.mkv")
+    fastpass_out = Path(args.fastpass_out).expanduser().resolve() if args.fastpass_out else (fastpass_dir / f"{input_file.stem}.fastpass.mkv")
 
-    ssimu2_log = project_dir / f"{input_file.stem}_ssimu2.log"
-    xpsnr_log = project_dir / f"{input_file.stem}_xpsnr.log"
+    ssimu2_log = fastpass_dir / f"{input_file.stem}_ssimu2.log"
+    xpsnr_log = fastpass_dir / f"{input_file.stem}_xpsnr.log"
+
+    av1an_log_file: Optional[Path]
+    av1an_log_arg = str(args.av1an_log_file).strip().lower()
+    if av1an_log_arg in ("none", "off", "false", "0"):
+        av1an_log_file = None
+    elif av1an_log_arg == "auto" or not av1an_log_arg:
+        av1an_log_file = fastpass_dir / "av1an.log"
+    else:
+        av1an_log_file = Path(args.av1an_log_file).expanduser()
+        if not av1an_log_file.is_absolute():
+            av1an_log_file = project_dir / av1an_log_file
 
     marks = marker_paths(project_dir)
 
@@ -2273,6 +2311,11 @@ def main() -> int:
                 ffmpeg_arg=str(args.ffmpeg),
                 verbose=bool(args.verbose),
                 keep=bool(args.keep),
+                log_file=av1an_log_file,
+                log_level=(
+                    None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
+                    else str(args.av1an_log_level).strip()
+                ),
             )
             touch(marks["fastpass"])
 

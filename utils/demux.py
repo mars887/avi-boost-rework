@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 WIN_BAD = r'<>:"/\|?*'
 WIN_BAD_RE = re.compile(rf"[{re.escape(WIN_BAD)}]")
+STATE_DIR_NAME = ".state"
+DEMUX_MARKER = "DEMUX_DONE"
 
 
 def eprint(*args: Any) -> None:
@@ -99,6 +101,16 @@ def setup_logging(log_path: Optional[str], workdir: Optional[Path] = None) -> No
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
+
+def marker_path(workdir: Path) -> Path:
+    return workdir / STATE_DIR_NAME / DEMUX_MARKER
+
+
+def write_marker(workdir: Path) -> None:
+    p = marker_path(workdir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("ok\n", encoding="utf-8")
 
 
 def which_or(name: str, fallback: str) -> str:
@@ -521,6 +533,10 @@ def main() -> int:
     source = Path(args.source)
     workdir = Path(args.workdir)
     setup_logging(args.log, workdir)
+    marker = marker_path(workdir)
+    if marker.exists() and not args.overwrite:
+        print(f"[demux] skip: marker exists: {marker}")
+        return 0
 
     if not source.exists():
         eprint(f"[demux] Source not found: {source}")
@@ -596,6 +612,7 @@ def main() -> int:
             "chapters": chapters_info,
         }
         write_json(workdir / "00_meta" / "demux_manifest.json", manifest)
+        write_marker(workdir)
 
         print("[demux] OK")
         return 0

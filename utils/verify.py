@@ -24,6 +24,8 @@ MIN_BYTES_SUB = 32          # subtitles can be tiny
 MIN_BYTES_ATTACHMENT = 16
 MIN_BYTES_AUDIO = 1024
 MIN_BYTES_VIDEO = 1024 * 256  # 256 KiB; adjust if you want stricter
+STATE_DIR_NAME = ".state"
+VERIFY_MARKER = "VERIFY_DONE"
 
 
 def eprint(*a: Any) -> None:
@@ -104,6 +106,16 @@ def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
         tee_err.close_log()
 
     atexit.register(_cleanup)
+
+
+def marker_path(workdir: Path) -> Path:
+    return workdir / STATE_DIR_NAME / VERIFY_MARKER
+
+
+def write_marker(workdir: Path) -> None:
+    p = marker_path(workdir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("ok\n", encoding="utf-8")
 
 
 def sanitize_error_id(s: str) -> str:
@@ -393,6 +405,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     workdir = Path(args.workdir)
     setup_logging(args.log, workdir)
     tracks_path = resolve_rel_to_workdir(workdir, args.tracksData)
+    marker = marker_path(workdir)
+    if marker.exists():
+        print(f"[verify] skip: marker exists: {marker}")
+        return 0
 
     try:
         if not source.exists():
@@ -444,6 +460,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass
 
         print("[verify] OK")
+        write_marker(workdir)
         return 0
 
     except Exception as ex:

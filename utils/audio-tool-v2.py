@@ -41,6 +41,8 @@ TOOL_VERSION = "1.1"
 
 MIN_OUT_BYTES = 1024  # sanity check
 DEFAULT_TMP_CODEC = "flac"  # preferred intermediate for "complex" EDIT
+STATE_DIR_NAME = ".state"
+AUDIO_MARKER = "AUDIO_DONE"
 
 
 class AudioToolError(RuntimeError):
@@ -127,6 +129,16 @@ def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
         tee_err.close_log()
 
     atexit.register(_cleanup)
+
+
+def marker_path(workdir: Path) -> Path:
+    return workdir / STATE_DIR_NAME / AUDIO_MARKER
+
+
+def write_marker(workdir: Path) -> None:
+    p = marker_path(workdir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("ok\n", encoding="utf-8")
 
 
 def sanitize_error_id(s: str) -> str:
@@ -611,6 +623,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     workdir = Path(args.workdir)
     setup_logging(args.log, workdir)
     tracks_data = Path(args.tracksData)
+    marker = marker_path(workdir)
+    if marker.exists() and not args.overwrite:
+        print(f"[{TOOL_NAME}] skip: marker exists: {marker}")
+        return 0
 
     if not source.exists():
         write_error_marker(workdir, "audio_missing_source")
@@ -856,6 +872,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 pass
 
         print(f"[{TOOL_NAME}] done. outputs={len(outputs)} manifest=00_meta/audio_manifest.json")
+        write_marker(workdir)
         return 0
 
     except AudioToolError as ex:

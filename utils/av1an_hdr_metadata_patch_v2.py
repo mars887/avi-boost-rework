@@ -54,6 +54,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 LOG = logging.getLogger("av1an_hdrmeta_patch")
+STATE_DIR_NAME = ".state"
+HDR_PATCH_MARKER = "HDR_PATCH_DONE"
 
 
 # --------------------------
@@ -71,6 +73,23 @@ def setup_logging(verbose: bool) -> None:
     LOG.handlers.clear()
     LOG.addHandler(handler)
     LOG.setLevel(level)
+
+
+def state_root_from_workdir(workdir: Path) -> Path:
+    if workdir.name.lower() == "hdr_tmp" and workdir.parent.name.lower() == "video":
+        return workdir.parent.parent
+    return workdir
+
+
+def marker_path(workdir: Path) -> Path:
+    root = state_root_from_workdir(workdir)
+    return root / STATE_DIR_NAME / HDR_PATCH_MARKER
+
+
+def write_marker(workdir: Path) -> None:
+    p = marker_path(workdir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("ok\n", encoding="utf-8")
 
 
 def require_tool(name: str) -> None:
@@ -745,6 +764,10 @@ def main() -> None:
     source = Path(args.source).resolve()
     scenes_in = Path(args.scenes).resolve()
     workdir = Path(args.workdir).resolve()
+    marker = marker_path(workdir)
+    if marker.exists():
+        LOG.info("Skip: marker exists: %s", marker)
+        return
     workdir.mkdir(parents=True, exist_ok=True)
 
     if not source.exists():
@@ -870,6 +893,7 @@ def main() -> None:
     # Save patched scenes
     out_path = (workdir / args.output).resolve()
     dump_json(out_path, scenes_data)
+    write_marker(workdir)
 
     LOG.info("---------------------------------------------------")
     LOG.info("Done.")
