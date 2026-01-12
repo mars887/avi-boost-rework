@@ -112,7 +112,7 @@ class BdremBatGenerator(
 
         val demuxPy = File(pipelineDir, "demux.py").absolutePath
         val attCleanPy = File(pipelineDir, "attachments-cleaner.py").absolutePath
-        val audioToolPy = File(pipelineDir, "audio_tool.py").absolutePath
+        val audioToolPy = File(pipelineDir, "audio-tool-v2.py").absolutePath
         val autoBoostPy = File(pipelineDir, "auto_boost_2.9.py").absolutePath
         val hdrPatchPy = File(pipelineDir, "hdr_patch.py").absolutePath
         val zoneEditorPy = File(pipelineDir, "zone_editor.py").absolutePath
@@ -267,7 +267,7 @@ class BdremBatGenerator(
         sb.appendLine("REM  3) AUDIO")
         sb.appendLine("REM ==========================================================")
         sb.appendLine()
-        sb.appendLine("${pythonExe} ${q(audioToolPy)} --source \"%SRC%\" --workdir \"%WORKDIR%\" --tracksData \"tracks.json\" > \"%LOGDIR%\\07_audio.log\" 2>&1") //~1
+        sb.appendLine("${pythonExe} ${q(audioToolPy)} --copy-container mka --no-preserve-special --source \"%SRC%\" --workdir \"%WORKDIR%\" --tracksData \"tracks.json\" > \"%LOGDIR%\\07_audio.log\" 2>&1") //~1
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
 
