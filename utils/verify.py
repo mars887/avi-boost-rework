@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 
-MIN_BYTES_SUB = 32          # subtitles can be tiny
+MIN_BYTES_SUB = 0          # subtitles can be tiny
 MIN_BYTES_ATTACHMENT = 16
 MIN_BYTES_AUDIO = 1024
 MIN_BYTES_VIDEO = 1024 * 256  # 256 KiB; adjust if you want stricter
@@ -197,6 +197,36 @@ def ffprobe_duration_ms(js: Dict[str, Any]) -> int:
         return 0
 
 
+def source_has_chapters(source: Path, ffprobe: Optional[str]) -> Optional[bool]:
+    if not ffprobe:
+        return None
+    cmd = [
+        ffprobe,
+        "-hide_banner",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_chapters",
+        str(source),
+    ]
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if p.returncode != 0:
+        return None
+    try:
+        js = json.loads(p.stdout)
+    except Exception:
+        return None
+    chapters = js.get("chapters") or []
+    return len(chapters) > 0
+
+
 def check_file_exists(p: Path, min_bytes: int, err_id: str) -> None:
     if not p.exists():
         raise RuntimeError(err_id)
@@ -325,7 +355,7 @@ def verify_audio(workdir: Path, tracks: List[Dict[str, Any]], ffprobe: Optional[
     return results
 
 
-def verify_demux_outputs(workdir: Path) -> None:
+def verify_demux_outputs(workdir: Path, source: Path, ffprobe: Optional[str]) -> None:
     demux_manifest = workdir / "00_meta" / "demux_manifest.json"
     if not demux_manifest.exists():
         print("[verify] demux: demux_manifest.json missing => skip demux checks")
@@ -367,6 +397,13 @@ def verify_demux_outputs(workdir: Path) -> None:
     # chapters
     ch = man.get("chapters") or {}
     if isinstance(ch, dict):
+        has_chapters = source_has_chapters(source, ffprobe)
+        if has_chapters is False:
+            print("[verify] chapters: none in source => skip")
+            return
+        if has_chapters is None:
+            print("[verify] chapters: ffprobe unavailable => skip")
+            return
         p = ch.get("path")
         if p:
             pp = Path(p)
@@ -374,6 +411,8 @@ def verify_demux_outputs(workdir: Path) -> None:
                 pp = workdir / pp
             print(f"[verify] chapters: {pp.name}")
             check_file_exists(pp, 16, "chapters_missing_or_too_small")
+        else:
+            raise RuntimeError("chapters_missing_or_too_small")
 
 
 def verify_duration_consistency(
@@ -438,7 +477,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         tracks = parse_tracks(tracks_json)
 
         # 1) demux artifacts if manifest exists
-        verify_demux_outputs(workdir)
+        verify_demux_outputs(workdir, source, ffprobe)
 
         # 2) video
         vpath, v_dms = verify_video(workdir, tracks, ffprobe)

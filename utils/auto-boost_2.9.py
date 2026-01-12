@@ -536,6 +536,7 @@ def run_fastpass_av1an(
     # Muxing defaults from old scripts
     cmd.extend(["-m", "lsmash", "-c", "mkvmerge"])
     cmd.extend(["--chunk-order", "random"])
+    cmd.extend(["--cache-mode", "temp"])
 
     # Encoder & encode settings (fast pass)
     cmd.extend(["-e", "svt-av1", "--force"])

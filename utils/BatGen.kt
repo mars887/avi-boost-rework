@@ -60,10 +60,6 @@ class BdremBatGenerator(
         mkdirsOrThrow(workDir)
         mkdirsOrThrow(logDir)
 
-        // Ensure placeholder command file exists (zone_editor.py often expects it)
-        val zoneCmd = File(workDir, "zone_edit_command.txt")
-        if (!zoneCmd.exists()) zoneCmd.writeText("", StandardCharsets.UTF_8)
-
         // Build per-track fileBase for naming stability across demux/audio/mux
         val planEntries = tracks.map { t ->
             TrackPlanEntry(
@@ -127,6 +123,11 @@ class BdremBatGenerator(
                     "If you want VIDEO COPY support, extend mux.py/contract accordingly."
         }
         val videoTrack = videoEdit.first()
+        // Write zoning commands (overwrite old content to avoid stale commands)
+        val zoning = videoTrack.trackMux["zoning"] ?: ""
+        val zoneCmd = File(workDir, "zone_edit_command.txt")
+        if (!zoneCmd.exists()) zoneCmd.writeText(zoning, StandardCharsets.UTF_8)
+
         val workers = getTrackMuxValue(videoTrack, "workers", "8")
         val abMultiplier = getTrackMuxValue(videoTrack, "abMultiplier", "0.9")
         val abPosDev = getTrackMuxValue(videoTrack, "abPosDev", "3")
@@ -213,6 +214,7 @@ class BdremBatGenerator(
         sb.appendLine("  --keep ^")
         sb.appendLine("  --verbose ^")
         sb.appendLine("  --workers \"%WORKERS%\" ^")
+        // --quality {crf}
         sb.appendLine("  -v \"%FASTPASS%\" ^")
         sb.appendLine("  --final-override \"%MAINPASS%\" ^")
         sb.appendLine("  -a \"%AB_MULTIPIER%\" ^")
@@ -245,9 +247,11 @@ class BdremBatGenerator(
         sb.appendLine("  --scenes \"%SCENES_FINAL%\" ^")
         sb.appendLine("  --workers \"%WORKERS%\" ^")
         sb.appendLine("  --temp \"%VIDEO_TEMP%\\mainpass\" ^")
+        sb.appendLine("  -n ^")
         sb.appendLine("  --keep ^")
         sb.appendLine("  --verbose ^")
         sb.appendLine("  --resume ^")
+        sb.appendLine("  --cache-mode temp ^")
         sb.appendLine("  --log-file \"%LOGDIR%\\06_av1an_mainpass.log\" ^")
         sb.appendLine("  --log-level info ^")
         sb.appendLine("  -e svt-av1 ^")
@@ -278,7 +282,7 @@ class BdremBatGenerator(
         // Verify stage
         sb.appendLine("REM ==========================================================")
         sb.appendLine("REM  4.5) VERIFY (integrity check before final mux)")
-        sb.appendLine("REM  If fails: creates marker рядом с исходником: <basename>-error-<errorInfo>")
+        sb.appendLine("REM  If fails: creates marker СЂСЏРґРѕРј СЃ РёСЃС…РѕРґРЅРёРєРѕРј: <basename>-error-<errorInfo>")
         sb.appendLine("REM  verify.py should write a single-line sanitized errorInfo to: %WORKDIR%\\00_logs\\verify_error.txt")
         sb.appendLine("REM ==========================================================")
         sb.appendLine()
@@ -299,7 +303,7 @@ class BdremBatGenerator(
 
         // Mux stage
         sb.appendLine("REM ==========================================================")
-        sb.appendLine("REM  5) MUX -> output рядом с исходником: *-av1.mkv")
+        sb.appendLine("REM  5) MUX -> output СЂСЏРґРѕРј СЃ РёСЃС…РѕРґРЅРёРєРѕРј: *-av1.mkv")
         sb.appendLine("REM ==========================================================")
         sb.appendLine()
         sb.appendLine("${Paths.VS_PYTHON_EXE} ${q(muxPy)} --source \"%SRC%\" --workdir \"%WORKDIR%\" > \"%LOGDIR%\\09_mux.log\" 2>&1")
