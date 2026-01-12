@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import atexit
 import json
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, TextIO, Tuple
 
 try:
     from fontTools.ttLib import TTFont, TTCollection  # type: ignore
@@ -29,6 +30,82 @@ def warn(msg: str) -> None:
 def die(msg: str, code: int = 1) -> int:
     print(f"[E] {msg}", file=sys.stderr)
     return code
+
+
+class TeeStream:
+    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
+        self._stream = stream
+        self._log: Optional[TextIO] = log_file
+
+    def write(self, s: str) -> int:
+        try:
+            self._stream.write(s)
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.write(s)
+                self._log.flush()
+            except Exception:
+                self._log = None
+        return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.flush()
+            except Exception:
+                self._log = None
+
+    def close_log(self) -> None:
+        if self._log is None:
+            return
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+        try:
+            self._log.close()
+        except Exception:
+            pass
+        self._log = None
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._stream, "encoding", "utf-8")
+
+
+def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
+    if not log_path:
+        return
+    p = Path(log_path)
+    if not p.is_absolute() and workdir is not None:
+        p = workdir / p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    log_fh = p.open("w", encoding=enc, errors="replace")
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    tee_out = TeeStream(orig_stdout, log_fh)
+    tee_err = TeeStream(orig_stderr, log_fh)
+    sys.stdout = tee_out
+    sys.stderr = tee_err
+
+    def _cleanup() -> None:
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
+        tee_out.close_log()
+        tee_err.close_log()
+
+    atexit.register(_cleanup)
 
 
 # -----------------------------
@@ -295,10 +372,12 @@ def main() -> int:
     ap.add_argument("--attachments", required=True, help="Path to WORKDIR\\attachments")
     ap.add_argument("--dry-run", action="store_true", help="Do not delete, only log what would be removed.")
     ap.add_argument("--report", default="", help="Optional path to write JSON report (default: <attachments>/attachments_cleaner_report.json)")
+    ap.add_argument("--log", default="", help="Optional log file path (relative to --subs parent if not absolute)")
     args = ap.parse_args()
 
     subs_dir = Path(args.subs)
     att_dir = Path(args.attachments)
+    setup_logging(args.log, subs_dir.parent)
 
     if not subs_dir.exists() or not subs_dir.is_dir():
         return die(f"Subs dir not found: {subs_dir}", 2)

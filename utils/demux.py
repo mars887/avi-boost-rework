@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import atexit
 import json
 import re
 import shutil
@@ -9,7 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 
 WIN_BAD = r'<>:"/\|?*'
@@ -18,6 +19,82 @@ WIN_BAD_RE = re.compile(rf"[{re.escape(WIN_BAD)}]")
 
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
+
+
+class TeeStream:
+    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
+        self._stream = stream
+        self._log: Optional[TextIO] = log_file
+
+    def write(self, s: str) -> int:
+        try:
+            self._stream.write(s)
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.write(s)
+                self._log.flush()
+            except Exception:
+                self._log = None
+        return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.flush()
+            except Exception:
+                self._log = None
+
+    def close_log(self) -> None:
+        if self._log is None:
+            return
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+        try:
+            self._log.close()
+        except Exception:
+            pass
+        self._log = None
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._stream, "encoding", "utf-8")
+
+
+def setup_logging(log_path: Optional[str], workdir: Optional[Path] = None) -> None:
+    if not log_path:
+        return
+    p = Path(log_path)
+    if not p.is_absolute() and workdir is not None:
+        p = workdir / p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    log_fh = p.open("w", encoding=enc, errors="replace")
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    tee_out = TeeStream(orig_stdout, log_fh)
+    tee_err = TeeStream(orig_stderr, log_fh)
+    sys.stdout = tee_out
+    sys.stderr = tee_err
+
+    def _cleanup() -> None:
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
+        tee_out.close_log()
+        tee_err.close_log()
+
+    atexit.register(_cleanup)
 
 
 def ensure_dir(p: Path) -> None:
@@ -42,22 +119,63 @@ def safe_filename(name: str, max_len: int = 180) -> str:
     return name
 
 
+PROGRESS_RE = re.compile(r"^(progress|processed)\s*[:\-]?\s*\d+%\s*$", re.IGNORECASE)
+
+
+def is_progress_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if PROGRESS_RE.match(s):
+        return True
+    if s.endswith("%") and any(ch.isdigit() for ch in s) and len(s) <= 40:
+        return True
+    return False
+
+
 def run_cmd(cmd: List[str]) -> None:
     # Важно: encoding/errors фиксируем, иначе Windows "charmap" может упасть.
     print("[cmd]", " ".join(cmd))
-    p = subprocess.run(
+    p = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
     )
-    if p.stdout:
-        print(p.stdout, end="" if p.stdout.endswith("\n") else "\n")
-    if p.returncode != 0:
-        raise RuntimeError(f"Command failed with code {p.returncode}")
+    progress_width = 0
+    had_progress = False
+    if p.stdout is not None:
+        for line in p.stdout:
+            if is_progress_line(line):
+                s = line.strip()
+                if len(s) < progress_width:
+                    s = s + (" " * (progress_width - len(s)))
+                progress_width = max(progress_width, len(s))
+                sys.stdout.write(s + "\r")
+                sys.stdout.flush()
+                had_progress = True
+                continue
+
+            if had_progress:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                had_progress = False
+                progress_width = 0
+
+            if line:
+                sys.stdout.write(line)
+                if not line.endswith("\n"):
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+
+    rc = p.wait()
+    if had_progress:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    if rc != 0:
+        raise RuntimeError(f"Command failed with code {rc}")
 
 
 def load_json(p: Path) -> Any:
@@ -397,10 +515,12 @@ def main() -> int:
     ap.add_argument("--mkvmerge", default="mkvmerge", help="Path to mkvmerge")
     ap.add_argument("--mkvextract", default="mkvextract", help="Path to mkvextract")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing extracted files")
+    ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
     args = ap.parse_args()
 
     source = Path(args.source)
     workdir = Path(args.workdir)
+    setup_logging(args.log, workdir)
 
     if not source.exists():
         eprint(f"[demux] Source not found: {source}")

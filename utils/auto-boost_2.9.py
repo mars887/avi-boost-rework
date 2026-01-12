@@ -22,6 +22,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import math
 import os
@@ -34,7 +35,7 @@ import sys
 import threading
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, TextIO, Tuple
 import tqdm
 
 IS_WINDOWS = (os.name == "nt")
@@ -74,16 +75,188 @@ def eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+PROGRESS_RE = re.compile(
+    r"^(progress|processed)\s*[:\-]?\s*\d+%\s*$|^frame\s+\d+\s*/.*fps$|^creating lwi index file\s+\d+%\s*$",
+    re.IGNORECASE,
+)
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def is_progress_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if PROGRESS_RE.match(s):
+        return True
+    if s.endswith("%") and any(ch.isdigit() for ch in s) and len(s) <= 60:
+        return True
+    if s.lower().startswith("frame ") and "fps" in s.lower():
+        return True
+    return False
+
+
+class TeeStream:
+    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
+        self._stream = stream
+        self._log: Optional[TextIO] = log_file
+
+    def write(self, s: str) -> int:
+        try:
+            self._stream.write(s)
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.write(s)
+                self._log.flush()
+            except Exception:
+                self._log = None
+        return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.flush()
+            except Exception:
+                self._log = None
+
+    def close_log(self) -> None:
+        if self._log is None:
+            return
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+        try:
+            self._log.close()
+        except Exception:
+            pass
+        self._log = None
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._stream, "encoding", "utf-8")
+
+
+def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
+    if not log_path:
+        return
+    p = Path(log_path)
+    if not p.is_absolute() and workdir is not None:
+        p = workdir / p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    log_fh = p.open("w", encoding=enc, errors="replace")
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    tee_out = TeeStream(orig_stdout, log_fh)
+    tee_err = TeeStream(orig_stderr, log_fh)
+    sys.stdout = tee_out
+    sys.stderr = tee_err
+
+    def _cleanup() -> None:
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
+        tee_out.close_log()
+        tee_err.close_log()
+
+    atexit.register(_cleanup)
+
+
 def run_cmd(cmd: Sequence[str], *, cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
     cmd_str = " ".join(shlex.quote(str(x)) for x in cmd)
     print(f"[cmd] {cmd_str}")
-    return subprocess.run(
+    p = subprocess.Popen(
         list(map(str, cmd)),
         cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        capture_output=False,
-        check=check,
+        encoding="utf-8",
+        errors="replace",
     )
+    buf = ""
+    progress_width = 0
+    had_progress = False
+    last_was_cr = False
+    if p.stdout is not None:
+        while True:
+            ch = p.stdout.read(1)
+            if ch == "":
+                break
+            if last_was_cr and ch == "\n":
+                last_was_cr = False
+                continue
+            if ch in ("\n", "\r"):
+                line = buf
+                buf = ""
+                clean = strip_ansi(line)
+                if ch == "\r" or is_progress_line(clean):
+                    s = clean.strip()
+                    if len(s) < progress_width:
+                        s = s + (" " * (progress_width - len(s)))
+                    progress_width = max(progress_width, len(s))
+                    sys.stdout.write(s + "\r")
+                    sys.stdout.flush()
+                    had_progress = True
+                    last_was_cr = (ch == "\r")
+                    continue
+
+                if had_progress:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    had_progress = False
+                    progress_width = 0
+                last_was_cr = False
+
+                sys.stdout.write(clean)
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                continue
+
+            buf += ch
+            last_was_cr = False
+            if len(buf) >= 2048:
+                sys.stdout.write(strip_ansi(buf))
+                sys.stdout.flush()
+                buf = ""
+    if buf:
+        clean = strip_ansi(buf)
+        if is_progress_line(clean):
+            s = clean.strip()
+            if len(s) < progress_width:
+                s = s + (" " * (progress_width - len(s)))
+            sys.stdout.write(s + "\r")
+            sys.stdout.flush()
+            had_progress = True
+        else:
+            if had_progress:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                had_progress = False
+                progress_width = 0
+            sys.stdout.write(clean)
+            sys.stdout.flush()
+    rc = p.wait()
+    if had_progress:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, list(cmd))
+    return subprocess.CompletedProcess(list(cmd), rc)
 
 def which_or_none(exe: str) -> Optional[str]:
     return shutil.which(exe)
@@ -1910,6 +2083,8 @@ def main() -> int:
     parser.add_argument("-i", "--input", required=True, help="Input video file (source).")
     parser.add_argument("-t", "--temp", default=None,
                         help="Project directory. Default: <input stem>_autoboost next to input.")
+    parser.add_argument("--log", default="",
+                        help="Optional log file path (relative to --temp if not absolute).")
     parser.add_argument("--force", action="store_true",
                         help="Start from scratch: clear resume markers and remove generated artifacts in the project dir.")
     parser.add_argument("--sdm", choices=["psd", "av1an"], default="psd",
@@ -1988,6 +2163,7 @@ def main() -> int:
 
     project_dir = Path(args.temp).expanduser().resolve() if args.temp else (input_file.parent / f"{input_file.stem}")
     ensure_dir(project_dir)
+    setup_logging(args.log, project_dir)
 
     av1an_temp = project_dir / "av1an_temp"
     ensure_dir(av1an_temp)
