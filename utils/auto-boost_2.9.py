@@ -2147,7 +2147,7 @@ def main() -> int:
     rules_group = parser.add_mutually_exclusive_group()
     rules_group.add_argument("--rules", default=None, help="Path to python rule script.")
     rules_group.add_argument("--rules-inline", default=None, help="Inline python rules string.")
-    parser.add_argument("--rules-required-metrics", nargs="*", default=["luma","grad_mad","farneback"],
+    parser.add_argument("--rules-required-metrics", nargs="*", default=[],
                         help="Space-separated list of metric names required by rules (fail-fast).")
     parser.add_argument("--rule-test", action="store_true",
                         help="Execute rules without saving results; implies --verbose.")
@@ -2193,7 +2193,7 @@ def main() -> int:
     ensure_dir(psd_dir)
     ensure_dir(fastpass_dir)
 
-    av1an_temp = fastpass_dir / "av1an_temp"
+    av1an_temp = fastpass_dir
     ensure_dir(av1an_temp)
 
     base_scenes_path = Path(args.base_scenes).expanduser().resolve() if args.base_scenes else (psd_dir / "scenes.psd.json")

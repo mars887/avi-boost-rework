@@ -3,7 +3,7 @@ import os
 import shlex
 import sys
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 
 
 TYPE_OPTIONS = ["auto", "video", "audio", "sub"]
@@ -87,18 +87,27 @@ def parse_params_string(raw_value):
     idx = 0
     while idx < len(tokens):
         token = tokens[idx]
-        if token.startswith("-"):
+        if token.startswith("--") and len(token) > 2:
             if "=" in token:
                 key, value = token.split("=", 1)
             else:
                 key = token
                 value = ""
-                if idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
+                if idx + 1 < len(tokens) and not tokens[idx + 1].startswith("--"):
                     value = tokens[idx + 1]
                     idx += 1
             result[key] = value
         idx += 1
     return result
+
+
+def get_param_value(params_map, key):
+    if not params_map:
+        return ""
+    value = params_map.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def parse_int_value(raw_value, default_value):
@@ -907,6 +916,40 @@ class TrackConfigGui:
     def on_apply(self):
         self.defaults = self._current_defaults()
         result, _ = build_results(self.files, self.tracks_by_file, self.settings, self.defaults)
+        missing = []
+        mismatch = []
+        for file_path, tracks in result.items():
+            for t in tracks:
+                t_type = normalize_type(t.get("type") or "")
+                if t_type != "video":
+                    continue
+                if str(t.get("trackStatus") or "").upper() != "EDIT":
+                    continue
+                track_param = t.get("trackParam") or {}
+                fast_crf = get_param_value(track_param, "--crf")
+                main_crf = get_param_value(track_param, "^^crf")
+                if not fast_crf and not main_crf:
+                    missing.append(f"{os.path.basename(file_path)} (trackId={t.get('trackId')})")
+                if fast_crf and main_crf:
+                    try:
+                        same = abs(float(fast_crf) - float(main_crf)) < 1e-6
+                    except ValueError:
+                        same = (fast_crf == main_crf)
+                    if not same:
+                        mismatch.append(f"{os.path.basename(file_path)} (trackId={t.get('trackId')})")
+
+        if missing:
+            messagebox.showwarning(
+                "CRF required",
+                "Specify --crf in params or last params for video EDIT.\n"
+                "Missing --crf for:\n  " + "\n  ".join(missing),
+            )
+            return
+        if mismatch:
+            messagebox.showwarning(
+                "CRF mismatch",
+                "Different --crf values in params and last params for:\n  " + "\n  ".join(mismatch),
+            )
         payload = {"status": "ok", "result": result}
         sys.stdout.write(json.dumps(payload, ensure_ascii=False))
         sys.stdout.flush()

@@ -85,7 +85,8 @@ class BdremBatGenerator(
 
         // Generate BAT next to source file
         val batFile = File(src.parentFile, "$baseName.bat")
-        batFile.writeText(buildBatText(src, workDir, logDir, tracks, planEntries), Charset.forName("windows-1251"))
+        val batText = buildBatText(src, workDir, logDir, tracks, planEntries)
+        batFile.writeText(transliterateToAscii(batText), Charset.forName("windows-1251"))
         return batFile
     }
 
@@ -126,18 +127,31 @@ class BdremBatGenerator(
         // Write zoning commands (overwrite old content to avoid stale commands)
         val zoning = videoTrack.trackMux["zoning"] ?: ""
         val zoneCmd = File(workDir, "zone_edit_command.txt")
-        if (!zoneCmd.exists()) zoneCmd.writeText(zoning, StandardCharsets.UTF_8)
+        zoneCmd.writeText(zoning, StandardCharsets.UTF_8)
 
         val workers = getTrackMuxValue(videoTrack, "workers", "8")
         val abMultiplier = getTrackMuxValue(videoTrack, "abMultiplier", "0.9")
         val abPosDev = getTrackMuxValue(videoTrack, "abPosDev", "3")
         val abNegDev = getTrackMuxValue(videoTrack, "abNegDev", "3")
-        val fastpass = buildParamString(videoTrack.trackParam, { key -> key.startsWith("--") })
+        val fastpassCrf = getTrackParamValue(videoTrack.trackParam, "--crf")
+        val mainpassCrf = getTrackParamValue(videoTrack.trackParam, "^^crf")
+        val fastpassPreset = getTrackParamValue(videoTrack.trackParam, "--preset")
+        val mainpassPreset = getTrackParamValue(videoTrack.trackParam, "^^preset")
+        val crfValue = mainpassCrf ?: fastpassCrf ?: "30"
+        val fastpass = buildParamString(
+            videoTrack.trackParam,
+            { key -> key.startsWith("--") && key != "--crf" && key != "--preset" }
+        )
         val mainpass = buildParamString(
             videoTrack.trackParam,
-            { key -> key.startsWith("^^") },
+            { key -> key.startsWith("^^") && key != "^^crf" && key != "^^preset" },
             { key -> key.replace("^", "-") }
         )
+        val mainpassBase = if (mainpassPreset.isNullOrBlank()) {
+            "--crf $crfValue"
+        } else {
+            "--preset $mainpassPreset --crf $crfValue"
+        }
         val fastpassVf = getTrackMuxValue(videoTrack, "fastpass", "")
         val mainpassVf = getTrackMuxValue(videoTrack, "mainpass", "")
 
@@ -214,9 +228,11 @@ class BdremBatGenerator(
         sb.appendLine("  --keep ^")
         sb.appendLine("  --verbose ^")
         sb.appendLine("  --workers \"%WORKERS%\" ^")
-        // --quality {crf}
         sb.appendLine("  -v \"%FASTPASS%\" ^")
         sb.appendLine("  --final-override \"%MAINPASS%\" ^")
+        sb.appendLine("  --quality \"$crfValue\" ^")
+        if (!fastpassPreset.isNullOrBlank()) sb.appendLine("  --fast-preset \"$fastpassPreset\" ^")
+        if (!mainpassPreset.isNullOrBlank()) sb.appendLine("  --preset \"$mainpassPreset\" ^")
         sb.appendLine("  -a \"%AB_MULTIPIER%\" ^")
         sb.appendLine("  --max-positive-dev \"%AB_POS_DEV%\" ^")
         sb.appendLine("  --max-negative-dev \"%AB_NEG_DEV%\" ^")
@@ -257,6 +273,7 @@ class BdremBatGenerator(
         sb.appendLine("  -e svt-av1 ^")
         sb.appendLine("  --pix-format yuv420p10le ^")
         sb.appendLine("  --no-defaults ^")
+        sb.appendLine("  -v \"$mainpassBase\" ^")
         if (mainpassVf.isNotBlank()) sb.appendLine("  --vf \"%MAINPASS_VF%\" ^")
         sb.appendLine("  -a=\"%MAINPASS_AUDIO%\"")
         sb.appendLine("if errorlevel 1 goto :fail")
@@ -378,6 +395,11 @@ class BdremBatGenerator(
         return if (value.isNullOrBlank()) fallback else value
     }
 
+    private fun getTrackParamValue(params: Map<String, String>, key: String): String? {
+        val value = params[key]?.trim()
+        return if (value.isNullOrBlank()) null else value
+    }
+
     private fun buildParamString(
         params: Map<String, String>,
         keyFilter: (String) -> Boolean,
@@ -448,5 +470,28 @@ class BdremBatGenerator(
     private fun mkdirsOrThrow(dir: File) {
         if (dir.exists()) return
         if (!dir.mkdirs()) error("Failed to create directory: ${dir.absolutePath}")
+    }
+
+    private fun transliterateToAscii(s: String): String {
+        val map = mapOf(
+            'А' to "A", 'Б' to "B", 'В' to "V", 'Г' to "G", 'Д' to "D", 'Е' to "E",
+            'Ё' to "E", 'Ж' to "Zh", 'З' to "Z", 'И' to "I", 'Й' to "Y", 'К' to "K",
+            'Л' to "L", 'М' to "M", 'Н' to "N", 'О' to "O", 'П' to "P", 'Р' to "R",
+            'С' to "S", 'Т' to "T", 'У' to "U", 'Ф' to "F", 'Х' to "Kh", 'Ц' to "Ts",
+            'Ч' to "Ch", 'Ш' to "Sh", 'Щ' to "Sch", 'Ъ' to "", 'Ы' to "Y", 'Ь' to "",
+            'Э' to "E", 'Ю' to "Yu", 'Я' to "Ya",
+            'а' to "a", 'б' to "b", 'в' to "v", 'г' to "g", 'д' to "d", 'е' to "e",
+            'ё' to "e", 'ж' to "zh", 'з' to "z", 'и' to "i", 'й' to "y", 'к' to "k",
+            'л' to "l", 'м' to "m", 'н' to "n", 'о' to "o", 'п' to "p", 'р' to "r",
+            'с' to "s", 'т' to "t", 'у' to "u", 'ф' to "f", 'х' to "kh", 'ц' to "ts",
+            'ч' to "ch", 'ш' to "sh", 'щ' to "sch", 'ъ' to "", 'ы' to "y", 'ь' to "",
+            'э' to "e", 'ю' to "yu", 'я' to "ya"
+        )
+        val out = StringBuilder(s.length)
+        for (ch in s) {
+            val repl = map[ch]
+            if (repl != null) out.append(repl) else out.append(ch)
+        }
+        return out.toString()
     }
 }

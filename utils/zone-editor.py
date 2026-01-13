@@ -17,6 +17,7 @@ edit_av1an_scenes.py
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -687,6 +688,8 @@ def apply_commands_to_scenes(
                 print(f"[scene {idx:4d}  {s0}-{s1})  cmd#{cmd_i}: {cmd.raw_line}")
                 for c in changes:
                     print(f"  - {c}")
+
+    scenes_data["split_scenes"] = copy.deepcopy(scenes)
 
 
 # ------------------------- CLI -------------------------

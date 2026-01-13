@@ -196,9 +196,9 @@ private fun buildGuiDefaults(): GuiDefaults {
         fastpass = "",
         mainpass = "",
         workers = "8",
-        abMultiplier = "0.9",
-        abPosDev = "3",
-        abNegDev = "3"
+        abMultiplier = "0.75",
+        abPosDev = "4",
+        abNegDev = "4"
     )
 }
 
