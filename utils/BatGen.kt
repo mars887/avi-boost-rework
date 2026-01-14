@@ -90,6 +90,41 @@ class BdremBatGenerator(
         return batFile
     }
 
+    /**
+     * Generates:
+     * - start-batch.bat (sequential runner for per-file bats)
+     * - Batch Manager.bat (drag-and-drop helper to run batch-manager.py)
+     *
+     * Scripts are created per source directory.
+     */
+    fun generateBatchScripts(files: List<File>): List<File> {
+        val out = mutableListOf<File>()
+        val groups = linkedMapOf<String, MutableList<File>>()
+        for (f in files) {
+            val dir = f.parentFile?.absolutePath ?: continue
+            groups.getOrPut(dir) { mutableListOf() }.add(f)
+        }
+
+        val batchManagerPy = File(pipelineDir, "batch-manager.py").absolutePath
+
+        for ((dirPath, items) in groups) {
+            if (items.isEmpty()) continue
+            val dir = File(dirPath)
+
+            val startBat = File(dir, "start-batch.bat")
+            val startText = buildStartBatchText(items)
+            startBat.writeText(transliterateToAscii(startText), Charset.forName("windows-1251"))
+            out.add(startBat)
+
+            val mgrBat = File(dir, "Batch Manager.bat")
+            val mgrText = buildBatchManagerText(batchManagerPy)
+            mgrBat.writeText(transliterateToAscii(mgrText), Charset.forName("windows-1251"))
+            out.add(mgrBat)
+        }
+
+        return out
+    }
+
     // ----------------------------
     // BAT building
     // ----------------------------
@@ -246,7 +281,7 @@ class BdremBatGenerator(
         sb.appendLine("  --scenes \"%SCENES%\" ^")
         sb.appendLine("  --output \"%SCENES_HDR%\" ^")
         sb.appendLine("  --workdir \"%HDR_WORKDIR%\" ^")
-        sb.appendLine("  > \"%LOGDIR%\\04_hdr_patch.log\" 2>&1")
+        sb.appendLine("  --log \"%LOGDIR%\\04_hdr_patch.log\"")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
         sb.appendLine("REM 2.3 zone-editor -> scenes-final.json")
@@ -255,7 +290,7 @@ class BdremBatGenerator(
         sb.appendLine("  --scenes \"%SCENES_HDR%\" ^")
         sb.appendLine("  --out \"%SCENES_FINAL%\" ^")
         sb.appendLine("  --command \"%WORKDIR%\\zone_edit_command.txt\" ^")
-        sb.appendLine("  > \"%LOGDIR%\\05_zone_edit.log\" 2>&1")
+        sb.appendLine("  --log \"%LOGDIR%\\05_zone_edit.log\"")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
         sb.appendLine("REM 2.4 mainpass av1an (video only)")
@@ -323,7 +358,7 @@ class BdremBatGenerator(
         sb.appendLine("REM  5) MUX -> output СЂСЏРґРѕРј СЃ РёСЃС…РѕРґРЅРёРєРѕРј: *-av1.mkv")
         sb.appendLine("REM ==========================================================")
         sb.appendLine()
-        sb.appendLine("${Paths.VS_PYTHON_EXE} ${q(muxPy)} --source \"%SRC%\" --workdir \"%WORKDIR%\" > \"%LOGDIR%\\09_mux.log\" 2>&1")
+        sb.appendLine("${Paths.VS_PYTHON_EXE} ${q(muxPy)} --source \"%SRC%\" --workdir \"%WORKDIR%\" --log \"%LOGDIR%\\09_mux.log\"")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
         sb.appendLine("echo OK")
@@ -354,6 +389,59 @@ class BdremBatGenerator(
         sb.appendLine("echo Logs: \"%LOGDIR%\"")
         sb.appendLine("exit /b 1")
 
+        return sb.toString()
+    }
+
+    private fun buildStartBatchText(files: List<File>): String {
+        val sb = StringBuilder()
+        sb.appendLine("@echo off")
+        sb.appendLine("setlocal EnableExtensions DisableDelayedExpansion")
+        sb.appendLine("chcp 1251 >nul")
+        sb.appendLine("pushd \"%~dp0\"")
+        sb.appendLine()
+        for (f in files) {
+            val base = f.nameWithoutExtension
+            sb.appendLine("call :run \"$base\"")
+            sb.appendLine("if errorlevel 1 goto :fail")
+        }
+        sb.appendLine()
+        sb.appendLine("echo OK")
+        sb.appendLine("exit /b 0")
+        sb.appendLine()
+        sb.appendLine(":run")
+        sb.appendLine("set \"BASENAME=%~1\"")
+        sb.appendLine("set \"OUT=%~dp0%BASENAME%-av1.mkv\"")
+        sb.appendLine("set \"BAT=%~dp0%BASENAME%.bat\"")
+        sb.appendLine("echo.")
+        sb.appendLine("echo ==========================================================")
+        sb.appendLine("echo ====== %BASENAME% ======")
+        sb.appendLine("echo ==========================================================")
+        sb.appendLine("if exist \"%OUT%\" (")
+        sb.appendLine("  echo [skip] output exists: \"%OUT%\"")
+        sb.appendLine("  exit /b 0")
+        sb.appendLine(")")
+        sb.appendLine("if not exist \"%BAT%\" (")
+        sb.appendLine("  echo [skip] missing bat: \"%BAT%\"")
+        sb.appendLine("  exit /b 0")
+        sb.appendLine(")")
+        sb.appendLine("call \"%BAT%\"")
+        sb.appendLine("exit /b %errorlevel%")
+        sb.appendLine()
+        sb.appendLine(":fail")
+        sb.appendLine("echo FAILED (code=%errorlevel%)")
+        sb.appendLine("exit /b 1")
+        return sb.toString()
+    }
+
+    private fun buildBatchManagerText(batchManagerPy: String): String {
+        val sb = StringBuilder()
+        sb.appendLine("@echo off")
+        sb.appendLine("setlocal EnableExtensions DisableDelayedExpansion")
+        sb.appendLine("chcp 1251 >nul")
+        sb.appendLine("pushd \"%~dp0\"")
+        sb.appendLine()
+        sb.appendLine("${Paths.PYTHON_EXE} \"${batchManagerPy}\" %*")
+        sb.appendLine("exit /b %errorlevel%")
         return sb.toString()
     }
 

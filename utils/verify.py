@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO, Tuple
 
@@ -91,7 +92,13 @@ def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
         p = workdir / p
     p.parent.mkdir(parents=True, exist_ok=True)
     enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    log_fh = p.open("w", encoding=enc, errors="replace")
+    log_fh = p.open("a", encoding=enc, errors="replace")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        log_fh.write(f"=== START verify {ts} ===\n")
+        log_fh.flush()
+    except Exception:
+        pass
     orig_stdout = sys.stdout
     orig_stderr = sys.stderr
     tee_out = TeeStream(orig_stdout, log_fh)
@@ -100,6 +107,12 @@ def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
     sys.stderr = tee_err
 
     def _cleanup() -> None:
+        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            log_fh.write(f"=== END verify {ts_end} ===\n")
+            log_fh.flush()
+        except Exception:
+            pass
         sys.stdout = orig_stdout
         sys.stderr = orig_stderr
         tee_out.close_log()

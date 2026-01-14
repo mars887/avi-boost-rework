@@ -79,6 +79,12 @@ fun runMain(args: Array<String>) {
         println("Generated: ${bat.absolutePath}")
     }
 
+    val orderedFiles = videoFiles.filter { result.containsKey(it.absolutePath) }
+    val batchScripts = gen.generateBatchScripts(orderedFiles)
+    batchScripts.forEach {
+        println("Generated: ${it.absolutePath}")
+    }
+
 }
 
 enum class TrackStatus {

@@ -24,12 +24,14 @@ Requires:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,6 +42,86 @@ from typing import Any, Dict, List, Optional, Tuple
 
 STATE_DIR_NAME = ".state"
 MUX_MARKER = "MUX_DONE"
+
+class TeeStream:
+    def __init__(self, stream, log_file) -> None:
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, s: str) -> int:
+        try:
+            self._stream.write(s)
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.write(s)
+                self._log.flush()
+            except Exception:
+                self._log = None
+        return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.flush()
+            except Exception:
+                self._log = None
+
+    def close_log(self) -> None:
+        if self._log is None:
+            return
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+        try:
+            self._log.close()
+        except Exception:
+            pass
+        self._log = None
+
+
+def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
+    if not log_path:
+        return
+    p = Path(log_path)
+    if not p.is_absolute() and workdir is not None:
+        p = workdir / p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    log_fh = p.open("a", encoding=enc, errors="replace")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        log_fh.write(f"=== START mux {ts} ===\n")
+        log_fh.flush()
+    except Exception:
+        pass
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    tee_out = TeeStream(orig_stdout, log_fh)
+    tee_err = TeeStream(orig_stderr, log_fh)
+    sys.stdout = tee_out
+    sys.stderr = tee_err
+
+    def _cleanup() -> None:
+        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            log_fh.write(f"=== END mux {ts_end} ===\n")
+            log_fh.flush()
+        except Exception:
+            pass
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
+        tee_out.close_log()
+        tee_err.close_log()
+
+    atexit.register(_cleanup)
 
 def eprint(*a: Any) -> None:
     print(*a, file=sys.stderr)
@@ -463,11 +545,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--source", required=True)
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--mkvmerge", default="mkvmerge", help="Path to mkvmerge (MKVToolNix)")
+    ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
     args = ap.parse_args(argv)
 
     source = Path(args.source)
     workdir = Path(args.workdir)
     mkvmerge = which_or(args.mkvmerge)
+    setup_logging(args.log, workdir)
     marker = marker_path(workdir)
     if marker.exists():
         print(f"[mux] skip: marker exists: {marker}")

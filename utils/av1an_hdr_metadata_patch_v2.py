@@ -42,12 +42,14 @@ Dependencies (must be in PATH, depending on enabled features):
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -62,9 +64,95 @@ HDR_PATCH_MARKER = "HDR_PATCH_DONE"
 # Utilities
 # --------------------------
 
-def setup_logging(verbose: bool) -> None:
+class TeeStream:
+    def __init__(self, stream, log_file) -> None:
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, s: str) -> int:
+        try:
+            self._stream.write(s)
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.write(s)
+                self._log.flush()
+            except Exception:
+                self._log = None
+        return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.flush()
+            except Exception:
+                self._log = None
+
+    def close_log(self) -> None:
+        if self._log is None:
+            return
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+        try:
+            self._log.close()
+        except Exception:
+            pass
+        self._log = None
+
+
+def setup_logging(log_path: str, verbose: bool, workdir: Optional[Path] = None) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    handler = logging.StreamHandler(sys.stdout)
+    stream = sys.stdout
+    log_fh = None
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    tee_out = None
+    tee_err = None
+
+    if log_path:
+        p = Path(log_path)
+        if not p.is_absolute() and workdir is not None:
+            p = workdir / p
+        p.parent.mkdir(parents=True, exist_ok=True)
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        log_fh = p.open("a", encoding=enc, errors="replace")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            log_fh.write(f"=== START hdr-patch {ts} ===\n")
+            log_fh.flush()
+        except Exception:
+            pass
+        tee_out = TeeStream(orig_stdout, log_fh)
+        tee_err = TeeStream(orig_stderr, log_fh)
+        sys.stdout = tee_out
+        sys.stderr = tee_err
+        stream = tee_out
+
+        def _cleanup() -> None:
+            ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                log_fh.write(f"=== END hdr-patch {ts_end} ===\n")
+                log_fh.flush()
+            except Exception:
+                pass
+            sys.stdout = orig_stdout
+            sys.stderr = orig_stderr
+            if tee_out is not None:
+                tee_out.close_log()
+            if tee_err is not None:
+                tee_err.close_log()
+
+        atexit.register(_cleanup)
+
+    handler = logging.StreamHandler(stream)
     formatter = logging.Formatter(
         "%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%H:%M:%S",
@@ -756,14 +844,15 @@ def main() -> None:
 
     parser.add_argument("--hdr10-add-enable-hdr", action="store_true", help="Also add --enable-hdr 1 to every scene (recommended).")
     parser.add_argument("--hdr10-scan-frames", type=int, default=120, help="How many initial frames to scan with ffprobe to find Mastering Display / Content Light Level side data (default: 120).")
+    parser.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute).")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging.")
 
     args = parser.parse_args()
-    setup_logging(args.verbose)
 
     source = Path(args.source).resolve()
     scenes_in = Path(args.scenes).resolve()
     workdir = Path(args.workdir).resolve()
+    setup_logging(args.log, args.verbose, workdir)
     marker = marker_path(workdir)
     if marker.exists():
         LOG.info("Skip: marker exists: %s", marker)
