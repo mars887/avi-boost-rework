@@ -33,7 +33,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 
 # ---------------------------
@@ -185,6 +185,262 @@ def run_cmd(cmd: List[str]) -> None:
         print(p.stdout, end="" if p.stdout.endswith("\n") else "\n")
     if p.returncode != 0:
         raise RuntimeError(f"mkvmerge_failed_rc_{p.returncode}")
+
+def parse_frame_rate(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        return v if v > 0 else None
+    s = str(value).strip()
+    if not s:
+        return None
+    if "/" in s:
+        a, b = s.split("/", 1)
+        try:
+            num = float(a)
+            den = float(b)
+            if den == 0:
+                return None
+            v = num / den
+            return v if v > 0 else None
+        except Exception:
+            return None
+    try:
+        v = float(s)
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+def get_stream_fps(source: Path) -> Optional[float]:
+    if not shutil.which("ffprobe"):
+        return None
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+        "-of", "csv=p=0",
+        str(source),
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        return None
+    for line in p.stdout.splitlines():
+        parts = [x.strip() for x in line.split(",") if x.strip()]
+        for part in parts:
+            fps = parse_frame_rate(part)
+            if fps:
+                return fps
+    return None
+
+def iter_frame_sizes(source: Path) -> Iterator[Tuple[int, Optional[float]]]:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_frames",
+        "-show_entries", "frame=pkt_size,pkt_duration_time",
+        "-of", "csv=p=0",
+        str(source),
+    ]
+    p = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert p.stdout is not None
+    for raw in p.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        try:
+            size = int(parts[0]) if parts[0] else 0
+        except Exception:
+            continue
+        dur: Optional[float] = None
+        if len(parts) > 1 and parts[1]:
+            try:
+                dur = float(parts[1])
+            except Exception:
+                dur = None
+        yield size, dur
+    p.stdout.close()
+    p.wait()
+
+def compute_source_bitrates(scenes: List[Dict[str, Any]], source: Path) -> List[Optional[float]]:
+    count = len(scenes)
+    if count == 0:
+        return []
+    if not shutil.which("ffprobe"):
+        print("[warn] ffprobe not found; source bitrate skipped.")
+        return [None] * count
+
+    ranges: List[Tuple[int, int]] = []
+    for sc in scenes:
+        try:
+            st = int(sc.get("start_frame"))
+            en = int(sc.get("end_frame"))
+        except Exception:
+            st, en = 0, 0
+        ranges.append((st, en))
+
+    sizes = [0] * count
+    durations = [0.0] * count
+    frames = [0] * count
+
+    scene_idx = 0
+    frame_idx = 0
+    for size, dur in iter_frame_sizes(source):
+        while scene_idx < count and frame_idx >= ranges[scene_idx][1]:
+            scene_idx += 1
+        if scene_idx >= count:
+            break
+        if frame_idx >= ranges[scene_idx][0]:
+            sizes[scene_idx] += int(size)
+            if dur is not None and dur > 0:
+                durations[scene_idx] += float(dur)
+            frames[scene_idx] += 1
+        frame_idx += 1
+
+    fps: Optional[float] = None
+    if any(d <= 0 and f > 0 for d, f in zip(durations, frames)):
+        fps = get_stream_fps(source)
+
+    out: List[Optional[float]] = []
+    for i in range(count):
+        if sizes[i] <= 0:
+            out.append(None)
+            continue
+        dur = durations[i]
+        if dur <= 0:
+            if fps and frames[i] > 0:
+                dur = frames[i] / fps
+            else:
+                out.append(None)
+                continue
+        if dur <= 0:
+            out.append(None)
+            continue
+        kbps = (sizes[i] * 8.0) / dur / 1000.0
+        out.append(kbps)
+    return out
+
+def compute_chunk_bitrates(av1an_temp: Path, scene_count: int) -> List[Optional[float]]:
+    out: List[Optional[float]] = [None] * scene_count
+    chunks_path = av1an_temp / "chunks.json"
+    encode_dir = av1an_temp / "encode"
+    if not chunks_path.exists() or not encode_dir.exists():
+        return out
+    try:
+        chunks = json.loads(chunks_path.read_text(encoding="utf-8"))
+    except Exception:
+        return out
+    if not isinstance(chunks, list):
+        return out
+    fps_default: Optional[float] = None
+    for ch in chunks:
+        fps_default = parse_frame_rate(ch.get("frame_rate"))
+        if fps_default:
+            break
+    for ch in chunks:
+        if not isinstance(ch, dict) or "index" not in ch:
+            continue
+        try:
+            idx = int(ch.get("index"))
+        except Exception:
+            continue
+        if idx < 0 or idx >= scene_count:
+            continue
+        try:
+            st = int(ch.get("start_frame"))
+            en = int(ch.get("end_frame"))
+        except Exception:
+            continue
+        fps = parse_frame_rate(ch.get("frame_rate")) or fps_default
+        if not fps or fps <= 0:
+            continue
+        duration = (en - st) / fps
+        if duration <= 0:
+            continue
+        ivf_path = encode_dir / f"{idx:05d}.ivf"
+        if not ivf_path.exists():
+            continue
+        size = ivf_path.stat().st_size
+        out[idx] = (size * 8.0) / duration / 1000.0
+    return out
+
+def apply_bitrates(scene_list: List[Dict[str, Any]], values: List[Optional[float]], key: str) -> bool:
+    changed = False
+    for i, sc in enumerate(scene_list):
+        if i >= len(values):
+            break
+        val = values[i]
+        if val is None:
+            continue
+        meta = sc.get("pb_meta")
+        if not isinstance(meta, dict):
+            meta = {}
+            sc["pb_meta"] = meta
+        bitrate = meta.get("bitrate")
+        if not isinstance(bitrate, dict):
+            bitrate = {}
+            meta["bitrate"] = bitrate
+        new_val = round(float(val), 3)
+        if bitrate.get(key) != new_val:
+            bitrate[key] = new_val
+            changed = True
+    return changed
+
+def update_scene_bitrates(workdir: Path, source: Path, *, include_source: bool = True) -> None:
+    video_dir = workdir / "video"
+    scenes_path = None
+    for name in ("scenes-final.json", "scenes-hdr.json", "scenes.json"):
+        p = video_dir / name
+        if p.exists():
+            scenes_path = p
+            break
+    if scenes_path is None:
+        print("[warn] scenes json not found; bitrate update skipped.")
+        return
+
+    try:
+        data = read_json(scenes_path)
+    except Exception as e:
+        print(f"[warn] failed to read scenes json: {e}")
+        return
+
+    scenes = data.get("scenes") if isinstance(data.get("scenes"), list) else None
+    split_scenes = data.get("split_scenes") if isinstance(data.get("split_scenes"), list) else None
+    base_list = scenes or split_scenes or []
+    if not base_list:
+        print("[warn] scenes list missing; bitrate update skipped.")
+        return
+
+    count = len(base_list)
+    fast_list = compute_chunk_bitrates(video_dir / "fastpass", count)
+    main_list = compute_chunk_bitrates(video_dir / "mainpass", count)
+    source_list = compute_source_bitrates(base_list, source) if include_source else [None] * count
+
+    changed = False
+    if scenes is not None and len(scenes) == count:
+        changed |= apply_bitrates(scenes, source_list, "source_kbps")
+        changed |= apply_bitrates(scenes, fast_list, "fastpass_kbps")
+        changed |= apply_bitrates(scenes, main_list, "mainpass_kbps")
+    if split_scenes is not None and len(split_scenes) == count:
+        changed |= apply_bitrates(split_scenes, source_list, "source_kbps")
+        changed |= apply_bitrates(split_scenes, fast_list, "fastpass_kbps")
+        changed |= apply_bitrates(split_scenes, main_list, "mainpass_kbps")
+
+    if changed:
+        write_json(scenes_path, data)
+        print(f"[ok] bitrate updated: {scenes_path}")
+    else:
+        print("[info] bitrate update: no changes.")
 
 def mkvmerge_json(mkvmerge: str, source: Path) -> Dict[str, Any]:
     cmd = [mkvmerge, "-J", str(source)]
@@ -546,6 +802,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--mkvmerge", default="mkvmerge", help="Path to mkvmerge (MKVToolNix)")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
+    ap.add_argument("--no-source-bitrate", action="store_true", help="Skip per-scene source bitrate calculation.")
     args = ap.parse_args(argv)
 
     source = Path(args.source)
@@ -566,6 +823,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise RuntimeError("missing_workdir")
         if not (Path(mkvmerge).exists() or shutil.which(mkvmerge)):
             raise RuntimeError("missing_mkvmerge")
+
+        update_scene_bitrates(workdir, source, include_source=(not args.no_source_bitrate))
 
         tracks = load_tracks(workdir)
 

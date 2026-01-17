@@ -140,10 +140,11 @@ def write_marker(out_path: Path) -> None:
 
 # Можно заполнить позже: {"--crf": Decimal("0.25"), "--someparam": Decimal("2")}
 # По ТЗ — список оставить пустым.
-DEFAULT_PARAM_STEP: Dict[str, Decimal] = {}
+DEFAULT_PARAM_STEP: Dict[str, Decimal] = {"--crf": Decimal("0.25")}
 
 # Полезные дефолты форматирования (можно расширять при желании)
 FORCE_2DP: set[str] = {"--crf"}  # CRF обычно хранится с 2 знаками
+META_KEY = "pb_meta"
 
 
 # ------------------------- ffprobe helpers -------------------------
@@ -261,6 +262,59 @@ def sec_to_frame_floor(sec: float, fps: Fraction) -> int:
 def sec_to_frame_ceil(sec: float, fps: Fraction) -> int:
     # end boundary: ceil
     return int(math.ceil(sec * float(fps) - 1e-9))
+
+
+def frame_to_sec(frame: int, fps: Fraction) -> float:
+    return float(frame) / float(fps)
+
+
+def format_timecode(frame: int, fps: Fraction) -> str:
+    total = frame_to_sec(frame, fps)
+    if total < 0:
+        total = 0.0
+    hours = int(total // 3600)
+    minutes = int((total % 3600) // 60)
+    seconds = total % 60.0
+    return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+
+
+def ensure_scene_meta(scene: Dict[str, Any], scene_idx: int, s0: int, s1: int, fps: Fraction) -> Dict[str, Any]:
+    meta = scene.get(META_KEY)
+    if not isinstance(meta, dict):
+        meta = {}
+        scene[META_KEY] = meta
+
+    meta["index"] = scene_idx
+
+    frames_meta = meta.get("frames")
+    if not isinstance(frames_meta, dict):
+        frames_meta = {}
+        meta["frames"] = frames_meta
+    frames_meta["start"] = s0
+    frames_meta["end"] = s1
+    frames_meta["len"] = max(0, s1 - s0)
+
+    t0 = frame_to_sec(s0, fps)
+    t1 = frame_to_sec(s1, fps)
+    time_meta = meta.get("time")
+    if not isinstance(time_meta, dict):
+        time_meta = {}
+        meta["time"] = time_meta
+    time_meta["start_sec"] = round(t0, 3)
+    time_meta["end_sec"] = round(t1, 3)
+    time_meta["duration_sec"] = round(max(0.0, t1 - t0), 3)
+    time_meta["start_tc"] = format_timecode(s0, fps)
+    time_meta["end_tc"] = format_timecode(s1, fps)
+
+    bitrate_meta = meta.get("bitrate")
+    if not isinstance(bitrate_meta, dict):
+        bitrate_meta = {}
+        meta["bitrate"] = bitrate_meta
+    bitrate_meta.setdefault("source_kbps", None)
+    bitrate_meta.setdefault("fastpass_kbps", None)
+    bitrate_meta.setdefault("mainpass_kbps", None)
+
+    return meta
 
 
 # ------------------------- command model -------------------------
@@ -709,6 +763,36 @@ def scene_selected(scene_idx: int, scene_start: int, scene_end: int, cmd: Comman
     return False
 
 
+def selector_matches(scene_idx: int, scene_start: int, scene_end: int, cmd: Command) -> List[Dict[str, Any]]:
+    matches: List[Dict[str, Any]] = []
+    scene_len = max(1, scene_end - scene_start)
+
+    for sel in cmd.selectors:
+        if sel.kind == "scene_idx":
+            for (a, b) in sel.scene_ranges:
+                if a <= scene_idx <= b:
+                    matches.append({
+                        "kind": "scene_idx",
+                        "range": [a, b],
+                        "raw": sel.raw,
+                    })
+        else:
+            for fr in sel.frame_ranges:
+                ol = overlap_len(scene_start, scene_end, fr.start, fr.end)
+                if ol <= 0:
+                    continue
+                matches.append({
+                    "kind": sel.kind,
+                    "range": [fr.start, fr.end],
+                    "raw": sel.raw,
+                    "rule": cmd.sep,
+                    "overlap_frames": ol,
+                    "overlap_ratio": round(float(ol) / float(scene_len), 4),
+                })
+
+    return matches
+
+
 # ------------------------- main apply -------------------------
 
 def apply_commands_to_scenes(
@@ -716,10 +800,19 @@ def apply_commands_to_scenes(
     commands: List[Command],
     *,
     param_step: Dict[str, Decimal],
+    video: VideoInfo,
 ) -> None:
     scenes = scenes_data.get("scenes") or []
     if not isinstance(scenes, list):
         raise RuntimeError("Invalid scenes.json: top-level 'scenes' must be a list.")
+
+    for idx, sc in enumerate(scenes):
+        try:
+            s0 = int(sc.get("start_frame"))
+            s1 = int(sc.get("end_frame"))
+        except Exception:
+            continue
+        ensure_scene_meta(sc, idx, s0, s1, video.fps)
 
     for cmd_i, cmd in enumerate(commands, start=1):
         for idx, sc in enumerate(scenes):
@@ -753,6 +846,7 @@ def apply_commands_to_scenes(
             pairs = parse_video_params([str(x) for x in vp])
 
             changes: List[str] = []
+            changes_detail: List[Dict[str, Optional[str]]] = []
             for act in cmd.actions:
                 new_pairs, before, after = apply_action_to_pairs(pairs, act, param_step=param_step)
                 if new_pairs is not pairs:
@@ -764,6 +858,11 @@ def apply_commands_to_scenes(
                             changes.append(f"{act.key}: {before} -> (removed)")
                         else:
                             changes.append(f"{act.key}: {before} -> {after}")
+                        changes_detail.append({
+                            "key": act.key,
+                            "before": before,
+                            "after": after,
+                        })
                 pairs = new_pairs
 
             if changes:
@@ -771,6 +870,24 @@ def apply_commands_to_scenes(
                 print(f"[scene {idx:4d}  {s0}-{s1})  cmd#{cmd_i}: {cmd.raw_line}")
                 for c in changes:
                     print(f"  - {c}")
+                meta = ensure_scene_meta(sc, idx, s0, s1, video.fps)
+                ze = meta.get("zone_editor")
+                if not isinstance(ze, dict):
+                    ze = {}
+                    meta["zone_editor"] = ze
+                applied = ze.get("applied_commands")
+                if not isinstance(applied, list):
+                    applied = []
+                    ze["applied_commands"] = applied
+                applied.append({
+                    "cmd_index": cmd_i,
+                    "cmd_line": cmd.raw_line,
+                    "selectors": [sel.raw for sel in cmd.selectors],
+                    "sep": cmd.sep,
+                    "matches": selector_matches(idx, s0, s1, cmd),
+                    "changes": changes_detail,
+                })
+                ze["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     scenes_data["split_scenes"] = copy.deepcopy(scenes)
 
@@ -818,7 +935,7 @@ def main(argv: Sequence[str]) -> int:
     commands = parse_commands(raw_lines, video=video, total_frames=total_frames)
 
     # Apply
-    apply_commands_to_scenes(scenes_data, commands, param_step=DEFAULT_PARAM_STEP)
+    apply_commands_to_scenes(scenes_data, commands, param_step=DEFAULT_PARAM_STEP, video=video)
 
     # Save
     with open(out_path, "w", encoding="utf-8") as f:

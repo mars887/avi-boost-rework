@@ -365,6 +365,37 @@ def scenes_to_ranges(scenes_obj: Dict[str, Any]) -> List[Tuple[int, int]]:
     scenes = scenes_obj.get("split_scenes") or scenes_obj.get("scenes") or []
     return [(int(s["start_frame"]), int(s["end_frame"])) for s in scenes]
 
+
+def apply_avg_func(avg_total: float, avg_func: str) -> float:
+    s = str(avg_func or "").strip()
+    if not s:
+        return avg_total
+    if s[0] in "+-" and len(s) > 1:
+        try:
+            delta = float(s)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --avg-func value: {avg_func!r}") from exc
+        return avg_total + delta
+    if s[0] == "!":
+        if len(s) == 1:
+            raise ValueError(f"Invalid --avg-func value: {avg_func!r}")
+        try:
+            target = float(s[1:])
+        except ValueError as exc:
+            raise ValueError(f"Invalid --avg-func value: {avg_func!r}") from exc
+        return target
+    if "%" in s:
+        left, right = s.split("%", 1)
+        if not left or not right:
+            raise ValueError(f"Invalid --avg-func value: {avg_func!r}")
+        try:
+            target = float(left)
+            pct = float(right)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --avg-func value: {avg_func!r}") from exc
+        return avg_total + (target - avg_total) * (pct / 100.0)
+    raise ValueError(f"Invalid --avg-func value: {avg_func!r}")
+
 def write_base_scenes_from_av1an(av1an_temp: Path, base_scenes_path: Path) -> None:
     av1an_scenes_path = av1an_temp / "scenes.json"
     if not av1an_scenes_path.exists():
@@ -545,6 +576,10 @@ def run_fastpass_av1an(
     # Provide scenes file (skip scene detection)
     if scenes_path is not None:
         cmd.extend(["--scenes", str(scenes_path)])
+        cmd.extend(["--extra-split-sec", "30"])
+    else:
+        cmd.extend(["--extra-split-sec", "15"])
+
 
     # Muxing defaults from old scripts
     cmd.extend(["-m", "lsmash", "-c", "mkvmerge"])
@@ -2185,7 +2220,8 @@ def main() -> int:
     parser.add_argument("--max-negative-dev", type=float, default=None,
                         help="Max allowed CRF decrease below base (better quality).")
     parser.add_argument("-a", "--aggressive", type=float, default=1.0, help="boosting multiplier.")
-    parser.add_argument("--avg-shift", type=float, default=0.0, help="shift metric avg")
+    parser.add_argument("--avg-func", default="",
+                        help="Adjust metric avg: +N/-N (shift), !N (set), or target%percent (move toward target by percent).")
 
     args = parser.parse_args()
 
@@ -2411,15 +2447,16 @@ def main() -> int:
             else:
                 raise ValueError("Invalid --metrics (expected 1..3).")
             
-            if args.avg_shift:
-                print(f"[avg-shift] {avg_total} -> {avg_total + args.avg_shift}")
+            avg_total_adj = apply_avg_func(avg_total, args.avg_func)
+            if str(args.avg_func).strip():
+                print(f"[avg-func] {avg_total} -> {avg_total_adj} ({args.avg_func})")
                 
             apply_crf_adjustments_to_scenes(
                 base_scenes_path=base_scenes_path,
                 out_scenes_path=out_scenes_path,
                 scene_ranges=scene_ranges,
                 per_chunk_5=per_chunk_5,
-                avg_total=avg_total + args.avg_shift,
+                avg_total=avg_total_adj,
                 base_crf=float(args.quality),
                 aggressive=float(args.aggressive),
                 deviation=float(args.deviation),
