@@ -607,6 +607,52 @@ def _load_schedule(path: str) -> dict:
     return data
 
 
+def _collect_decode_ranges(
+    nvof_runs: List[NvofRun],
+    luma_ranges: Optional[List[Tuple[int, int]]],
+    noise_ranges: Optional[List[Tuple[int, int]]],
+    *,
+    nvof_enabled: bool,
+    luma_enabled: bool,
+    noise_enabled: bool,
+) -> Optional[List[Tuple[int, int]]]:
+    ranges: List[Tuple[int, int]] = []
+    if nvof_enabled:
+        for run in nvof_runs:
+            if run.ranges is None:
+                return None
+            for start, end in run.ranges:
+                start = max(0, int(start) - 1)
+                ranges.append((start, int(end)))
+    if luma_enabled:
+        if luma_ranges is None:
+            return None
+        ranges.extend(luma_ranges)
+    if noise_enabled:
+        if noise_ranges is None:
+            return None
+        ranges.extend(noise_ranges)
+    if not ranges:
+        return []
+    return _merge_ranges(ranges)
+
+
+def _reader_grab(vr) -> bool:
+    if hasattr(vr, "grab"):
+        try:
+            ok = vr.grab()
+            if isinstance(ok, (tuple, list)):
+                ok = ok[0]
+            return bool(ok)
+        except Exception:
+            pass
+    try:
+        ok, _ = vr.nextFrame()
+        return bool(ok)
+    except Exception:
+        return False
+
+
 def parse_metrics_arg(raw: str) -> set[str]:
     tokens = {t.strip().lower() for t in str(raw).split(",") if t.strip()}
     if not tokens:
@@ -631,8 +677,8 @@ def parse_args():
     ap.add_argument("--gpu", type=int, default=0)
 
     # NVOF path
-    ap.add_argument("--nvof-w", type=int, default=800)
-    ap.add_argument("--nvof-h", type=int, default=450)
+    ap.add_argument("--nvof-w", type=int, default=1280)
+    ap.add_argument("--nvof-h", type=int, default=720)
     ap.add_argument("--grid", type=int, default=4, choices=(1, 2, 4))
     ap.add_argument("--perf", default="slow", choices=("fast", "medium", "slow"))
     ap.add_argument("--temporal-hints", type=int, default=1)
@@ -648,16 +694,16 @@ def parse_args():
 
     ap.add_argument("--tile", type=int, default=64)
     ap.add_argument("--pix-step", type=int, default=2)
-    ap.add_argument("--tile-sample", type=float, default=0.5)
-    ap.add_argument("--tile-keep", type=float, default=0.30)
+    ap.add_argument("--tile-sample", type=float, default=0.6)
+    ap.add_argument("--tile-keep", type=float, default=0.6)
     ap.add_argument("--d2", type=int, default=2)
 
     ap.add_argument("--seed", type=int, default=12345)
 
-    ap.add_argument("--min-luma", type=float, default=4.0)
-    ap.add_argument("--max-luma", type=float, default=251.0)
+    ap.add_argument("--min-luma", type=float, default=1.0)
+    ap.add_argument("--max-luma", type=float, default=254.0)
     ap.add_argument("--min-var", type=float, default=1.0)
-    ap.add_argument("--min-samples", type=int, default=16)
+    ap.add_argument("--min-samples", type=int, default=1)
 
     ap.add_argument("--pool", choices=["median", "trimmed_mean"], default="median")
     ap.add_argument("--trim-low", type=float, default=0.025)
@@ -892,6 +938,17 @@ def main():
     elif noise_requested:
         log("Noise metrics disabled (--noise-step <= 0)")
 
+    decode_ranges = _collect_decode_ranges(
+        nvof_runs,
+        luma_ranges,
+        noise_ranges,
+        nvof_enabled=nvof_enabled,
+        luma_enabled=luma_enabled,
+        noise_enabled=noise_enabled,
+    )
+    if decode_ranges is not None:
+        log(f"Decode ranges: {len(decode_ranges)} (grab for gaps)")
+
     log(f"Sync/harvest every {args.sync_every} frames")
 
     # Reusable GPU buffers
@@ -996,6 +1053,7 @@ def main():
     # Measured run continues on the same reader (we want real output order)
     frame_idx = 0
     n_total = 0
+    range_idx = 0
 
     # Host-side collected metrics
     metrics_luma_mean: Dict[int, float] = {}
@@ -1137,6 +1195,18 @@ def main():
     while True:
         if args.max_frames and n_total >= int(args.max_frames):
             break
+
+        if decode_ranges is not None:
+            while range_idx < len(decode_ranges) and frame_idx > decode_ranges[range_idx][1]:
+                range_idx += 1
+            if range_idx >= len(decode_ranges):
+                break
+            start, end = decode_ranges[range_idx]
+            if frame_idx < start:
+                if not _reader_grab(vr):
+                    break
+                frame_idx += 1
+                continue
 
         ok, g = vr.nextFrame()
         if not ok:
@@ -1395,7 +1465,7 @@ def main():
             if (n_total % int(args.print_every)) == 0:
                 dt = time.perf_counter() - t0
                 fps = n_total / dt if dt > 0 else 0.0
-                row_parts = [str(n_total), f"{fps:.1f}"]
+                row_parts = [str(frame_idx - 1), f"{fps:.1f}"]
                 if nvof_enabled:
                     if schedule_used or len(nvof_runs) > 1:
                         for run in nvof_runs:
@@ -1505,12 +1575,23 @@ def main():
             noise_suffix = f"_{noise_id}" if (schedule_used and noise_id and noise_id != "noise") else ""
             csv_cols.extend([f"noise_sigma{noise_suffix}", f"grain_ratio{noise_suffix}"])
 
-        if nvof_enabled or luma_enabled:
-            frame_indices = range(n_total)
-        elif noise_enabled:
-            frame_indices = sorted(metrics_noise_sigma.keys())
+        if decode_ranges is not None:
+            frame_set: set[int] = set()
+            if nvof_enabled:
+                for run in nvof_runs:
+                    frame_set.update(run.metrics.keys())
+            if luma_enabled:
+                frame_set.update(metrics_luma_mean.keys())
+            if noise_enabled:
+                frame_set.update(metrics_noise_sigma.keys())
+            frame_indices = sorted(frame_set)
         else:
-            frame_indices = []
+            if nvof_enabled or luma_enabled:
+                frame_indices = range(n_total)
+            elif noise_enabled:
+                frame_indices = sorted(metrics_noise_sigma.keys())
+            else:
+                frame_indices = []
 
         rows = []
         for fidx in frame_indices:

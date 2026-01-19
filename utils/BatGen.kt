@@ -182,11 +182,11 @@ class BdremBatGenerator(
             { key -> key.startsWith("^^") && key != "^^crf" && key != "^^preset" },
             { key -> key.replace("^", "-") }
         )
-        val mainpassBase = if (mainpassPreset.isNullOrBlank()) {
-            "--crf $crfValue"
-        } else {
-            "--preset $mainpassPreset --crf $crfValue"
-        }
+        // val mainpassBase = if (mainpassPreset.isNullOrBlank()) {
+        //     "--crf $crfValue"
+        // } else {
+        //     "--preset $mainpassPreset --crf $crfValue"
+        // }
         val fastpassVf = getTrackMuxValue(videoTrack, "fastpass", "")
         val mainpassVf = getTrackMuxValue(videoTrack, "mainpass", "")
 
@@ -201,9 +201,10 @@ class BdremBatGenerator(
         sb.appendLine("set \"AB_MULTIPIER=$abMultiplier\"")
         sb.appendLine("set \"AB_POS_DEV=$abPosDev\"")
         sb.appendLine("set \"AB_NEG_DEV=$abNegDev\"")
+        sb.appendLine("set \"QUALITY=$crfValue\"")
         sb.appendLine()
-        sb.appendLine("set \"FASTPASS_VF=$fastpassVf\"") //~2
-        sb.appendLine("set \"MAINPASS_VF=$mainpassVf\"") //~2
+        sb.appendLine("set \"FASTPASS_VF=$fastpassVf\"")
+        sb.appendLine("set \"MAINPASS_VF=$mainpassVf\"")
         sb.appendLine()
         sb.appendLine("set \"MAINPASS_AUDIO=-an -sn\"")
         sb.appendLine()
@@ -266,7 +267,7 @@ class BdremBatGenerator(
         sb.appendLine("  --workers \"%WORKERS%\" ^")
         sb.appendLine("  -v \"%FASTPASS%\" ^")
         sb.appendLine("  --final-override \"%MAINPASS%\" ^")
-        sb.appendLine("  --quality \"$crfValue\" ^")
+        sb.appendLine("  --quality \"%QUALITY%\" ^")
         if (!fastpassPreset.isNullOrBlank()) sb.appendLine("  --fast-preset \"$fastpassPreset\" ^")
         if (!mainpassPreset.isNullOrBlank()) sb.appendLine("  --preset \"$mainpassPreset\" ^")
         sb.appendLine("  -a \"%AB_MULTIPIER%\" ^")
@@ -309,8 +310,8 @@ class BdremBatGenerator(
         sb.appendLine("  -e svt-av1 ^")
         sb.appendLine("  --pix-format yuv420p10le ^")
         sb.appendLine("  --no-defaults ^")
-        sb.appendLine("  -v \"$mainpassBase\" ^")
-        if (mainpassVf.isNotBlank()) sb.appendLine("  -f \"%MAINPASS_VF%\" ^")
+        // sb.appendLine("  -v \"$mainpassBase\" ^")
+        if (mainpassVf.isNotBlank()) sb.appendLine("  -f \"-vf %MAINPASS_VF%\" ^")
         sb.appendLine("  -a=\"%MAINPASS_AUDIO%\"")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()

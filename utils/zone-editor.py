@@ -655,6 +655,15 @@ def apply_action_to_pairs(
         new_pairs = [p for p in pairs if p[0] != key]
         return new_pairs, before, None
 
+    if key != "--crf":
+        if idxs:
+            new_pairs = list(pairs)
+            last_i = idxs[-1]
+            new_pairs[last_i] = (key, raw)
+            return new_pairs, before, raw
+        new_pairs = list(pairs) + [(key, raw)]
+        return new_pairs, None, raw
+
     # decide operation kind
     # percent forms: "+10%" "-10%" "+10%0.25" "-10%0.25"
     m_pct = re.match(r"^([+-])(\d+(?:\.\d+)?)%(\d+(?:\.\d+)?)?$", raw)
@@ -896,13 +905,38 @@ def apply_commands_to_scenes(
 
 def main(argv: Sequence[str]) -> int:
     ap = argparse.ArgumentParser(description="Edit av1an scenes.json using a simple command DSL.")
-    ap.add_argument("--scenes", required=True, help="Input scenes.json (av1an scenes file)")
-    ap.add_argument("--out", required=True, help="Output scenes.json path")
-    ap.add_argument("--source", required=True, help="Source video file (for chapters/time->frames mapping)")
-    ap.add_argument("--command", required=True, help="Commands: file path (newline-separated) OR inline string (separator '?')")
+    ap.add_argument("--scenes", required=False, help="Input scenes.json (av1an scenes file)")
+    ap.add_argument("--out", required=False, help="Output scenes.json path")
+    ap.add_argument("--source", required=False, help="Source video file (for chapters/time->frames mapping)")
+    ap.add_argument("--command", required=False, help="Commands: file path (newline-separated) OR inline string (separator '?')")
     ap.add_argument("--no-vfr-warn", action="store_true", help="Do not warn when avg_frame_rate differs from r_frame_rate")
+    ap.add_argument("--parse-check", action="store_true", help="Parse-check command(s) and exit without writing output.")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --out dir if not absolute)")
     args = ap.parse_args(list(argv))
+
+    if args.parse_check:
+        if not args.source:
+            raise SystemExit("--source is required for --parse-check")
+        if not args.command:
+            raise SystemExit("--command is required for --parse-check")
+        base_dir = Path.cwd()
+        if args.out:
+            base_dir = Path(args.out).resolve().parent
+        setup_logging(args.log, base_dir)
+        video = read_video_info(args.source)
+        raw_lines = load_commands(args.command)
+        commands = parse_commands(raw_lines, video=video, total_frames=None)
+        print(f"[ok] parse-check: {len(commands)} commands")
+        return 0
+
+    if not args.scenes:
+        raise SystemExit("--scenes is required")
+    if not args.out:
+        raise SystemExit("--out is required")
+    if not args.source:
+        raise SystemExit("--source is required")
+    if not args.command:
+        raise SystemExit("--command is required")
 
     out_path = Path(args.out).resolve()
     setup_logging(args.log, out_path.parent)

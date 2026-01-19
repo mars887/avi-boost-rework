@@ -2013,7 +2013,8 @@ def apply_crf_adjustments_to_scenes(
     per_chunk_5: List[float],
     avg_total: float,
     base_crf: float,
-    aggressive: float,
+    pos_dev_multiplier: float,
+    neg_dev_multiplier: float,
     deviation: float,
     max_positive_dev: Optional[float],
     max_negative_dev: Optional[float],
@@ -2030,12 +2031,15 @@ def apply_crf_adjustments_to_scenes(
     max_pos = max_positive_dev if max_positive_dev is not None else base_dev
     max_neg = max_negative_dev if max_negative_dev is not None else base_dev
 
-    aggressive = aggressive * 20
+    pos_multiplier = float(pos_dev_multiplier) * 20.0
+    neg_multiplier = float(neg_dev_multiplier) * 20.0
 
 
     updated: List[Dict[str, Any]] = []
     for i, (st, en) in enumerate(scene_ranges):
-        adj = math.ceil((1.0 - (per_chunk_5[i] / avg_total)) * aggressive * 4.0) / 4.0
+        delta = 1.0 - (per_chunk_5[i] / avg_total)
+        multiplier = pos_multiplier if delta >= 0 else neg_multiplier
+        adj = math.ceil(delta * multiplier * 4.0) / 4.0
         new_crf = float(base_crf) - float(adj)
 
         # Clamp deviations
@@ -2219,7 +2223,12 @@ def main() -> int:
                         help="Max allowed CRF increase above base (worse quality).")
     parser.add_argument("--max-negative-dev", type=float, default=None,
                         help="Max allowed CRF decrease below base (better quality).")
-    parser.add_argument("-a", "--aggressive", type=float, default=1.0, help="boosting multiplier.")
+    parser.add_argument("-a", "--aggressive", type=float, default=None,
+                        help="Boosting multiplier (overrides +/- multipliers when specified).")
+    parser.add_argument("--pos-dev-multiplier", type=float, default=None,
+                        help="Multiplier used when adj is positive (requires --neg-dev-multiplier if set).")
+    parser.add_argument("--neg-dev-multiplier", type=float, default=None,
+                        help="Multiplier used when adj is negative (requires --pos-dev-multiplier if set).")
     parser.add_argument("--avg-func", default="",
                         help="Adjust metric avg: +N/-N (shift), !N (set), or target%percent (move toward target by percent).")
 
@@ -2450,7 +2459,25 @@ def main() -> int:
             avg_total_adj = apply_avg_func(avg_total, args.avg_func)
             if str(args.avg_func).strip():
                 print(f"[avg-func] {avg_total} -> {avg_total_adj} ({args.avg_func})")
-                
+
+            aggressive_val = args.aggressive
+            pos_val = args.pos_dev_multiplier
+            neg_val = args.neg_dev_multiplier
+            if aggressive_val is not None:
+                pos_dev_multiplier = float(aggressive_val)
+                neg_dev_multiplier = float(aggressive_val)
+            else:
+                if (pos_val is None) != (neg_val is None):
+                    raise RuntimeError(
+                        "Specify either --aggressive or both --pos-dev-multiplier and --neg-dev-multiplier."
+                    )
+                if pos_val is None and neg_val is None:
+                    pos_dev_multiplier = 1.0
+                    neg_dev_multiplier = 1.0
+                else:
+                    pos_dev_multiplier = float(pos_val)
+                    neg_dev_multiplier = float(neg_val)
+
             apply_crf_adjustments_to_scenes(
                 base_scenes_path=base_scenes_path,
                 out_scenes_path=out_scenes_path,
@@ -2458,7 +2485,8 @@ def main() -> int:
                 per_chunk_5=per_chunk_5,
                 avg_total=avg_total_adj,
                 base_crf=float(args.quality),
-                aggressive=float(args.aggressive),
+                pos_dev_multiplier=pos_dev_multiplier,
+                neg_dev_multiplier=neg_dev_multiplier,
                 deviation=float(args.deviation),
                 max_positive_dev=args.max_positive_dev,
                 max_negative_dev=args.max_negative_dev,

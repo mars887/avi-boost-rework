@@ -250,6 +250,29 @@ def full_clear(groups: List[SourceGroup]) -> None:
                 continue
             remove_path(entry)
 
+def verify_config(group: SourceGroup, *, check_filters: bool, check_params: bool) -> None:
+    script = Path(__file__).with_name("batch-verify.py")
+    if not script.exists():
+        print(f"[err] verify script not found: {script}")
+        return
+    cmd = [
+        sys.executable,
+        str(script),
+        "--source", str(group.source),
+        "--workdir", str(group.workdir),
+        "--per-file-bat", str(group.per_file_bat),
+        "--result-mkv", str(group.result_mkv),
+        "--result-mp4", str(group.result_mp4),
+    ]
+    if check_filters:
+        cmd.append("--check-filters")
+    if check_params:
+        cmd.append("--check-params")
+    print("[cmd]", " ".join(cmd))
+    p = subprocess.run(cmd)
+    if p.returncode != 0:
+        print(f"[err] verify failed (code={p.returncode})")
+
 
 def print_menu() -> None:
     print()
@@ -258,6 +281,7 @@ def print_menu() -> None:
     print("  2) Make Web MP4")
     print("  3) Clear Stage")
     print("  4) Full Clear")
+    print("  5) Verify")
     print("  Q) Quit")
 
 
@@ -272,11 +296,21 @@ def print_clear_stage_menu() -> None:
 
 
 def main(argv: List[str]) -> int:
-    if not argv:
-        print("Drag files onto this script or pass paths as arguments.")
-        return 1
+    check_filters = True
+    check_params = False
+    paths: List[str] = []
+    for a in argv:
+        if a == "--check-filters":
+            continue
+        elif a == "--check-params":
+            continue
+        else:
+            paths.append(a)
+    if not paths:
+        print("No input args. Scanning current directory...")
+        paths = ["."]
 
-    groups, unknown = collect_sources(argv)
+    groups, unknown = collect_sources(paths)
     if not groups:
         print("No sources found.")
         if unknown:
@@ -340,6 +374,11 @@ def main(argv: List[str]) -> int:
                     print("Unknown option.")
         elif choice == "4":
             full_clear(groups)
+        elif choice == "5":
+            for g in groups:
+                print()
+                print(f"[Verify] {g.base}")
+                verify_config(g, check_filters=check_filters, check_params=check_params)
         else:
             print("Unknown option.")
 
