@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-auto-boost (2.7) — PSD + scenes.json workflow + resume markers + VapourSynth Vship/FFMS2 defaults
+auto-boost (2.9) — PSD + scenes.json workflow + resume markers + VapourSynth Vship/FFMS2 defaults
 
 Pipeline (default --stage 0, with automatic resume):
   1) Scene detection (PSD) if --sdm psd -> base scenes.json (zone_overrides = null)
@@ -540,6 +540,8 @@ def build_av1an_filter_arg(ffmpeg_arg: str) -> List[str]:
 def run_fastpass_av1an(
     *,
     input_file: Path,
+    fastpass_vpy: Optional[Path],
+    fastpass_proxy: Optional[Path],
     output_file: Path,
     scenes_path: Optional[Path],
     av1an_temp: Path,
@@ -558,9 +560,10 @@ def run_fastpass_av1an(
         ensure_exists(scenes_path, "Base scenes.json")
     ensure_dir(av1an_temp)
 
+    av1an_input = fastpass_vpy if fastpass_vpy is not None else input_file
     cmd: List[str] = [
         "av1an",
-        "-i", str(input_file),
+        "-i", str(av1an_input),
         "--temp", str(av1an_temp),
         "-y",
     ]
@@ -572,6 +575,10 @@ def run_fastpass_av1an(
         cmd.extend(["--log-level", str(log_level)])
     if log_file is not None:
         cmd.extend(["--log-file", str(log_file)])
+    if fastpass_proxy is not None:
+        cmd.extend(["--proxy", str(fastpass_proxy)])
+    if fastpass_vpy is not None or fastpass_proxy is not None:
+        cmd.extend(["--vspipe-args", f"src={input_file}"])
 
     # Provide scenes file (skip scene detection)
     if scenes_path is not None:
@@ -767,14 +774,6 @@ def calculate_ssimu2(
 
     # Accept legacy names but force VapourSynth plugin backends.
     selected = (backend or "auto").strip().lower()
-    if selected in {"ffvship", "ffvship.exe", "ffvship-cli"}:
-        selected = "vship"
-
-    if selected in {"turbo", "cli"}:
-        raise RuntimeError(
-            "SSIMU2 backend 'turbo' is disabled in this build. "
-            "Use --ssimu2-backend vship (preferred) or vszip."
-        )
 
     if not has_vapoursynth():
         raise RuntimeError("VapourSynth is not available (python module not found). Install VapourSynth and the required plugins.")
@@ -2037,7 +2036,7 @@ def apply_crf_adjustments_to_scenes(
 
     updated: List[Dict[str, Any]] = []
     for i, (st, en) in enumerate(scene_ranges):
-        delta = 1.0 - (per_chunk_5[i] / avg_total)
+        delta = 1.0 - (per_chunk_5[i] / (avg_total + 0.001))
         multiplier = pos_multiplier if delta >= 0 else neg_multiplier
         adj = math.ceil(delta * multiplier * 4.0) / 4.0
         new_crf = float(base_crf) - float(adj)
@@ -2176,6 +2175,10 @@ def main() -> int:
     # av1an fastpass
     parser.add_argument("--fastpass-out", default=None,
                         help="Fast-pass output file. Default: <project>/<stem>.fastpass.mkv")
+    parser.add_argument("--fastpass-vpy", default=None,
+                        help="Optional .vpy path for fast-pass input (used for av1an -i). Adds --vspipe-args src=<input>.")
+    parser.add_argument("--fastpass-proxy", default=None,
+                        help="Optional av1an --proxy path for fast-pass. Adds --proxy and --vspipe-args src=<input>.")
     parser.add_argument("--workers", type=int, default=8,
                         help="av1an workers for fast-pass.")
     parser.add_argument("--lp", type=int, default=3, help="--lp for fast-pass encoding (svt-av1).")
@@ -2257,6 +2260,8 @@ def main() -> int:
     base_scenes_path = Path(args.base_scenes).expanduser().resolve() if args.base_scenes else (psd_dir / "scenes.psd.json")
     out_scenes_path = Path(args.out_scenes).expanduser().resolve() if args.out_scenes else (project_dir / "scenes.final.json")
     fastpass_out = Path(args.fastpass_out).expanduser().resolve() if args.fastpass_out else (fastpass_dir / f"{input_file.stem}.fastpass.mkv")
+    fastpass_vpy = Path(args.fastpass_vpy).expanduser().resolve() if args.fastpass_vpy else None
+    fastpass_proxy = Path(args.fastpass_proxy).expanduser().resolve() if args.fastpass_proxy else None
 
     ssimu2_log = fastpass_dir / f"{input_file.stem}_ssimu2.log"
     xpsnr_log = fastpass_dir / f"{input_file.stem}_xpsnr.log"
@@ -2357,8 +2362,14 @@ def main() -> int:
         if marks["fastpass"].exists() and fastpass_out.exists() and fastpass_out.stat().st_size > 0:
             print(f"[resume] fast-pass already completed: {fastpass_out}")
         else:
+            if fastpass_vpy is not None:
+                ensure_exists(fastpass_vpy, "Fast-pass vpy")
+            if fastpass_proxy is not None:
+                ensure_exists(fastpass_proxy, "Fast-pass proxy")
             run_fastpass_av1an(
                 input_file=input_file,
+                fastpass_vpy=fastpass_vpy,
+                fastpass_proxy=fastpass_proxy,
                 output_file=fastpass_out,
                 scenes_path=base_scenes_path if args.sdm == "psd" else None,
                 av1an_temp=av1an_temp,
