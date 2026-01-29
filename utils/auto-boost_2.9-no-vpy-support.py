@@ -619,124 +619,8 @@ def has_cv2() -> bool:
         return False
 
 
-def _unwrap_vs_output(out: object, vs_mod):
-    """Best-effort unwrap of VapourSynth output containers to a VideoNode."""
-    try:
-        if isinstance(out, vs_mod.VideoNode):
-            return out
-    except Exception:
-        pass
-
-    # vspipe-style output tuples/objects may expose the clip/node as an attribute.
-    for attr in ("clip", "node", "video", "output"):
-        try:
-            v = getattr(out, attr, None)
-            if v is not None and isinstance(v, vs_mod.VideoNode):
-                return v
-        except Exception:
-            continue
-
-    # Or may simply be a tuple/list where the first element is the clip.
-    if isinstance(out, (tuple, list)):
-        for v in out:
-            try:
-                if isinstance(v, vs_mod.VideoNode):
-                    return v
-            except Exception:
-                continue
-
-    return None
-
-
-def _load_vs_clip_from_vpy(vpy_path: Path, *, vpy_src: Path):
-    """Execute a .vpy in-process and return its first output clip.
-
-    This avoids temp files by directly importing/executing the script and extracting:
-      - output 0 via vs.get_output(0) / core.get_output(0), or
-      - a VideoNode variable from the script namespace.
-
-    The variable `src` is injected, matching av1an's `--vspipe-args src=<input>` behavior.
-    """
-    if not has_vapoursynth():
-        raise RuntimeError("VapourSynth is not available (python module not found).")
-
+def load_vs_clip(path: Path, vs_source: str):
     import vapoursynth as vs  # type: ignore
-    import runpy
-
-    # Clear previously registered outputs (important if this process runs multiple vpy loads).
-    try:
-        if hasattr(vs, "clear_outputs"):
-            vs.clear_outputs()
-        elif hasattr(vs.core, "clear_outputs"):
-            vs.core.clear_outputs()  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-    old_cwd = os.getcwd()
-    old_sys_path = list(sys.path)
-
-    try:
-        os.chdir(str(vpy_path.parent))
-        if str(vpy_path.parent) not in sys.path:
-            sys.path.insert(0, str(vpy_path.parent))
-
-        init_globals = {
-            "__file__": str(vpy_path),
-            "__name__": "__vapoursynth__",
-            "src": str(vpy_src),
-        }
-        ns = runpy.run_path(str(vpy_path), init_globals=init_globals)
-    finally:
-        os.chdir(old_cwd)
-        sys.path[:] = old_sys_path
-
-    # 1) Preferred: fetch output 0 registered via clip.set_output().
-    getters = []
-    if hasattr(vs, "get_output"):
-        getters.append(getattr(vs, "get_output"))
-    if hasattr(vs.core, "get_output"):
-        getters.append(getattr(vs.core, "get_output"))
-
-    for get_out in getters:
-        try:
-            out = get_out(0)
-        except Exception:
-            continue
-        node = _unwrap_vs_output(out, vs)
-        if node is not None:
-            return node
-
-    # 2) Fallback: common variable names.
-    for k in ("clip", "out", "output", "src_clip"):
-        v = ns.get(k)
-        try:
-            if isinstance(v, vs.VideoNode):
-                return v
-        except Exception:
-            continue
-
-    # 3) Last resort: any VideoNode in globals.
-    for v in ns.values():
-        try:
-            if isinstance(v, vs.VideoNode):
-                return v
-        except Exception:
-            continue
-
-    raise RuntimeError(
-        f"No VapourSynth output found in vpy: {vpy_path}. "
-        "Ensure it either calls clip.set_output() (output index 0) or leaves a VideoNode variable (e.g. clip=...)."
-    )
-
-
-def load_vs_clip(path: Path, vs_source: str, *, vpy_src: Optional[Path] = None):
-    import vapoursynth as vs  # type: ignore
-
-    # Allow using a .vpy directly as a reference source (no temp files).
-    if path.suffix.lower() == ".vpy":
-        if vpy_src is None:
-            raise ValueError(f"Loading a .vpy requires vpy_src (original input path), but none was provided: {path}")
-        return _load_vs_clip_from_vpy(path, vpy_src=vpy_src)
 
     core = vs.core
     req = (vs_source or "ffms2").lower().strip()
@@ -769,6 +653,8 @@ def load_vs_clip(path: Path, vs_source: str, *, vpy_src: Optional[Path] = None):
         except Exception as e:
             last_err = e
     raise RuntimeError(f"Could not load {path}. Last error: {last_err}")
+
+
 def frame_to_ndarray(frame) -> "Any":
     if hasattr(frame, "get_read_array"):
         np = _import_numpy()
@@ -862,7 +748,6 @@ def calculate_ssimu2(
     skip: int,
     backend: str,
     vs_source: str,
-    vpy_src: Optional[Path] = None,
 ) -> int:
     """Compute SSIMULACRA2 and write a log file.
 
@@ -903,8 +788,8 @@ def calculate_ssimu2(
         raise RuntimeError("vszip VapourSynth plugin is not loaded (core.vszip.SSIMULACRA2 not available).")
 
     # Always build the clips first (fixes UnboundLocalError in vship branch).
-    source_clip = load_vs_clip(src_file, vs_source, vpy_src=vpy_src)
-    encoded_clip = load_vs_clip(enc_file, vs_source, vpy_src=vpy_src)
+    source_clip = load_vs_clip(src_file, vs_source)
+    encoded_clip = load_vs_clip(enc_file, vs_source)
 
     # Match geometry (SSIMU2 needs same dimensions).
     if source_clip.width != encoded_clip.width or source_clip.height != encoded_clip.height:
@@ -1098,13 +983,13 @@ def load_av1an_chunks(av1an_temp: Path) -> List[Dict[str, Any]]:
     return chunks
 
 
-def compute_luma_samples(src_file: Path, skip: int, vs_source: str, *, vpy_src: Optional[Path] = None) -> List[float]:
+def compute_luma_samples(src_file: Path, skip: int, vs_source: str) -> List[float]:
     if not has_vapoursynth():
         raise RuntimeError("VapourSynth is not available (python module not found).")
     import vapoursynth as vs  # type: ignore
 
     core = vs.core
-    clip = load_vs_clip(src_file, vs_source, vpy_src=vpy_src)
+    clip = load_vs_clip(src_file, vs_source)
     if clip.format is None:
         raise RuntimeError("Unknown clip format for luma calculation.")
 
@@ -1143,7 +1028,6 @@ class RuleMetricsState:
         self,
         *,
         src_file: Path,
-        vpy_src: Optional[Path] = None,
         frames_count: int,
         skip: int,
         av1an_temp: Path,
@@ -1154,7 +1038,6 @@ class RuleMetricsState:
         required_metrics: Optional[Sequence[str]] = None,
     ) -> None:
         self.src_file = src_file
-        self.vpy_src = vpy_src
         self.frames_count = int(frames_count)
         self.skip = int(skip)
         self.av1an_temp = av1an_temp
@@ -1249,7 +1132,7 @@ class RuleMetricsState:
         import vapoursynth as vs  # type: ignore
 
         core = vs.core
-        clip = load_vs_clip(self.src_file, self.vs_source, vpy_src=self.vpy_src)
+        clip = load_vs_clip(self.src_file, self.vs_source)
         if clip.format is None or clip.format.color_family != vs.GRAY or clip.format.bits_per_sample != 8:
             clip = core.resize.Bicubic(clip, format=vs.GRAY8)
 
@@ -2191,10 +2074,6 @@ def main() -> int:
     fastpass_vpy = Path(args.fastpass_vpy).expanduser().resolve() if args.fastpass_vpy else None
     fastpass_proxy = Path(args.fastpass_proxy).expanduser().resolve() if args.fastpass_proxy else None
 
-    # Metrics reference: if fast-pass input is a .vpy (may crop/scale), compare against that pipeline, not the original source.
-    metrics_ref_src = fastpass_vpy if fastpass_vpy is not None else input_file
-    metrics_ref_vpy_src = input_file if fastpass_vpy is not None else None
-
     ssimu2_log = fastpass_dir / f"{input_file.stem}_ssimu2.log"
 
     av1an_log_file: Optional[Path]
@@ -2341,14 +2220,13 @@ def main() -> int:
             print(f"[resume] SSIMU2 already completed: {ssimu2_log}")
         else:
             calculate_ssimu2(
-                src_file=metrics_ref_src,
+                src_file=input_file,
                 enc_file=fastpass_out,
                 out_path=ssimu2_log,
                 frames_count=frames_count,
                 skip=int(args.skip),
                 backend=str(args.ssimu2_backend),
                 vs_source=str(args.vs_source),
-                vpy_src=metrics_ref_vpy_src,
             )
             touch(marks["ssimu2"])
 
@@ -2421,8 +2299,7 @@ def main() -> int:
                 base_obj = load_json(out_scenes_path)
                 rule_scene_ranges = scenes_to_ranges(base_obj)
                 metrics_state = RuleMetricsState(
-                    src_file=metrics_ref_src,
-                    vpy_src=metrics_ref_vpy_src,
+                    src_file=input_file,
                     frames_count=frames_count,
                     skip=int(args.skip),
                     av1an_temp=av1an_temp,

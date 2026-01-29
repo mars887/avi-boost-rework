@@ -412,6 +412,47 @@ def split_command_tokens(line: str) -> Tuple[str, str, List[str]]:
     return selectors_part, sep, action_tokens
 
 
+def parse_preset_definition(line: str) -> Tuple[str, List[str]]:
+    selectors_part, _sep, action_tokens = split_command_tokens(line)
+    name = selectors_part.strip()
+    if not name.startswith("@"):
+        raise ValueError("Preset line must start with '@'")
+    name = name[1:].strip()
+    if not name:
+        raise ValueError("Preset name is empty")
+    if any(ch.isspace() for ch in name):
+        raise ValueError(f"Preset name must be a single token: {name!r}")
+    if not action_tokens:
+        raise ValueError(f"Preset {name!r} has no actions")
+    return name, action_tokens
+
+
+def expand_preset_tokens(
+    tokens: List[str],
+    presets: Dict[str, List[str]],
+    *,
+    _stack: Optional[List[str]] = None,
+) -> List[str]:
+    if _stack is None:
+        _stack = []
+    out: List[str] = []
+    for tok in tokens:
+        if tok.startswith("@"):
+            name = tok[1:]
+            if not name:
+                raise ValueError("Invalid preset reference '@' with no name")
+            if name not in presets:
+                raise ValueError(f"Unknown preset @{name}")
+            if name in _stack:
+                cycle = " -> ".join(_stack + [name])
+                raise ValueError(f"Preset cycle detected: {cycle}")
+            expanded = expand_preset_tokens(presets[name], presets, _stack=_stack + [name])
+            out.extend(expanded)
+        else:
+            out.append(tok)
+    return out
+
+
 def find_chapter_ranges_by_title(chapters: List[Chapter], title_query: str) -> List[Tuple[float, float, str]]:
     q = title_query.strip().casefold()
     if not q:
@@ -532,16 +573,24 @@ def parse_commands(
     total_frames: Optional[int],
 ) -> List[Command]:
     cmds: List[Command] = []
+    presets: Dict[str, List[str]] = {}
     for raw_line in command_lines:
         line = raw_line.strip()
         if not line:
             continue
         if line.startswith("#"):
             continue
+        if line.startswith("@"):
+            name, action_tokens = parse_preset_definition(line)
+            if name in presets:
+                raise ValueError(f"Duplicate preset @{name}")
+            presets[name] = action_tokens
+            continue
 
         selectors_part, sep, action_tokens = split_command_tokens(line)
         selectors = parse_selectors(selectors_part, video=video, total_frames=total_frames)
-        actions = parse_actions(action_tokens)
+        expanded_tokens = expand_preset_tokens(action_tokens, presets)
+        actions = parse_actions(expanded_tokens)
 
         cmds.append(Command(
             selectors=tuple(selectors),
@@ -908,7 +957,7 @@ def main(argv: Sequence[str]) -> int:
     ap.add_argument("--scenes", required=False, help="Input scenes.json (av1an scenes file)")
     ap.add_argument("--out", required=False, help="Output scenes.json path")
     ap.add_argument("--source", required=False, help="Source video file (for chapters/time->frames mapping)")
-    ap.add_argument("--command", required=False, help="Commands: file path (newline-separated) OR inline string (separator '?')")
+    ap.add_argument("--command", required=False, help="Commands: file path (newline-separated, supports # comments and @presets) OR inline string (separator '?')")
     ap.add_argument("--no-vfr-warn", action="store_true", help="Do not warn when avg_frame_rate differs from r_frame_rate")
     ap.add_argument("--parse-check", action="store_true", help="Parse-check command(s) and exit without writing output.")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --out dir if not absolute)")

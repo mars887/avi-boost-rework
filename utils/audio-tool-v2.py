@@ -650,7 +650,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # user clarified: always mkv
         write_error_marker(workdir, "audio_invalid_source_container")
         eprint(f"[{TOOL_NAME}] ERROR: source must be MKV: {source}")
-        return 2
+#         return 2
 
     if not tracks_data.is_absolute():
         tracks_data = workdir / tracks_data

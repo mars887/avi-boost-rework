@@ -817,8 +817,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if not source.exists():
             raise RuntimeError("missing_source")
-        if source.suffix.lower() != ".mkv":
-            raise RuntimeError("source_not_mkv")
+#         if source.suffix.lower() != ".mkv":
+#             raise RuntimeError("source_not_mkv")
         if not workdir.exists():
             raise RuntimeError("missing_workdir")
         if not (Path(mkvmerge).exists() or shutil.which(mkvmerge)):

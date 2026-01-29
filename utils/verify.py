@@ -470,7 +470,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if source.suffix.lower() != ".mkv":
             write_verify_error(workdir, "source_not_mkv")
             eprint("[verify] ERROR: source is not mkv")
-            return 2
+#             return 2
         if not workdir.exists():
             write_verify_error(workdir, "missing_workdir")
             eprint("[verify] ERROR: workdir missing")

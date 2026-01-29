@@ -87,6 +87,20 @@ fun runMain(args: Array<String>) {
 
 }
 
+private fun buildGuiDefaults(): GuiDefaults {
+    return GuiDefaults(
+        params = "--variance-boost-strength 2 --variance-octile 6 --variance-boost-curve 3 --tune 0 --qm-min 7 --chroma-qm-min 10 --scm 0 --enable-dlf 2 --sharp-tx 1 --enable-restoration 0 --color-primaries 9 --transfer-characteristics 16 --matrix-coefficients 9 --lp 3 --sharpness 1 --hbd-mds 1 --ac-bias 2.00",
+        lastParams = "--film-grain 14 --complex-hvs 1",
+        zoning = "",
+        fastpass = "",
+        mainpass = "",
+        workers = "8",
+        abMultiplier = "0.7",
+        abPosDev = "5",
+        abNegDev = "4"
+    )
+}
+
 enum class TrackStatus {
     COPY,
     EDIT,
@@ -194,19 +208,7 @@ private fun buildGuiInput(
     return GuiInput(fileList, summaryRows, buildGuiDefaults())
 }
 
-private fun buildGuiDefaults(): GuiDefaults {
-    return GuiDefaults(
-        params = "--variance-boost-strength 2 --variance-octile 6 --variance-boost-curve 3 --tune 0 --qm-min 7 --chroma-qm-min 10 --scm 0 --enable-dlf 2 --sharp-tx 1 --enable-restoration 0 --color-primaries 9 --transfer-characteristics 16 --matrix-coefficients 9 --lp 3 --sharpness 1 --hbd-mds 1 --ac-bias 2.00",
-        lastParams = "--film-grain 14 --complex-hvs 1",
-        zoning = "",
-        fastpass = "",
-        mainpass = "",
-        workers = "8",
-        abMultiplier = "0.75",
-        abPosDev = "4",
-        abNegDev = "4"
-    )
-}
+
 
 private fun parseGuiResult(resultAny: Map<String, List<GuiTrackEntry>>): Map<String, List<TrackInFile>> {
     val result = mutableMapOf<String, List<TrackInFile>>()
