@@ -1158,6 +1158,7 @@ class RuleMetricsState:
         skip: int,
         av1an_temp: Path,
         fastpass_out: Path,
+        ssimu2_log: Path,
         vs_source: str,
         verbose: bool,
         scene_ranges: Optional[List[Tuple[int, int]]] = None,
@@ -1169,6 +1170,7 @@ class RuleMetricsState:
         self.skip = int(skip)
         self.av1an_temp = av1an_temp
         self.fastpass_out = fastpass_out
+        self.ssimu2_log = ssimu2_log
         self.vs_source = vs_source
         self.verbose = verbose
         self.scene_ranges = scene_ranges or []
@@ -1187,6 +1189,10 @@ class RuleMetricsState:
         self._scene_bitrate_cache: Dict[int, float] = {}
         self._video_bitrate_avg: Optional[float] = None
         self._fps: Optional[float] = None
+        self._ssimu2_skip: Optional[int] = None
+        self._ssimu2_scores: Optional[List[float]] = None
+        self._ssimu2_avg_all: Optional[float] = None
+        self._ssimu2_scene_avg_cache: Dict[int, float] = {}
         self._grad_mad_scene_cache: Dict[int, Tuple[float, int]] = {}
         self._grad_mad_global_avg: Optional[float] = None
         self._farneback_scene_cache: Dict[int, Tuple[float, int]] = {}
@@ -1566,6 +1572,33 @@ class RuleMetricsState:
             raise ValueError("Invalid fps derived from chunks.json.")
         return float(self._fps)
 
+    def _load_ssimu2(self) -> Tuple[int, List[float]]:
+        if self._ssimu2_skip is None or self._ssimu2_scores is None:
+            ensure_exists(self.ssimu2_log, "SSIMU2 log")
+            skip, scores = parse_ssimu2_log(self.ssimu2_log)
+            self._ssimu2_skip = int(skip)
+            self._ssimu2_scores = list(scores)
+        return int(self._ssimu2_skip), self._ssimu2_scores
+
+    def ssimu2_scene_avg(self, scene_index: int, st: int, en: int) -> float:
+        if scene_index in self._ssimu2_scene_avg_cache:
+            return float(self._ssimu2_scene_avg_cache[scene_index])
+        skip, scores = self._load_ssimu2()
+        scene_scores = slice_samples_for_scene(scores, st, en, skip)
+        if not scene_scores:
+            raise ValueError(f"No SSIMU2 samples for scene {scene_index}.")
+        avg = sum(scene_scores) / len(scene_scores)
+        self._ssimu2_scene_avg_cache[scene_index] = float(avg)
+        return float(avg)
+
+    def ssimu2_avg_all(self) -> float:
+        if self._ssimu2_avg_all is None:
+            _skip, scores = self._load_ssimu2()
+            if not scores:
+                raise ValueError("No SSIMU2 samples for global average.")
+            self._ssimu2_avg_all = sum(scores) / len(scores)
+        return float(self._ssimu2_avg_all)
+
     def scene_bitrate(self, scene_index: int) -> float:
         if scene_index in self._scene_bitrate_cache:
             return self._scene_bitrate_cache[scene_index]
@@ -1660,6 +1693,10 @@ class SceneMetrics:
             return self.state.scene_bitrate(self.scene_index)
         if key == "scene_bitrate_ratio":
             return self.state.scene_bitrate_ratio(self.scene_index)
+        if key == "ssimu2":
+            return self.state.ssimu2_scene_avg(self.scene_index, self.st, self.en)
+        if key == "ssimu2_avg":
+            return self.state.ssimu2_avg_all()
 
         raise KeyError(f"Unknown metric name: {name}")
 
@@ -1819,7 +1856,7 @@ def validate_scenes_with_overrides(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
     return scenes
 
 
-def check_rules_prereqs(required_metrics: Sequence[str], av1an_temp: Path, fastpass_out: Path) -> None:
+def check_rules_prereqs(required_metrics: Sequence[str], av1an_temp: Path, fastpass_out: Path, ssimu2_log: Path) -> None:
     if not required_metrics:
         return
     normalized = [m.strip().lower().rstrip("*") for m in required_metrics if m and m.strip()]
@@ -1848,6 +1885,11 @@ def check_rules_prereqs(required_metrics: Sequence[str], av1an_temp: Path, fastp
                 "Run fast-pass with --keep and keep access to av1an_temp."
             )
         ensure_exists(fastpass_out, "Fast-pass output")
+
+    if any(m.startswith("ssimu2") for m in normalized):
+        ensure_exists(ssimu2_log, "SSIMU2 log")
+        if not is_valid_ssimu2_log(ssimu2_log):
+            raise RuntimeError(f"Rules require ssimu2 metrics, but SSIMU2 log is invalid: {ssimu2_log}")
 
 
 # ---------------------------
@@ -2521,7 +2563,7 @@ def main() -> int:
                 print(f"[resume] rules already applied: {out_scenes_path}")
             else:
                 ensure_exists(out_scenes_path, "Base scenes.json (Stage 4 output)")
-                check_rules_prereqs(required_metrics, av1an_temp, fastpass_out)
+                check_rules_prereqs(required_metrics, av1an_temp, fastpass_out, ssimu2_log)
 
                 base_obj = load_json(out_scenes_path)
                 rule_scene_ranges = scenes_to_ranges(base_obj)
@@ -2532,6 +2574,7 @@ def main() -> int:
                     skip=int(args.skip),
                     av1an_temp=av1an_temp,
                     fastpass_out=fastpass_out,
+                    ssimu2_log=ssimu2_log,
                     vs_source=str(args.vs_source),
                     verbose=bool(args.verbose),
                     scene_ranges=rule_scene_ranges,
