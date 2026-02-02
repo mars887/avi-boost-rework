@@ -23,7 +23,8 @@ VIDEO_EXTS = (".mkv", ".mp4")
 
 @dataclass
 class BatConfig:
-    workers: Optional[int]
+    fastpass_workers: Optional[int]
+    mainpass_workers: Optional[int]
     ab_multiplier: Optional[float]
     ab_pos_dev: Optional[float]
     ab_neg_dev: Optional[float]
@@ -140,19 +141,23 @@ def validate_bat(path: Path) -> Tuple[Optional[BatConfig], List[str], List[str]]
     lines = text.splitlines()
     vars_map = parse_bat_vars(lines)
 
-    workers = parse_int(vars_map.get("WORKERS"))
-    if workers is None:
-        errors.append("WORKERS missing or invalid")
-    else:
-        cores = os.cpu_count() or 1
-        if workers < 1 or workers > cores:
-            errors.append(f"WORKERS out of range: {workers} (1..{cores})")
+    workers_fallback = parse_int(vars_map.get("WORKERS"))
+    fastpass_workers = parse_int(vars_map.get("FASTPASS_WORKERS")) or workers_fallback
+    mainpass_workers = parse_int(vars_map.get("MAINPASS_WORKERS")) or workers_fallback
+    cores = os.cpu_count() or 1
+    if fastpass_workers is None:
+        errors.append("FASTPASS_WORKERS missing or invalid")
+    elif fastpass_workers < 1 or fastpass_workers > cores:
+        errors.append(f"FASTPASS_WORKERS out of range: {fastpass_workers} (1..{cores})")
+    if mainpass_workers is None:
+        errors.append("MAINPASS_WORKERS missing or invalid")
+    elif mainpass_workers < 1 or mainpass_workers > cores:
+        errors.append(f"MAINPASS_WORKERS out of range: {mainpass_workers} (1..{cores})")
 
     ab_multiplier = parse_float(vars_map.get("AB_MULTIPIER"))
-    if ab_multiplier is None:
-        errors.append("AB_MULTIPIER missing or invalid")
-    elif not (0.0 < ab_multiplier <= 5.0):
-        errors.append(f"AB_MULTIPIER out of range: {ab_multiplier} (0..5]")
+    if ab_multiplier is not None:
+        if not (0.0 < ab_multiplier <= 5.0):
+            errors.append(f"AB_MULTIPIER out of range: {ab_multiplier} (0..5]")
 
     ab_pos = parse_float(vars_map.get("AB_POS_DEV"))
     if ab_pos is None:
@@ -165,6 +170,23 @@ def validate_bat(path: Path) -> Tuple[Optional[BatConfig], List[str], List[str]]
         errors.append("AB_NEG_DEV missing or invalid")
     elif not (0.0 <= ab_neg <= 20.0) or not is_multiple_of(ab_neg, 0.25):
         errors.append(f"AB_NEG_DEV out of range or not multiple of 0.25: {ab_neg}")
+
+    ab_pos_mult = parse_float(vars_map.get("AB_POS_MULT"))
+    ab_neg_mult = parse_float(vars_map.get("AB_NEG_MULT"))
+    if ab_multiplier is None:
+        if (ab_pos_mult is None) != (ab_neg_mult is None):
+            errors.append("AB_POS_MULT/AB_NEG_MULT must be set together when AB_MULTIPIER is empty")
+        else:
+            if ab_pos_mult is not None and ab_pos_mult <= 0:
+                errors.append(f"AB_POS_MULT out of range: {ab_pos_mult} (must be > 0)")
+            if ab_neg_mult is not None and ab_neg_mult <= 0:
+                errors.append(f"AB_NEG_MULT out of range: {ab_neg_mult} (must be > 0)")
+    else:
+        if ab_pos_mult is not None and ab_neg_mult is not None:
+            if ab_pos_mult <= 0:
+                errors.append(f"AB_POS_MULT out of range: {ab_pos_mult} (must be > 0)")
+            if ab_neg_mult <= 0:
+                errors.append(f"AB_NEG_MULT out of range: {ab_neg_mult} (must be > 0)")
 
     quality_str = vars_map.get("QUALITY") or extract_quality_from_lines(lines)
     quality = parse_float(quality_str)
@@ -179,7 +201,8 @@ def validate_bat(path: Path) -> Tuple[Optional[BatConfig], List[str], List[str]]
     mainpass_vf = vars_map.get("MAINPASS_VF", "")
 
     cfg = BatConfig(
-        workers=workers,
+        fastpass_workers=fastpass_workers,
+        mainpass_workers=mainpass_workers,
         ab_multiplier=ab_multiplier,
         ab_pos_dev=ab_pos,
         ab_neg_dev=ab_neg,

@@ -534,6 +534,7 @@ def run_fastpass_av1an(
     output_file: Path,
     scenes_path: Optional[Path],
     av1an_temp: Path,
+    sdm: str,
     workers: int,
     lp: int,
     fast_preset: int,
@@ -542,10 +543,11 @@ def run_fastpass_av1an(
     ffmpeg_arg: str,
     verbose: bool,
     keep: bool,
+    sc_only: bool,
     log_file: Optional[Path],
     log_level: Optional[str],
 ) -> None:
-    if scenes_path is not None:
+    if scenes_path is not None and str(sdm).strip().lower() == "psd":
         ensure_exists(scenes_path, "Base scenes.json")
     ensure_dir(av1an_temp)
 
@@ -556,6 +558,8 @@ def run_fastpass_av1an(
         "--temp", str(av1an_temp),
         "-y",
     ]
+    if sc_only:
+        cmd.append("--sc-only")
     if verbose:
         cmd.append("--verbose")
     if keep:
@@ -569,10 +573,13 @@ def run_fastpass_av1an(
     if fastpass_vpy is not None or fastpass_proxy is not None:
         cmd.extend(["--vspipe-args", f"src={input_file}"])
 
-    # Provide scenes file (skip scene detection)
+    # Provide scenes file (skip scene detection) or emit scenes when --sc-only
     if scenes_path is not None:
         cmd.extend(["--scenes", str(scenes_path)])
-        cmd.extend(["--extra-split-sec", "30"])
+        if str(sdm).strip().lower() == "psd":
+            cmd.extend(["--extra-split-sec", "30"])
+        else:
+            cmd.extend(["--extra-split-sec", "15"])
     else:
         cmd.extend(["--extra-split-sec", "15"])
 
@@ -596,7 +603,10 @@ def run_fastpass_av1an(
     cmd.extend(["-o", str(output_file)])
 
     run_cmd(cmd, check=True, inherit_output=True, cwd=av1an_temp.parent)
-    print(f"[ok] fast-pass output: {output_file}")
+    if sc_only:
+        print("[ok] scene detection (sc-only) completed")
+    else:
+        print(f"[ok] fast-pass output: {output_file}")
 
 
 # ---------------------------
@@ -1934,6 +1944,41 @@ def build_zone_overrides(
     }
 
 
+def write_uniform_scenes(
+    *,
+    base_scenes_path: Path,
+    out_scenes_path: Path,
+    base_crf: float,
+    final_preset: int,
+    video_params: str,
+    final_override: str,
+) -> None:
+    base = load_json(base_scenes_path)
+    base_norm = sanitize_scenes_json(base)
+    frames_count = int(base_norm["frames"])
+    scenes = base_norm.get("scenes") or base_norm.get("split_scenes") or []
+
+    updated: List[Dict[str, Any]] = []
+    for s in scenes:
+        st = int(s["start_frame"])
+        en = int(s["end_frame"])
+        updated.append({
+            "start_frame": st,
+            "end_frame": en,
+            "zone_overrides": build_zone_overrides(
+                crf=float(base_crf),
+                preset=int(final_preset),
+                video_params_str=str(video_params),
+                final_override=str(final_override),
+            ),
+        })
+
+    out_obj = {"frames": frames_count, "scenes": updated, "split_scenes": [dict(x) for x in updated]}
+    ensure_dir(out_scenes_path.parent)
+    save_json(out_scenes_path, out_obj)
+    print(f"[ok] uniform scenes.json written: {out_scenes_path}")
+
+
 
 def apply_crf_adjustments_to_scenes(
     *,
@@ -2090,6 +2135,8 @@ def main() -> int:
                         help="Start from scratch: clear resume markers and remove generated artifacts in the project dir.")
     parser.add_argument("--sdm", choices=["psd", "av1an"], default="psd",
                         help="Scene detection mode: psd (default, run PSD and pass --scenes) or av1an (use av1an internal detection).")
+    parser.add_argument("--no-fastpass", action="store_true",
+                        help="Skip fast-pass and metrics; write uniform scenes with base CRF.")
 
     # PSD
     parser.add_argument("--psd-script", default="Progressive-Scene-Detection.py",
@@ -2286,46 +2333,91 @@ def main() -> int:
     # Stage 2: fast-pass
     # -----------------
     if args.stage in (0, 2):
-        if marks["fastpass"].exists() and fastpass_out.exists() and fastpass_out.stat().st_size > 0:
-            print(f"[resume] fast-pass already completed: {fastpass_out}")
+        if args.no_fastpass and args.sdm == "psd":
+            print("[skip] no-fastpass enabled; fast-pass skipped for sdm=psd.")
         else:
-            if fastpass_vpy is not None:
-                ensure_exists(fastpass_vpy, "Fast-pass vpy")
-            if fastpass_proxy is not None:
-                ensure_exists(fastpass_proxy, "Fast-pass proxy")
-            run_fastpass_av1an(
-                input_file=input_file,
-                fastpass_vpy=fastpass_vpy,
-                fastpass_proxy=fastpass_proxy,
-                output_file=fastpass_out,
-                scenes_path=base_scenes_path if args.sdm == "psd" else None,
-                av1an_temp=av1an_temp,
-                workers=int(args.workers),
-                lp=int(args.lp),
-                fast_preset=int(args.fast_preset),
-                fast_crf=float(args.quality),
-                video_params=str(args.video_params),
-                ffmpeg_arg=str(args.ffmpeg),
-                verbose=bool(args.verbose),
-                keep=bool(args.keep),
-                log_file=av1an_log_file,
-                log_level=(
-                    None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
-                    else str(args.av1an_log_level).strip()
-                ),
-            )
-            touch(marks["fastpass"])
+            if args.no_fastpass and args.sdm == "av1an":
+                scenes_hint = av1an_temp / "scenes.json"
+                if marks["fastpass"].exists() and scenes_hint.exists():
+                    print(f"[resume] scene-only already completed: {scenes_hint}")
+                else:
+                    if fastpass_vpy is not None:
+                        ensure_exists(fastpass_vpy, "Fast-pass vpy")
+                    if fastpass_proxy is not None:
+                        ensure_exists(fastpass_proxy, "Fast-pass proxy")
+                    run_fastpass_av1an(
+                        input_file=input_file,
+                        fastpass_vpy=fastpass_vpy,
+                        fastpass_proxy=fastpass_proxy,
+                        output_file=fastpass_out,
+                        scenes_path=base_scenes_path,
+                        av1an_temp=av1an_temp,
+                        sdm=str(args.sdm),
+                        workers=int(args.workers),
+                        lp=int(args.lp),
+                        fast_preset=int(args.fast_preset),
+                        fast_crf=float(args.quality),
+                        video_params=str(args.video_params),
+                        ffmpeg_arg=str(args.ffmpeg),
+                        verbose=bool(args.verbose),
+                        keep=bool(args.keep),
+                        sc_only=True,
+                        log_file=av1an_log_file,
+                        log_level=(
+                            None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
+                            else str(args.av1an_log_level).strip()
+                        ),
+                    )
+                    touch(marks["fastpass"])
+            else:
+                if marks["fastpass"].exists() and fastpass_out.exists() and fastpass_out.stat().st_size > 0:
+                    print(f"[resume] fast-pass already completed: {fastpass_out}")
+                else:
+                    if fastpass_vpy is not None:
+                        ensure_exists(fastpass_vpy, "Fast-pass vpy")
+                    if fastpass_proxy is not None:
+                        ensure_exists(fastpass_proxy, "Fast-pass proxy")
+                    run_fastpass_av1an(
+                        input_file=input_file,
+                        fastpass_vpy=fastpass_vpy,
+                        fastpass_proxy=fastpass_proxy,
+                        output_file=fastpass_out,
+                        scenes_path=base_scenes_path,
+                        av1an_temp=av1an_temp,
+                        sdm=str(args.sdm),
+                        workers=int(args.workers),
+                        lp=int(args.lp),
+                        fast_preset=int(args.fast_preset),
+                        fast_crf=float(args.quality),
+                        video_params=str(args.video_params),
+                        ffmpeg_arg=str(args.ffmpeg),
+                        verbose=bool(args.verbose),
+                        keep=bool(args.keep),
+                        sc_only=False,
+                        log_file=av1an_log_file,
+                        log_level=(
+                            None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
+                            else str(args.av1an_log_level).strip()
+                        ),
+                    )
+                    touch(marks["fastpass"])
 
     frames_count = 0
     scene_ranges: List[Tuple[int, int]] = []
     if args.stage in (0, 3, 4, 5):
         if args.sdm == "av1an":
-            try:
-                write_base_scenes_from_av1an(av1an_temp, base_scenes_path)
-            except FileNotFoundError as exc:
-                if not is_valid_base_scenes(base_scenes_path):
-                    raise
-                eprint(f"[warn] {exc}. Using existing base scenes: {base_scenes_path}")
+            if base_scenes_path.exists():
+                raw = load_json(base_scenes_path)
+                norm = sanitize_scenes_json(raw)
+                save_json(base_scenes_path, norm)
+                print(f"[ok] av1an scenes normalized: {base_scenes_path}")
+            else:
+                try:
+                    write_base_scenes_from_av1an(av1an_temp, base_scenes_path)
+                except FileNotFoundError as exc:
+                    if not is_valid_base_scenes(base_scenes_path):
+                        raise
+                    eprint(f"[warn] {exc}. Using existing base scenes: {base_scenes_path}")
         ensure_exists(base_scenes_path, "Base scenes.json")
         base_scenes_obj = sanitize_scenes_json(load_json(base_scenes_path))
         frames_count = int(base_scenes_obj["frames"])
@@ -2335,22 +2427,25 @@ def main() -> int:
     # Stage 3: metrics
     # -----------------
     if args.stage in (0, 3):
-        ensure_exists(fastpass_out, "Fast-pass output")
-
-        if marks["ssimu2"].exists() and is_valid_ssimu2_log(ssimu2_log):
-            print(f"[resume] SSIMU2 already completed: {ssimu2_log}")
+        if args.no_fastpass:
+            print("[skip] no-fastpass enabled; metrics skipped.")
         else:
-            calculate_ssimu2(
-                src_file=metrics_ref_src,
-                enc_file=fastpass_out,
-                out_path=ssimu2_log,
-                frames_count=frames_count,
-                skip=int(args.skip),
-                backend=str(args.ssimu2_backend),
-                vs_source=str(args.vs_source),
-                vpy_src=metrics_ref_vpy_src,
-            )
-            touch(marks["ssimu2"])
+            ensure_exists(fastpass_out, "Fast-pass output")
+
+            if marks["ssimu2"].exists() and is_valid_ssimu2_log(ssimu2_log):
+                print(f"[resume] SSIMU2 already completed: {ssimu2_log}")
+            else:
+                calculate_ssimu2(
+                    src_file=metrics_ref_src,
+                    enc_file=fastpass_out,
+                    out_path=ssimu2_log,
+                    frames_count=frames_count,
+                    skip=int(args.skip),
+                    backend=str(args.ssimu2_backend),
+                    vs_source=str(args.vs_source),
+                    vpy_src=metrics_ref_vpy_src,
+                )
+                touch(marks["ssimu2"])
 
     # -----------------
     # Stage 4: base scenes
@@ -2359,49 +2454,59 @@ def main() -> int:
         if marks["final"].exists() and is_valid_final_scenes(out_scenes_path):
             print(f"[resume] base scenes already written: {out_scenes_path}")
         else:
-            _, per_chunk_5, avg_total = compute_chunk_5p_single_metric(
-                scene_ranges=scene_ranges,
-                ssimu2_path=ssimu2_log,
-            )
-            
-            avg_total_adj = apply_avg_func(avg_total, args.avg_func)
-            if str(args.avg_func).strip():
-                print(f"[avg-func] {avg_total} -> {avg_total_adj} ({args.avg_func})")
-
-            aggressive_val = args.aggressive
-            pos_val = args.pos_dev_multiplier
-            neg_val = args.neg_dev_multiplier
-            if aggressive_val is not None:
-                pos_dev_multiplier = float(aggressive_val)
-                neg_dev_multiplier = float(aggressive_val)
+            if args.no_fastpass:
+                write_uniform_scenes(
+                    base_scenes_path=base_scenes_path,
+                    out_scenes_path=out_scenes_path,
+                    base_crf=float(args.quality),
+                    final_preset=int(args.preset),
+                    video_params=str(args.video_params),
+                    final_override=str(args.final_override),
+                )
             else:
-                if (pos_val is None) != (neg_val is None):
-                    raise RuntimeError(
-                        "Specify either --aggressive or both --pos-dev-multiplier and --neg-dev-multiplier."
-                    )
-                if pos_val is None and neg_val is None:
-                    pos_dev_multiplier = 1.0
-                    neg_dev_multiplier = 1.0
-                else:
-                    pos_dev_multiplier = float(pos_val)
-                    neg_dev_multiplier = float(neg_val)
+                _, per_chunk_5, avg_total = compute_chunk_5p_single_metric(
+                    scene_ranges=scene_ranges,
+                    ssimu2_path=ssimu2_log,
+                )
+                
+                avg_total_adj = apply_avg_func(avg_total, args.avg_func)
+                if str(args.avg_func).strip():
+                    print(f"[avg-func] {avg_total} -> {avg_total_adj} ({args.avg_func})")
 
-            apply_crf_adjustments_to_scenes(
-                base_scenes_path=base_scenes_path,
-                out_scenes_path=out_scenes_path,
-                scene_ranges=scene_ranges,
-                per_chunk_5=per_chunk_5,
-                avg_total=avg_total_adj,
-                base_crf=float(args.quality),
-                pos_dev_multiplier=pos_dev_multiplier,
-                neg_dev_multiplier=neg_dev_multiplier,
-                deviation=float(args.deviation),
-                max_positive_dev=args.max_positive_dev,
-                max_negative_dev=args.max_negative_dev,
-                final_preset=int(args.preset),
-                video_params=str(args.video_params),
-                final_override=str(args.final_override)
-            )
+                aggressive_val = args.aggressive
+                pos_val = args.pos_dev_multiplier
+                neg_val = args.neg_dev_multiplier
+                if aggressive_val is not None:
+                    pos_dev_multiplier = float(aggressive_val)
+                    neg_dev_multiplier = float(aggressive_val)
+                else:
+                    if (pos_val is None) != (neg_val is None):
+                        raise RuntimeError(
+                            "Specify either --aggressive or both --pos-dev-multiplier and --neg-dev-multiplier."
+                        )
+                    if pos_val is None and neg_val is None:
+                        pos_dev_multiplier = 1.0
+                        neg_dev_multiplier = 1.0
+                    else:
+                        pos_dev_multiplier = float(pos_val)
+                        neg_dev_multiplier = float(neg_val)
+
+                apply_crf_adjustments_to_scenes(
+                    base_scenes_path=base_scenes_path,
+                    out_scenes_path=out_scenes_path,
+                    scene_ranges=scene_ranges,
+                    per_chunk_5=per_chunk_5,
+                    avg_total=avg_total_adj,
+                    base_crf=float(args.quality),
+                    pos_dev_multiplier=pos_dev_multiplier,
+                    neg_dev_multiplier=neg_dev_multiplier,
+                    deviation=float(args.deviation),
+                    max_positive_dev=args.max_positive_dev,
+                    max_negative_dev=args.max_negative_dev,
+                    final_preset=int(args.preset),
+                    video_params=str(args.video_params),
+                    final_override=str(args.final_override)
+                )
             touch(marks["final"])
 
     # -----------------

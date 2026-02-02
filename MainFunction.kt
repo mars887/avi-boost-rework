@@ -94,10 +94,18 @@ private fun buildGuiDefaults(): GuiDefaults {
         zoning = "",
         fastpass = "",
         mainpass = "",
-        workers = "8",
+        sceneDetection = "av1an",
+        noFastpass = false,
+        fastpassWorkers = "8",
+        mainpassWorkers = "8",
         abMultiplier = "0.7",
         abPosDev = "5",
-        abNegDev = "4"
+        abNegDev = "4",
+        abPosMultiplier = "",
+        abNegMultiplier = "",
+        mainVpy = "",
+        fastVpy = "",
+        proxyVpy = ""
     )
 }
 
@@ -246,10 +254,18 @@ private data class GuiDefaults(
     val zoning: String,
     val fastpass: String,
     val mainpass: String,
-    val workers: String,
+    val sceneDetection: String,
+    val noFastpass: Boolean,
+    val fastpassWorkers: String,
+    val mainpassWorkers: String,
     val abMultiplier: String,
     val abPosDev: String,
-    val abNegDev: String
+    val abNegDev: String,
+    val abPosMultiplier: String,
+    val abNegMultiplier: String,
+    val mainVpy: String,
+    val fastVpy: String,
+    val proxyVpy: String
 )
 
 private data class GuiInput(

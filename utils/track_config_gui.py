@@ -23,20 +23,44 @@ class DefaultSettings:
         zoning="",
         fastpass="",
         mainpass="",
+        scene_detection="",
+        no_fastpass=False,
+        fastpass_workers="",
+        mainpass_workers="",
         workers="",
         ab_multiplier="",
         ab_pos_dev="",
         ab_neg_dev="",
+        ab_pos_multiplier="",
+        ab_neg_multiplier="",
+        main_vpy="",
+        fast_vpy="",
+        proxy_vpy="",
     ):
         self.params = params or ""
         self.last_params = last_params or ""
         self.zoning = zoning or ""
         self.fastpass = fastpass or ""
         self.mainpass = mainpass or ""
+        sd = (scene_detection or "").strip().lower()
+        if sd not in ("psd", "av1an"):
+            sd = "av1an"
+        self.scene_detection = sd
+        if isinstance(no_fastpass, bool):
+            self.no_fastpass = no_fastpass
+        else:
+            self.no_fastpass = str(no_fastpass).strip().lower() in ("1", "true", "yes", "on")
         self.workers = workers or ""
+        self.fastpass_workers = fastpass_workers or self.workers or ""
+        self.mainpass_workers = mainpass_workers or self.workers or ""
         self.ab_multiplier = ab_multiplier or ""
         self.ab_pos_dev = ab_pos_dev or ""
         self.ab_neg_dev = ab_neg_dev or ""
+        self.ab_pos_multiplier = ab_pos_multiplier or ""
+        self.ab_neg_multiplier = ab_neg_multiplier or ""
+        self.main_vpy = main_vpy or ""
+        self.fast_vpy = fast_vpy or ""
+        self.proxy_vpy = proxy_vpy or ""
 
 
 def normalize_type(value):
@@ -182,10 +206,18 @@ def build_results(files, tracks_by_file, settings, defaults):
     default_zoning = defaults.zoning
     default_fastpass = defaults.fastpass
     default_mainpass = defaults.mainpass
-    default_workers = defaults.workers
+    default_scene_detection = defaults.scene_detection
+    default_no_fastpass = defaults.no_fastpass
+    default_fastpass_workers = defaults.fastpass_workers or defaults.workers
+    default_mainpass_workers = defaults.mainpass_workers or defaults.workers
     default_ab_multiplier = defaults.ab_multiplier
     default_ab_pos_dev = defaults.ab_pos_dev
     default_ab_neg_dev = defaults.ab_neg_dev
+    default_ab_pos_multiplier = defaults.ab_pos_multiplier
+    default_ab_neg_multiplier = defaults.ab_neg_multiplier
+    default_main_vpy = defaults.main_vpy
+    default_fast_vpy = defaults.fast_vpy
+    default_proxy_vpy = defaults.proxy_vpy
 
     for file_index, file_path in enumerate(files, start=1):
         lines.append(f"[{file_index}] {os.path.basename(file_path)}")
@@ -306,10 +338,19 @@ def build_results(files, tracks_by_file, settings, defaults):
                 track_mux["zoning"] = default_zoning
                 track_mux["fastpass"] = default_fastpass
                 track_mux["mainpass"] = default_mainpass
-                track_mux["workers"] = default_workers
+                track_mux["sceneDetection"] = default_scene_detection
+                track_mux["noFastpass"] = "true" if default_no_fastpass else "false"
+                track_mux["fastpassWorkers"] = default_fastpass_workers
+                track_mux["mainpassWorkers"] = default_mainpass_workers
+                track_mux["workers"] = default_fastpass_workers
                 track_mux["abMultiplier"] = default_ab_multiplier
                 track_mux["abPosDev"] = default_ab_pos_dev
                 track_mux["abNegDev"] = default_ab_neg_dev
+                track_mux["abPosMultiplier"] = default_ab_pos_multiplier
+                track_mux["abNegMultiplier"] = default_ab_neg_multiplier
+                track_mux["mainVpy"] = default_main_vpy
+                track_mux["fastVpy"] = default_fast_vpy
+                track_mux["proxyVpy"] = default_proxy_vpy
             elif track_type in ("audio", "sub"):
                 if final_name:
                     track_mux["name"] = final_name
@@ -378,10 +419,19 @@ class TrackConfigGui:
             zoning=defaults_raw.get("zoning") or "",
             fastpass=defaults_raw.get("fastpass") or "",
             mainpass=defaults_raw.get("mainpass") or "",
+            scene_detection=defaults_raw.get("sceneDetection") or defaults_raw.get("scene_detection") or "",
+            no_fastpass=defaults_raw.get("noFastpass") or defaults_raw.get("no_fastpass") or False,
+            fastpass_workers=defaults_raw.get("fastpassWorkers") or defaults_raw.get("fastpass_workers") or "",
+            mainpass_workers=defaults_raw.get("mainpassWorkers") or defaults_raw.get("mainpass_workers") or "",
             workers=defaults_raw.get("workers") or "",
             ab_multiplier=defaults_raw.get("abMultiplier") or defaults_raw.get("ab_multiplier") or "",
             ab_pos_dev=defaults_raw.get("abPosDev") or defaults_raw.get("ab_pos_dev") or "",
             ab_neg_dev=defaults_raw.get("abNegDev") or defaults_raw.get("ab_neg_dev") or "",
+            ab_pos_multiplier=defaults_raw.get("abPosMultiplier") or defaults_raw.get("ab_pos_multiplier") or "",
+            ab_neg_multiplier=defaults_raw.get("abNegMultiplier") or defaults_raw.get("ab_neg_multiplier") or "",
+            main_vpy=defaults_raw.get("mainVpy") or defaults_raw.get("main_vpy") or "",
+            fast_vpy=defaults_raw.get("fastVpy") or defaults_raw.get("fast_vpy") or "",
+            proxy_vpy=defaults_raw.get("proxyVpy") or defaults_raw.get("proxy_vpy") or "",
         )
 
         self.match_tracks = []
@@ -451,47 +501,141 @@ class TrackConfigGui:
         self._build_center(center_frame)
 
     def _build_center(self, frame):
-        defaults_frame = ttk.LabelFrame(frame, text="Defaults")
-        defaults_frame.pack(fill=tk.X, padx=6, pady=(6, 0))
+        notebook = ttk.Notebook(frame)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
-        ttk.Label(defaults_frame, text="params").grid(row=0, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        self.default_params_text = tk.Text(defaults_frame, height=2, width=60, wrap="char")
-        self.default_params_text.grid(row=0, column=1, sticky=tk.EW, pady=2)
+        tracks_tab = ttk.Frame(notebook)
+        video_tab = ttk.Frame(notebook)
+
+        notebook.add(tracks_tab, text="Tracks")
+        notebook.add(video_tab, text="Video")
+
+        self._build_tracks_tab(tracks_tab)
+        self._build_video_tab(video_tab)
+
+    def _build_video_tab(self, frame):
+        frame.columnconfigure(1, weight=1)
+
+        self.default_params_text = tk.Text(frame, height=4, width=60, wrap="char")
+        self.default_last_params_text = tk.Text(frame, height=2, width=60, wrap="char")
+        self.default_zoning_text = tk.Text(frame, height=5, width=60, wrap="none")
+
+        self.default_fastpass_var = tk.StringVar(value=self.defaults.fastpass)
+        self.default_mainpass_var = tk.StringVar(value=self.defaults.mainpass)
+        self.scene_detection_var = tk.StringVar(value=self.defaults.scene_detection or "av1an")
+        self.no_fastpass_var = tk.BooleanVar(value=bool(self.defaults.no_fastpass))
+        self.fastpass_workers_var = tk.StringVar(value=self.defaults.fastpass_workers or self.defaults.workers)
+        self.mainpass_workers_var = tk.StringVar(value=self.defaults.mainpass_workers or self.defaults.workers)
+        self.ab_multiplier_var = tk.StringVar(value=self.defaults.ab_multiplier)
+        self.ab_pos_multiplier_var = tk.StringVar(value=self.defaults.ab_pos_multiplier)
+        self.ab_neg_multiplier_var = tk.StringVar(value=self.defaults.ab_neg_multiplier)
+        self.ab_pos_dev_var = tk.StringVar(value=self.defaults.ab_pos_dev)
+        self.ab_neg_dev_var = tk.StringVar(value=self.defaults.ab_neg_dev)
+        self.main_vpy_var = tk.StringVar(value=self.defaults.main_vpy)
+        self.fast_vpy_var = tk.StringVar(value=self.defaults.fast_vpy)
+        self.proxy_vpy_var = tk.StringVar(value=self.defaults.proxy_vpy)
+
+        row = 0
+        ttk.Label(frame, text="params").grid(row=row, column=0, sticky=tk.NW, padx=(0, 6), pady=2)
+        self.default_params_text.grid(row=row, column=1, sticky=tk.EW, pady=2)
         self.default_params_text.insert("1.0", self.defaults.params)
         self.default_params_text.edit_modified(False)
         self.default_params_text.bind("<Return>", lambda _event: "break")
         self.default_params_text.bind("<KP_Enter>", lambda _event: "break")
         self.default_params_text.bind("<<Modified>>", self.on_default_text_change)
-        ttk.Label(defaults_frame, text="last params").grid(row=1, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        self.default_last_params_text = tk.Text(defaults_frame, height=2, width=60, wrap="char")
-        self.default_last_params_text.grid(row=1, column=1, sticky=tk.EW, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="last params").grid(row=row, column=0, sticky=tk.NW, padx=(0, 6), pady=2)
+        self.default_last_params_text.grid(row=row, column=1, sticky=tk.EW, pady=2)
         self.default_last_params_text.insert("1.0", self.defaults.last_params)
         self.default_last_params_text.edit_modified(False)
         self.default_last_params_text.bind("<Return>", lambda _event: "break")
         self.default_last_params_text.bind("<KP_Enter>", lambda _event: "break")
         self.default_last_params_text.bind("<<Modified>>", self.on_default_text_change)
-        ttk.Label(defaults_frame, text="zoning").grid(row=2, column=0, sticky=tk.NW, padx=(0, 6), pady=2)
-        self.default_zoning_text = tk.Text(defaults_frame, height=3, width=60, wrap="none")
-        self.default_zoning_text.grid(row=2, column=1, sticky=tk.EW, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="zoning").grid(row=row, column=0, sticky=tk.NW, padx=(0, 6), pady=2)
+        self.default_zoning_text.grid(row=row, column=1, sticky=tk.EW, pady=2)
         self.default_zoning_text.insert("1.0", self.defaults.zoning)
         self.default_zoning_text.edit_modified(False)
+        self.default_zoning_text.bind("<<Modified>>", self.on_zoning_change)
+        row += 1
 
-        ttk.Label(defaults_frame, text="Filters").grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(6, 2))
+        ttk.Label(frame, text="fastpass").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.default_fastpass_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
+        row += 1
 
-        self.default_fastpass_var = tk.StringVar(value=self.defaults.fastpass)
-        self.default_mainpass_var = tk.StringVar(value=self.defaults.mainpass)
+        ttk.Label(frame, text="mainpass").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.default_mainpass_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
+        row += 1
 
-        ttk.Label(defaults_frame, text="fastpass").grid(row=4, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(defaults_frame, textvariable=self.default_fastpass_var, width=60).grid(
-            row=4, column=1, sticky=tk.EW, pady=2
+        ttk.Label(frame, text="scene detection").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Combobox(frame, textvariable=self.scene_detection_var, values=["psd", "av1an"], width=57, state="readonly").grid(
+            row=row, column=1, sticky=tk.W, pady=2
         )
-        ttk.Label(defaults_frame, text="mainpass").grid(row=5, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(defaults_frame, textvariable=self.default_mainpass_var, width=60).grid(
-            row=5, column=1, sticky=tk.EW, pady=2
+        row += 1
+
+        ttk.Checkbutton(frame, text="no fastpass", variable=self.no_fastpass_var).grid(
+            row=row, column=1, sticky=tk.W, pady=2
         )
+        row += 1
 
-        defaults_frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text="fastpass workers").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.fastpass_workers_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
+        row += 1
 
+        ttk.Label(frame, text="mainpass workers").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.mainpass_workers_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="max-pos-dev").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.ab_pos_dev_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="pos-multiplier").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.ab_pos_multiplier_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="multiplier").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.ab_multiplier_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="neg-multiplier").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.ab_neg_multiplier_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="max-neg-dev").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.ab_neg_dev_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="main-vpy").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.main_vpy_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="fast-vpy").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.fast_vpy_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
+        row += 1
+
+        ttk.Label(frame, text="proxy-vpy").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.proxy_vpy_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
+
+        self.default_fastpass_var.trace_add("write", self.on_defaults_change)
+        self.default_mainpass_var.trace_add("write", self.on_defaults_change)
+        self.scene_detection_var.trace_add("write", self.on_defaults_change)
+        self.no_fastpass_var.trace_add("write", self.on_defaults_change)
+        self.fastpass_workers_var.trace_add("write", self.on_defaults_change)
+        self.mainpass_workers_var.trace_add("write", self.on_defaults_change)
+        self.ab_pos_dev_var.trace_add("write", self.on_defaults_change)
+        self.ab_neg_dev_var.trace_add("write", self.on_defaults_change)
+        self.main_vpy_var.trace_add("write", self.on_defaults_change)
+        self.fast_vpy_var.trace_add("write", self.on_defaults_change)
+        self.proxy_vpy_var.trace_add("write", self.on_defaults_change)
+
+        self.ab_multiplier_var.trace_add("write", self.on_ab_multiplier_change)
+        self.ab_pos_multiplier_var.trace_add("write", self.on_ab_pos_multiplier_change)
+        self.ab_neg_multiplier_var.trace_add("write", self.on_ab_pos_multiplier_change)
+
+    def _build_tracks_tab(self, frame):
         top_frame = ttk.Frame(frame)
         top_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
@@ -500,8 +644,6 @@ class TrackConfigGui:
             "id",
             "type",
             "mode",
-            "params",
-            "last_params",
             "bitrate",
             "channels",
             "name",
@@ -513,8 +655,6 @@ class TrackConfigGui:
         self.tree.heading("id", text="id")
         self.tree.heading("type", text="type")
         self.tree.heading("mode", text="mode")
-        self.tree.heading("params", text="params")
-        self.tree.heading("last_params", text="last params")
         self.tree.heading("bitrate", text="bitrate")
         self.tree.heading("channels", text="channels")
         self.tree.heading("name", text="name")
@@ -525,8 +665,6 @@ class TrackConfigGui:
         self.tree.column("id", width=120)
         self.tree.column("type", width=70, anchor=tk.CENTER)
         self.tree.column("mode", width=70, anchor=tk.CENTER)
-        self.tree.column("params", width=140)
-        self.tree.column("last_params", width=140)
         self.tree.column("bitrate", width=70, anchor=tk.CENTER)
         self.tree.column("channels", width=70, anchor=tk.CENTER)
         self.tree.column("name", width=120)
@@ -546,8 +684,6 @@ class TrackConfigGui:
         self.id_var = tk.StringVar()
         self.type_var = tk.StringVar(value="auto")
         self.mode_var = tk.StringVar(value="COPY")
-        self.params_var = tk.StringVar()
-        self.last_params_var = tk.StringVar()
         self.bitrate_var = tk.StringVar()
         self.channels_var = tk.StringVar()
         self.name_var = tk.StringVar()
@@ -557,20 +693,15 @@ class TrackConfigGui:
         self.id_var.trace_add("write", self.on_id_change)
         self.type_var.trace_add("write", self.on_type_change)
         self.mode_var.trace_add("write", self.on_mode_change)
-        self.default_fastpass_var.trace_add("write", self.on_defaults_change)
-        self.default_mainpass_var.trace_add("write", self.on_defaults_change)
-        self.default_zoning_text.bind("<<Modified>>", self.on_zoning_change)
 
         self._add_form_row(form_frame, 0, "id", self.id_var)
         self._add_combo_row(form_frame, 1, "type", self.type_var, TYPE_OPTIONS)
         self._add_combo_row(form_frame, 2, "mode", self.mode_var, MODE_OPTIONS)
-        self._add_form_row(form_frame, 3, "params", self.params_var)
-        self._add_form_row(form_frame, 4, "last params", self.last_params_var)
-        self._add_form_row(form_frame, 5, "bitrate", self.bitrate_var)
-        self._add_form_row(form_frame, 6, "channels", self.channels_var)
-        self._add_form_row(form_frame, 7, "name", self.name_var)
-        self._add_form_row(form_frame, 8, "lang", self.lang_var)
-        self._add_combo_row(form_frame, 9, "default", self.default_var, DEFAULT_OPTIONS)
+        self._add_form_row(form_frame, 3, "bitrate", self.bitrate_var)
+        self._add_form_row(form_frame, 4, "channels", self.channels_var)
+        self._add_form_row(form_frame, 5, "name", self.name_var)
+        self._add_form_row(form_frame, 6, "lang", self.lang_var)
+        self._add_combo_row(form_frame, 7, "default", self.default_var, DEFAULT_OPTIONS)
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill=tk.X, padx=6, pady=(0, 6))
@@ -592,11 +723,7 @@ class TrackConfigGui:
         ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
         entry = ttk.Entry(frame, textvariable=variable, width=40)
         entry.grid(row=row, column=1, sticky=tk.W, pady=2)
-        if label == "params":
-            self.params_entry = entry
-        elif label == "last params":
-            self.last_params_entry = entry
-        elif label == "bitrate":
+        if label == "bitrate":
             self.bitrate_entry = entry
         elif label == "channels":
             self.channels_entry = entry
@@ -635,8 +762,6 @@ class TrackConfigGui:
                 setting.get("id") or "",
                 setting.get("type") or "auto",
                 setting.get("mode") or "",
-                setting.get("params") or "",
-                setting.get("last_params") or "",
                 setting.get("bitrate") or "",
                 setting.get("channels") or "",
                 setting.get("name") or "",
@@ -671,8 +796,8 @@ class TrackConfigGui:
             "id": self.id_var.get().strip(),
             "type": setting_type,
             "mode": self.mode_var.get().strip().upper(),
-            "params": self.params_var.get().strip(),
-            "last_params": self.last_params_var.get().strip(),
+            "params": "",
+            "last_params": "",
             "bitrate": self.bitrate_var.get().strip(),
             "channels": self.channels_var.get().strip(),
             "name": self.name_var.get().strip(),
@@ -688,6 +813,12 @@ class TrackConfigGui:
             text = " ".join(line.strip() for line in text.splitlines())
         return text.strip()
 
+    def _get_var_value(self, name):
+        var = getattr(self, name, None)
+        if not var:
+            return ""
+        return var.get().strip()
+
     def _current_defaults(self):
         zoning_value = ""
         if hasattr(self, "default_zoning_text"):
@@ -696,20 +827,27 @@ class TrackConfigGui:
             params=self._get_single_line_text(getattr(self, "default_params_text", None)),
             last_params=self._get_single_line_text(getattr(self, "default_last_params_text", None)),
             zoning=zoning_value,
-            fastpass=self.default_fastpass_var.get().strip(),
-            mainpass=self.default_mainpass_var.get().strip(),
+            fastpass=self._get_var_value("default_fastpass_var"),
+            mainpass=self._get_var_value("default_mainpass_var"),
+            scene_detection=self._get_var_value("scene_detection_var"),
+            no_fastpass=bool(getattr(self, "no_fastpass_var", tk.BooleanVar(value=False)).get()),
+            fastpass_workers=self._get_var_value("fastpass_workers_var"),
+            mainpass_workers=self._get_var_value("mainpass_workers_var"),
             workers=self.defaults.workers,
-            ab_multiplier=self.defaults.ab_multiplier,
-            ab_pos_dev=self.defaults.ab_pos_dev,
-            ab_neg_dev=self.defaults.ab_neg_dev,
+            ab_multiplier=self._get_var_value("ab_multiplier_var"),
+            ab_pos_dev=self._get_var_value("ab_pos_dev_var"),
+            ab_neg_dev=self._get_var_value("ab_neg_dev_var"),
+            ab_pos_multiplier=self._get_var_value("ab_pos_multiplier_var"),
+            ab_neg_multiplier=self._get_var_value("ab_neg_multiplier_var"),
+            main_vpy=self._get_var_value("main_vpy_var"),
+            fast_vpy=self._get_var_value("fast_vpy_var"),
+            proxy_vpy=self._get_var_value("proxy_vpy_var"),
         )
 
     def _apply_setting_to_form(self, setting):
         self.id_var.set(setting.get("id") or "")
         self.type_var.set(setting.get("type") or "auto")
         self.mode_var.set(setting.get("mode") or "COPY")
-        self.params_var.set(setting.get("params") or "")
-        self.last_params_var.set(setting.get("last_params") or "")
         self.bitrate_var.set(setting.get("bitrate") or "")
         self.channels_var.set(setting.get("channels") or "")
         self.name_var.set(setting.get("name") or "")
@@ -736,8 +874,6 @@ class TrackConfigGui:
             mode = self.mode_var.get().strip().upper()
 
             allowed_modes = MODE_OPTIONS
-            enable_params = False
-            enable_last_params = False
             enable_bitrate = False
             enable_channels = False
             enable_name = False
@@ -750,9 +886,6 @@ class TrackConfigGui:
                     mode = allowed_modes[0]
                     self.mode_var.set(mode)
                 enable_lang = True
-                if mode == "EDIT":
-                    enable_params = True
-                    enable_last_params = True
             elif track_type == "audio":
                 allowed_modes = AUDIO_MODE_OPTIONS
                 if mode not in allowed_modes:
@@ -782,16 +915,12 @@ class TrackConfigGui:
                 enable_name = True
                 enable_lang = True
                 if mode == "EDIT":
-                    enable_params = True
-                    enable_last_params = True
                     enable_bitrate = True
                     enable_channels = True
 
             if hasattr(self, "mode_combo"):
                 self.mode_combo.configure(values=allowed_modes)
 
-            self._set_entry_state(getattr(self, "params_entry", None), enable_params)
-            self._set_entry_state(getattr(self, "last_params_entry", None), enable_last_params)
             self._set_entry_state(getattr(self, "bitrate_entry", None), enable_bitrate)
             self._set_entry_state(getattr(self, "channels_entry", None), enable_channels)
             self._set_entry_state(getattr(self, "name_entry", None), enable_name)
@@ -841,6 +970,35 @@ class TrackConfigGui:
 
     def on_mode_change(self, *_args):
         self._refresh_field_states()
+
+    def on_ab_multiplier_change(self, *_args):
+        if getattr(self, "_ab_syncing", False):
+            return
+        self._ab_syncing = True
+        try:
+            value = self._get_var_value("ab_multiplier_var")
+            if self._get_var_value("ab_pos_multiplier_var") != value:
+                self.ab_pos_multiplier_var.set(value)
+            if self._get_var_value("ab_neg_multiplier_var") != value:
+                self.ab_neg_multiplier_var.set(value)
+            self.on_defaults_change()
+        finally:
+            self._ab_syncing = False
+
+    def on_ab_pos_multiplier_change(self, *_args):
+        if getattr(self, "_ab_syncing", False):
+            return
+        self._ab_syncing = True
+        try:
+            multiplier = self._get_var_value("ab_multiplier_var")
+            if multiplier:
+                pos_val = self._get_var_value("ab_pos_multiplier_var")
+                neg_val = self._get_var_value("ab_neg_multiplier_var")
+                if pos_val != multiplier or neg_val != multiplier:
+                    self.ab_multiplier_var.set("")
+            self.on_defaults_change()
+        finally:
+            self._ab_syncing = False
 
     def on_default_text_change(self, event=None):
         widget = event.widget if event else None
