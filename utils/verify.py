@@ -18,7 +18,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
 
 
 MIN_BYTES_SUB = 0          # subtitles can be tiny
@@ -159,6 +159,53 @@ def which_or(path_or_name: str) -> Optional[str]:
     if Path(path_or_name).exists():
         return path_or_name
     return shutil.which(path_or_name)
+
+
+def norm_path(p: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(p)))
+
+
+def find_attachments_cleaner_report(workdir: Path) -> Optional[Path]:
+    candidates = [
+        workdir / "attachments" / "attachments_cleaner_report.json",
+        workdir / "attachments_cleaner_report.json",
+        workdir / "00_logs" / "attachments_cleaner_report.json",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def load_removed_attachments(workdir: Path) -> Tuple[Set[str], Set[str], Optional[Path]]:
+    report = find_attachments_cleaner_report(workdir)
+    if not report:
+        return set(), set(), None
+    try:
+        js = read_json(report)
+    except Exception:
+        return set(), set(), report
+
+    # If it was a dry-run, nothing was actually removed.
+    if bool(js.get("dry_run")):
+        return set(), set(), report
+
+    removed = js.get("removed_fonts") or []
+    removed_paths: Set[str] = set()
+    removed_names: Set[str] = set()
+    if isinstance(removed, list):
+        for r in removed:
+            if not isinstance(r, dict):
+                continue
+            p = r.get("path")
+            if not p:
+                continue
+            pp = Path(str(p))
+            if not pp.is_absolute():
+                pp = workdir / pp
+            removed_paths.add(norm_path(pp))
+            removed_names.add(pp.name)
+    return removed_paths, removed_names, report
 
 
 def run_ffprobe_json(ffprobe: str, path: Path) -> Dict[str, Any]:
@@ -375,6 +422,9 @@ def verify_demux_outputs(workdir: Path, source: Path, ffprobe: Optional[str]) ->
         return
 
     man = read_json(demux_manifest)
+    removed_paths, removed_names, report_path = load_removed_attachments(workdir)
+    if report_path and (removed_paths or removed_names):
+        print(f"[verify] attachments-cleaner report: {report_path}")
 
     # subs
     subs = man.get("subs") or []
@@ -405,6 +455,11 @@ def verify_demux_outputs(workdir: Path, source: Path, ffprobe: Optional[str]) ->
             if not pp.is_absolute():
                 pp = workdir / pp
             print(f"[verify] att: {pp.name}")
+            if not pp.exists():
+                if (removed_paths or removed_names) and (norm_path(pp) in removed_paths or pp.name in removed_names):
+                    print(f"[verify] att: {pp.name} => missing but removed by attachments-cleaner")
+                    continue
+                raise RuntimeError("attachment_missing_or_too_small")
             check_file_exists(pp, MIN_BYTES_ATTACHMENT, "attachment_missing_or_too_small")
 
     # chapters
