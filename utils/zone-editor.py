@@ -519,11 +519,19 @@ def parse_selectors(
 
         # Otherwise: chapter title
         if not video.chapters:
-            raise ValueError(f"Selector {raw!r} treated as chapter title, but video has no chapters.")
+            print(
+                f"[warn] Selector {raw!r} treated as chapter title, but video has no chapters. Skipping.",
+                file=sys.stderr,
+            )
+            continue
 
         matches = find_chapter_ranges_by_title(video.chapters, raw)
         if not matches:
-            raise ValueError(f"Chapter title {raw!r} not found in source video chapters.")
+            print(
+                f"[warn] Chapter title {raw!r} not found in source video chapters. Skipping.",
+                file=sys.stderr,
+            )
+            continue
 
         frs: List[FrameRange] = []
         for (cs, ce, _title) in matches:

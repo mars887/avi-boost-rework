@@ -71,6 +71,8 @@ def main() -> int:
                         help="Scene detection mode: psd (default, run PSD and pass --scenes) or av1an (use av1an internal detection).")
     parser.add_argument("--no-fastpass", action="store_true",
                         help="Skip fast-pass and metrics; write uniform scenes with base CRF.")
+    parser.add_argument("--stop-before-stage4", "--fastpass-only", action="store_true",
+                        help="Run stages 1-3, then exit before Stage 4 (useful for two-pass batch).")
 
     # PSD
     parser.add_argument("--psd-script", default="Progressive-Scene-Detection.py",
@@ -391,6 +393,13 @@ def main() -> int:
                     vpy_src=metrics_ref_vpy_src,
                 )
                 touch(marks["ssimu2"])
+
+    if args.stop_before_stage4:
+        print("[stop] requested stop before stage 4; skipping stages 4+.")
+        print(f"Base scenes : {base_scenes_path}")
+        print(f"Fast-pass   : {fastpass_out}")
+        print(f"SSIMU2 log  : {ssimu2_log}")
+        return 0
 
     # -----------------
     # Stage 4: base scenes

@@ -4,14 +4,28 @@ import utils.SummaryRow
 import utils.enterNumbers
 import utils.summarizeTracksWithPython
 import java.io.File
+import java.nio.charset.Charset
 
 val videoExtensions = listOf("mp4", "mkv")
 private val gson = Gson()
 
 fun runMain(args: Array<String>) {
-    println("Enter file or directory path:")
-    val inputPath = readln().trim()
-    val inputFile = File(inputPath)
+    println("Enter file, directory path or per-file bat path:")
+    val firstInput = readln().trim()
+    val firstFile = File(firstInput)
+
+    var perFileDefaults: GuiDefaults? = null
+    val inputFile = when {
+        firstFile.isFile && firstFile.extension.equals("bat", ignoreCase = true) -> {
+            perFileDefaults = runCatching { buildGuiDefaultsFromPerFileBat(firstFile) }
+                .onFailure { println("Warning: failed to parse per-file bat: ${it.message}") }
+                .getOrNull()
+            println("Enter file or directory path:")
+            val secondInput = readln().trim()
+            File(secondInput)
+        }
+        else -> firstFile
+    }
 
 
     val videoFiles = when {
@@ -53,7 +67,8 @@ fun runMain(args: Array<String>) {
         pythonExe = Paths.PYTHON_EXE,
         scriptPath = resolveTrackConfigGuiPath(),
         files = videoFiles,
-        summary = tracksSummary
+        summary = tracksSummary,
+        defaults = perFileDefaults ?: buildGuiDefaults()
     )
     if (result.isEmpty()) {
         println("No GUI result received.")
@@ -71,7 +86,7 @@ fun runMain(args: Array<String>) {
     }
     val gen = BdremBatGenerator(
         paths = Paths,
-        pipelineDir = "C:\\projects\\PBBatchProcessUtil\\src\\main\\java\\utils"           // где лежат demux.py/mux.py/verify.py/...
+        pipelineDir = "C:\\projects\\PBBatchProcessUtil\\src\\main\\java"           // где лежат demux.py/mux.py/verify.py/...
     )
 
     for ((filePath, trackList) in result) {
@@ -107,6 +122,147 @@ private fun buildGuiDefaults(): GuiDefaults {
         fastVpy = "",
         proxyVpy = ""
     )
+}
+
+private fun buildGuiDefaultsFromPerFileBat(batFile: File): GuiDefaults {
+    val base = buildGuiDefaults()
+    val lines = readBatLines(batFile)
+    val env = parseBatEnv(lines)
+
+    val quality = envValue(env, "QUALITY")?.trim()?.takeIf { it.isNotEmpty() }
+    val fastPreset = extractFlagValue(lines, "--fast-preset")
+    val mainPreset = extractFlagValue(lines, "--preset")
+    val noFastpass = lines.any { it.contains("--no-fastpass", ignoreCase = true) }
+
+    val params = buildParamsFromBat(envValue(env, "FASTPASS"), quality, fastPreset)
+    val lastParams = buildParamsFromBat(envValue(env, "MAINPASS"), quality, mainPreset)
+
+    val workdir = envValue(env, "WORKDIR")?.takeIf { it.isNotBlank() }
+    val zoning = readZoneEdit(workdir, batFile)
+
+    val sceneDetection = envValue(env, "SCENE_DETECTION")
+        ?: extractFlagValue(lines, "--sdm")?.takeIf { !it.contains("%") }
+
+    return GuiDefaults(
+        params = params ?: base.params,
+        lastParams = lastParams ?: base.lastParams,
+        zoning = zoning ?: base.zoning,
+        fastpass = envValue(env, "FASTPASS_VF") ?: base.fastpass,
+        mainpass = envValue(env, "MAINPASS_VF") ?: base.mainpass,
+        sceneDetection = sceneDetection ?: base.sceneDetection,
+        noFastpass = noFastpass,
+        fastpassWorkers = envValue(env, "FASTPASS_WORKERS") ?: base.fastpassWorkers,
+        mainpassWorkers = envValue(env, "MAINPASS_WORKERS") ?: base.mainpassWorkers,
+        abMultiplier = envValue(env, "AB_MULTIPIER")
+            ?: envValue(env, "AB_MULTIPLIER")
+            ?: base.abMultiplier,
+        abPosDev = envValue(env, "AB_POS_DEV") ?: base.abPosDev,
+        abNegDev = envValue(env, "AB_NEG_DEV") ?: base.abNegDev,
+        abPosMultiplier = envValue(env, "AB_POS_MULT") ?: base.abPosMultiplier,
+        abNegMultiplier = envValue(env, "AB_NEG_MULT") ?: base.abNegMultiplier,
+        mainVpy = envValue(env, "MAIN_VPY") ?: base.mainVpy,
+        fastVpy = envValue(env, "FAST_VPY") ?: base.fastVpy,
+        proxyVpy = envValue(env, "PROXY_VPY") ?: base.proxyVpy
+    )
+}
+
+private fun readBatLines(batFile: File): List<String> {
+    require(batFile.exists() && batFile.isFile) { "Per-file bat not found: ${batFile.path}" }
+    val charset = Charset.forName("windows-1251")
+    return batFile.readLines(charset)
+}
+
+private fun parseBatEnv(lines: List<String>): Map<String, String> {
+    val env = mutableMapOf<String, String>()
+    val regex = Regex("""^\s*set\s+"([^=]+)=(.*)"\s*$""", RegexOption.IGNORE_CASE)
+    for (line in lines) {
+        val match = regex.find(line) ?: continue
+        val key = match.groupValues[1].trim().uppercase()
+        val value = match.groupValues[2]
+        env[key] = value
+    }
+    return env
+}
+
+private fun envValue(env: Map<String, String>, key: String): String? {
+    val upperKey = key.uppercase()
+    return if (env.containsKey(upperKey)) env[upperKey] ?: "" else null
+}
+
+private fun extractFlagValue(lines: List<String>, flag: String): String? {
+    for (line in lines) {
+        val trimmed = line.trimStart()
+        if (!trimmed.startsWith(flag)) {
+            continue
+        }
+        val value = extractFlagValue(trimmed, flag)
+        if (!value.isNullOrBlank()) {
+            return value
+        }
+    }
+    return null
+}
+
+private fun extractFlagValue(line: String, flag: String): String? {
+    val regex = Regex("""(?:^|\s)${Regex.escape(flag)}\s+("([^"]*)"|([^\s^]+))""")
+    val match = regex.find(line) ?: return null
+    val quoted = match.groups[2]?.value
+    val bare = match.groups[3]?.value
+    val value = quoted ?: bare ?: return null
+    return value.trim()
+}
+
+private fun buildParamsFromBat(base: String?, quality: String?, preset: String?): String? {
+    var out = base?.trim() ?: ""
+    var used = base != null
+    if (!quality.isNullOrBlank() && !hasFlag(out, "--crf")) {
+        out = appendFlag(out, "--crf", quality)
+        used = true
+    }
+    if (!preset.isNullOrBlank() && !hasFlag(out, "--preset")) {
+        out = appendFlag(out, "--preset", preset)
+        used = true
+    }
+    return if (used) out.trim() else null
+}
+
+private fun hasFlag(params: String, flag: String): Boolean {
+    if (params.isBlank()) return false
+    val regex = Regex("""(?:^|\s)${Regex.escape(flag)}(?:\s|=|$)""")
+    return regex.containsMatchIn(params)
+}
+
+private fun appendFlag(params: String, flag: String, value: String): String {
+    val formatted = formatParamValue(value)
+    val prefix = if (params.isBlank()) "" else params.trim() + " "
+    return if (formatted.isBlank()) {
+        "$prefix$flag"
+    } else {
+        "$prefix$flag $formatted"
+    }.trim()
+}
+
+private fun formatParamValue(value: String): String {
+    val trimmed = value.trim()
+    if (trimmed.isEmpty()) return trimmed
+    if (trimmed.startsWith("\"") && trimmed.endsWith("\"")) return trimmed
+    return if (trimmed.any { it.isWhitespace() }) "\"$trimmed\"" else trimmed
+}
+
+private fun readZoneEdit(workdir: String?, batFile: File): String? {
+    val candidates = mutableListOf<File>()
+    if (!workdir.isNullOrBlank()) {
+        candidates.add(File(workdir, "zone_edit_command.txt"))
+    }
+    val fallbackDir = File(batFile.parentFile, batFile.nameWithoutExtension)
+    candidates.add(File(fallbackDir, "zone_edit_command.txt"))
+
+    for (candidate in candidates) {
+        if (candidate.exists() && candidate.isFile) {
+            return candidate.readText(Charsets.UTF_8)
+        }
+    }
+    return null
 }
 
 enum class TrackStatus {
@@ -160,9 +316,10 @@ private fun openTrackConfigGui(
     pythonExe: String,
     scriptPath: String,
     files: List<File>,
-    summary: List<Pair<String, SummaryRow>>
+    summary: List<Pair<String, SummaryRow>>,
+    defaults: GuiDefaults
 ): Map<String, List<TrackInFile>> {
-    val inputJson = gson.toJson(buildGuiInput(files, summary))
+    val inputJson = gson.toJson(buildGuiInput(files, summary, defaults))
     val cmd = listOf(pythonExe, scriptPath)
     val process = ProcessBuilder(cmd)
         .redirectErrorStream(false)
@@ -200,7 +357,8 @@ private fun openTrackConfigGui(
 
 private fun buildGuiInput(
     files: List<File>,
-    summary: List<Pair<String, SummaryRow>>
+    summary: List<Pair<String, SummaryRow>>,
+    defaults: GuiDefaults
 ): GuiInput {
     val fileList = files.map { it.toString() }
     val summaryRows = summary.map { (line, row) ->
@@ -213,7 +371,7 @@ private fun buildGuiInput(
             presentIn = row.presentIn.sorted()
         )
     }
-    return GuiInput(fileList, summaryRows, buildGuiDefaults())
+    return GuiInput(fileList, summaryRows, defaults)
 }
 
 

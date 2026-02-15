@@ -93,6 +93,7 @@ class BdremBatGenerator(
     /**
      * Generates:
      * - start-batch.bat (sequential runner for per-file bats)
+     * - batch-fastpass.bat (sequential runner for fastpass-only per-file)
      * - Batch Manager.bat (drag-and-drop helper to run batch-manager.py)
      *
      * Scripts are created per source directory.
@@ -105,7 +106,7 @@ class BdremBatGenerator(
             groups.getOrPut(dir) { mutableListOf() }.add(f)
         }
 
-        val batchManagerPy = File(pipelineDir, "batch-manager.py").absolutePath
+        val batchManagerPy = File(pipelineDir, "utils\\batch-manager.py").absolutePath
 
         for ((dirPath, items) in groups) {
             if (items.isEmpty()) continue
@@ -115,6 +116,11 @@ class BdremBatGenerator(
             val startText = buildStartBatchText(items)
             startBat.writeText(transliterateToAscii(startText), Charset.forName("windows-1251"))
             out.add(startBat)
+
+            val fastpassBat = File(dir, "batch-fastpass.bat")
+            val fastpassText = buildFastpassBatchText(items)
+            fastpassBat.writeText(transliterateToAscii(fastpassText), Charset.forName("windows-1251"))
+            out.add(fastpassBat)
 
             val mgrBat = File(dir, "Batch Manager.bat")
             val mgrText = buildBatchManagerText(batchManagerPy)
@@ -140,14 +146,14 @@ class BdremBatGenerator(
 
         fun q(s: String) = "\"$s\""
 
-        val demuxPy = File(pipelineDir, "demux.py").absolutePath
-        val attCleanPy = File(pipelineDir, "attachments-cleaner.py").absolutePath
-        val audioToolPy = File(pipelineDir, "audio-tool-v2.py").absolutePath
-        val autoBoostPy = File(pipelineDir, "auto-boost_2.9.py").absolutePath
-        val hdrPatchPy = File(pipelineDir, "av1an_hdr_metadata_patch_v2.py").absolutePath
-        val zoneEditorPy = File(pipelineDir, "zone-editor.py").absolutePath
-        val verifyPy = File(pipelineDir, "verify.py").absolutePath
-        val muxPy = File(pipelineDir, "mux.py").absolutePath
+        val demuxPy = File(pipelineDir, "utils\\demux.py").absolutePath
+        val attCleanPy = File(pipelineDir, "utils\\attachments-cleaner.py").absolutePath
+        val audioToolPy = File(pipelineDir, "utils\\audio-tool-v2.py").absolutePath
+        val autoBoostPy = File(pipelineDir, "auto-boost-3.0\\auto_boost.py").absolutePath
+        val hdrPatchPy = File(pipelineDir, "utils\\av1an_hdr_metadata_patch_v2.py").absolutePath
+        val zoneEditorPy = File(pipelineDir, "utils\\zone-editor.py").absolutePath
+        val verifyPy = File(pipelineDir, "utils\\verify.py").absolutePath
+        val muxPy = File(pipelineDir, "utils\\mux.py").absolutePath
 
         // Tracks block
         val tracksComment = buildTracksComment(tracks)
@@ -244,6 +250,11 @@ class BdremBatGenerator(
         sb.appendLine("set \"LOGDIR=%WORKDIR%\\00_logs\"")
         sb.appendLine("set \"MAINPASS_INPUT=%SRC%\"")
         sb.appendLine("if not \"%MAIN_VPY%\"==\"\" set \"MAINPASS_INPUT=%MAIN_VPY%\"")
+        sb.appendLine("if not defined FASTPASS_ONLY set \"FASTPASS_ONLY=0\"")
+        sb.appendLine("if /I \"%~1\"==\"--fastpass-only\" set \"FASTPASS_ONLY=1\"")
+        sb.appendLine("if /I \"%~1\"==\"--stop-before-stage4\" set \"FASTPASS_ONLY=1\"")
+        sb.appendLine("set \"AUTOBOOST_EXTRA=\"")
+        sb.appendLine("if /I \"%FASTPASS_ONLY%\"==\"1\" set \"AUTOBOOST_EXTRA= --stop-before-stage4\"")
         sb.appendLine()
         sb.appendLine("mkdir \"%WORKDIR%\" \"%LOGDIR%\" \"%WORKDIR%\\audio\" \"%WORKDIR%\\video\" \"%WORKDIR%\\sub\" \"%WORKDIR%\\attachments\" \"%WORKDIR%\\chapters\" >nul 2>nul")
         sb.appendLine()
@@ -298,7 +309,7 @@ class BdremBatGenerator(
         sb.appendLine("  --workers \"%FASTPASS_WORKERS%\" ^")
         sb.appendLine("  -v \"%FASTPASS%\" ^")
         sb.appendLine("  --final-override \"%MAINPASS%\" ^")
-        sb.appendLine("  --quality \"%QUALITY%\" ^")
+        sb.appendLine("  --quality \"%QUALITY%\"%AUTOBOOST_EXTRA% ^")
         if (!fastpassPreset.isNullOrBlank()) sb.appendLine("  --fast-preset \"$fastpassPreset\" ^")
         if (!mainpassPreset.isNullOrBlank()) sb.appendLine("  --preset \"$mainpassPreset\" ^")
         if (useAggressive) sb.appendLine("  -a \"%AB_MULTIPIER%\" ^")
@@ -311,6 +322,11 @@ class BdremBatGenerator(
         if(fastpassVf.isNotBlank()) sb.appendLine("  -f \"%FASTPASS_VF%\" ^")
         sb.appendLine("  --log \"%LOGDIR%\\03_autoboost.log\"")
         sb.appendLine("if errorlevel 1 goto :fail")
+        sb.appendLine()
+        sb.appendLine("if /I \"%FASTPASS_ONLY%\"==\"1\" (")
+        sb.appendLine("  echo [fastpass-only] stopping before Stage 4 and later stages")
+        sb.appendLine("  exit /b 0")
+        sb.appendLine(")")
         sb.appendLine()
         sb.appendLine("REM 2.2 hdr-patch -> scenes-hdr.json")
         sb.appendLine("${Paths.VS_PYTHON_EXE} ${q(hdrPatchPy)} ^")
@@ -464,6 +480,42 @@ class BdremBatGenerator(
         sb.appendLine("  exit /b 0")
         sb.appendLine(")")
         sb.appendLine("call \"%BAT%\"")
+        sb.appendLine("exit /b %errorlevel%")
+        sb.appendLine()
+        sb.appendLine(":fail")
+        sb.appendLine("echo FAILED (code=%errorlevel%)")
+        sb.appendLine("exit /b 1")
+        return sb.toString()
+    }
+
+    private fun buildFastpassBatchText(files: List<File>): String {
+        val sb = StringBuilder()
+        sb.appendLine("@echo off")
+        sb.appendLine("setlocal EnableExtensions DisableDelayedExpansion")
+        sb.appendLine("chcp 1251 >nul")
+        sb.appendLine("pushd \"%~dp0\"")
+        sb.appendLine()
+        for (f in files) {
+            val base = f.nameWithoutExtension
+            sb.appendLine("call :run \"$base\"")
+            sb.appendLine("if errorlevel 1 goto :fail")
+        }
+        sb.appendLine()
+        sb.appendLine("echo OK")
+        sb.appendLine("exit /b 0")
+        sb.appendLine()
+        sb.appendLine(":run")
+        sb.appendLine("set \"BASENAME=%~1\"")
+        sb.appendLine("set \"BAT=%~dp0%BASENAME%.bat\"")
+        sb.appendLine("echo.")
+        sb.appendLine("echo ==========================================================")
+        sb.appendLine("echo ====== FASTPASS %BASENAME% ======")
+        sb.appendLine("echo ==========================================================")
+        sb.appendLine("if not exist \"%BAT%\" (")
+        sb.appendLine("  echo [skip] missing bat: \"%BAT%\"")
+        sb.appendLine("  exit /b 0")
+        sb.appendLine(")")
+        sb.appendLine("call \"%BAT%\" --fastpass-only")
         sb.appendLine("exit /b %errorlevel%")
         sb.appendLine()
         sb.appendLine(":fail")
