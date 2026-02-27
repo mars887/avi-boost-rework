@@ -1,6 +1,7 @@
 fun main(args: Array<String>) {
     when(args.getOrNull(0)) {
         null -> runMain(args)
+        "extract" -> runExtract(args.drop(1))
         "split" -> runSplit(args.drop(1))
         "modify" -> runModify(args.drop(1))
         "pack" -> runPack(args.drop(1))

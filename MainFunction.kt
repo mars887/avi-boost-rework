@@ -102,6 +102,164 @@ fun runMain(args: Array<String>) {
 
 }
 
+fun runExtract(drop: List<String>) {
+    val overwrite = drop.any { it.equals("--overwrite", ignoreCase = true) }
+
+    println("Enter file or directory path:")
+    val input = readln().trim()
+    val inputFile = File(input)
+
+    val sourceFiles = when {
+        inputFile.isFile -> {
+            if (isSupportedVideoFile(inputFile)) {
+                listOf(inputFile.absoluteFile)
+            } else {
+                error("File extension not supported")
+            }
+        }
+
+        inputFile.isDirectory -> inputFile.listFiles()
+            ?.filter { isSupportedVideoFile(it) }
+            ?.sortedBy { it.name.lowercase() }
+            ?.let { files ->
+                println("Files:")
+                files.forEachIndexed { index, file ->
+                    println("  ${index + 1} - ${file.name}")
+                }
+                val idx = enterNumbers(1, files.size)
+                files.filterIndexed { index, _ ->
+                    index + 1 in idx
+                }.map { it.absoluteFile }
+            }
+
+        else -> {
+            error("Path not found or this is not file/directory.")
+        }
+    } ?: error("no files found")
+
+    if (sourceFiles.isEmpty()) {
+        println("No files selected.")
+        return
+    }
+
+    println("Files:")
+    println(sourceFiles.joinToString("\n") { "  ${it.name}" })
+
+    val tracksSummary = summarizeTracksWithPython(
+        Paths.PYTHON_EXE,
+        resolveFileTracksInfoPath(),
+        sourceFiles.map { it.absolutePath }
+    )
+
+    println("\nTracks summary:")
+    tracksSummary.forEach {
+        println("  ${it.first}")
+    }
+
+    val result = openTrackConfigGui(
+        pythonExe = Paths.PYTHON_EXE,
+        scriptPath = resolveTrackConfigGuiPath(),
+        files = sourceFiles,
+        summary = tracksSummary,
+        defaults = buildGuiDefaults()
+    )
+    if (result.isEmpty()) {
+        println("No GUI result received.")
+        return
+    }
+
+    val normalizedResult = normalizeGuiResultByPath(result)
+    val items = sourceFiles.mapNotNull { source ->
+        val normalizedPath = normalizePathKey(source.absolutePath)
+        val selectedTracks = normalizedResult[normalizedPath]
+            .orEmpty()
+            .filter { it.trackStatus != TrackStatus.SKIP }
+
+        if (selectedTracks.isEmpty()) {
+            return@mapNotNull null
+        }
+
+        BatchExtractItem(
+            source = source.absolutePath,
+            tracks = selectedTracks.map {
+                BatchExtractTrack(
+                    trackId = it.trackId,
+                    type = it.type,
+                    trackStatus = it.trackStatus.name,
+                    origName = it.origName,
+                    origLang = it.origLang,
+                    trackMux = it.trackMux
+                )
+            }
+        )
+    }
+
+    if (items.isEmpty()) {
+        println("No tracks selected for extraction.")
+        return
+    }
+
+    val outputRoot = chooseOutputRoot(sourceFiles)
+    val request = BatchExtractRequest(
+        outputRoot = outputRoot.absolutePath,
+        overwrite = overwrite,
+        items = items
+    )
+    if (overwrite) {
+        println("Overwrite mode: enabled")
+    }
+
+    val output = runBatchTrackExtractScript(
+        pythonExe = Paths.PYTHON_EXE,
+        scriptPath = resolveBatchTrackExtractPath(),
+        request = request
+    )
+
+    if (output != null) {
+        println("Extraction root: ${output.outputRoot}")
+        println("Tracks processed: ${output.processed}")
+        println("Tracks extracted: ${output.extracted}")
+        if (output.failed > 0) {
+            println("Tracks failed: ${output.failed}")
+        }
+        output.groups.orEmpty().forEach { group ->
+            println("  ${group.folder}: ${group.tracks}")
+        }
+    }
+}
+
+private fun isSupportedVideoFile(file: File): Boolean {
+    if (!file.isFile) return false
+    return videoExtensions.any { ext ->
+        file.extension.equals(ext, ignoreCase = true)
+    }
+}
+
+private fun chooseOutputRoot(sourceFiles: List<File>): File {
+    val parents = sourceFiles.mapNotNull { it.parentFile?.absoluteFile }
+    if (parents.isEmpty()) return File(".").absoluteFile
+    val uniqueParents = linkedMapOf<String, File>()
+    for (parent in parents) {
+        uniqueParents.putIfAbsent(normalizePathKey(parent.absolutePath), parent)
+    }
+    if (uniqueParents.size > 1) {
+        println("Warning: files are from different directories, output root will be ${uniqueParents.values.first().absolutePath}")
+    }
+    return uniqueParents.values.first()
+}
+
+private fun normalizeGuiResultByPath(result: Map<String, List<TrackInFile>>): Map<String, List<TrackInFile>> {
+    val normalized = mutableMapOf<String, List<TrackInFile>>()
+    result.forEach { (path, tracks) ->
+        normalized[normalizePathKey(path)] = tracks
+    }
+    return normalized
+}
+
+private fun normalizePathKey(path: String): String {
+    return File(path).absoluteFile.normalize().path.lowercase()
+}
+
 private fun buildGuiDefaults(): GuiDefaults {
     return GuiDefaults(
         params = "--variance-boost-strength 2 --variance-octile 6 --variance-boost-curve 3 --tune 0 --qm-min 7 --chroma-qm-min 10 --scm 0 --enable-dlf 2 --sharp-tx 1 --enable-restoration 0 --color-primaries 9 --transfer-characteristics 16 --matrix-coefficients 9 --lp 3 --sharpness 1 --hbd-mds 1 --ac-bias 2.00",
@@ -122,6 +280,76 @@ private fun buildGuiDefaults(): GuiDefaults {
         fastVpy = "",
         proxyVpy = ""
     )
+}
+
+private fun resolveBatchTrackExtractPath(): String {
+    val local = File("utils/batch-track-extract.py")
+    if (local.exists()) {
+        return local.absolutePath
+    }
+    val fallback = File("src/main/java/utils/batch-track-extract.py")
+    if (fallback.exists()) {
+        return fallback.absolutePath
+    }
+    error(
+        "batch-track-extract.py not found. Checked: ${local.path}, ${fallback.path}"
+    )
+}
+
+private fun runBatchTrackExtractScript(
+    pythonExe: String,
+    scriptPath: String,
+    request: BatchExtractRequest
+): BatchExtractOutput? {
+    val inputJson = gson.toJson(request)
+    val process = ProcessBuilder(listOf(pythonExe, scriptPath))
+        .redirectErrorStream(false)
+        .apply {
+            environment()["PYTHONIOENCODING"] = "utf-8"
+            environment()["PYTHONUTF8"] = "1"
+        }
+        .start()
+
+    val stderrLines = mutableListOf<String>()
+    val stderrThread = Thread {
+        process.errorStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
+            lines.forEach { line ->
+                synchronized(stderrLines) {
+                    stderrLines += line
+                }
+                println(line)
+            }
+        }
+    }.apply {
+        isDaemon = true
+        start()
+    }
+
+    process.outputStream.use { stream ->
+        stream.write(inputJson.toByteArray(Charsets.UTF_8))
+    }
+
+    val stdout = process.inputStream.bufferedReader(Charsets.UTF_8).readText()
+    val exitCode = process.waitFor()
+    stderrThread.join()
+
+    if (exitCode != 0) {
+        val stderrDump = synchronized(stderrLines) { stderrLines.joinToString("\n") }
+        if (stderrDump.isNotBlank()) {
+            error("Batch track extraction failed with code $exitCode\n$stderrDump")
+        }
+        error("Batch track extraction failed with code $exitCode")
+    }
+
+    if (stdout.isBlank()) {
+        return null
+    }
+
+    return runCatching { gson.fromJson(stdout, BatchExtractOutput::class.java) }
+        .onFailure {
+            println(stdout.trim())
+        }
+        .getOrNull()
 }
 
 private fun buildGuiDefaultsFromPerFileBat(batFile: File): GuiDefaults {
@@ -280,6 +508,40 @@ data class TrackInFile(
     val trackStatus: TrackStatus,
     val trackParam: Map<String, String>,
     val trackMux: Map<String, String>,
+)
+
+private data class BatchExtractRequest(
+    val outputRoot: String,
+    val overwrite: Boolean,
+    val items: List<BatchExtractItem>
+)
+
+private data class BatchExtractItem(
+    val source: String,
+    val tracks: List<BatchExtractTrack>
+)
+
+private data class BatchExtractTrack(
+    val trackId: Int,
+    val type: String,
+    val trackStatus: String,
+    val origName: String,
+    val origLang: String,
+    val trackMux: Map<String, String>
+)
+
+private data class BatchExtractOutput(
+    val status: String?,
+    val outputRoot: String?,
+    val processed: Int,
+    val extracted: Int,
+    val failed: Int,
+    val groups: List<BatchExtractGroup>?
+)
+
+private data class BatchExtractGroup(
+    val folder: String,
+    val tracks: Int
 )
 
 private fun resolveTrackConfigGuiPath(): String {

@@ -39,6 +39,9 @@ class BdremBatGenerator(
         val fileBase: String
     )
 
+    private fun toWindowsEol(s: String): String =
+        s.replace("\r\n", "\n").replace("\n", "\r\n")
+
     /**
      * Generates:
      * - <src dir>\<basename>.bat
@@ -86,7 +89,7 @@ class BdremBatGenerator(
         // Generate BAT next to source file
         val batFile = File(src.parentFile, "$baseName.bat")
         val batText = buildBatText(src, workDir, logDir, tracks, planEntries)
-        batFile.writeText(transliterateToAscii(batText), Charset.forName("windows-1251"))
+        batFile.writeText(toWindowsEol(transliterateToAscii(batText)), Charset.forName("windows-1251"))
         return batFile
     }
 
@@ -114,17 +117,17 @@ class BdremBatGenerator(
 
             val startBat = File(dir, "start-batch.bat")
             val startText = buildStartBatchText(items)
-            startBat.writeText(transliterateToAscii(startText), Charset.forName("windows-1251"))
+            startBat.writeText(toWindowsEol(transliterateToAscii(startText)), Charset.forName("windows-1251"))
             out.add(startBat)
 
             val fastpassBat = File(dir, "batch-fastpass.bat")
             val fastpassText = buildFastpassBatchText(items)
-            fastpassBat.writeText(transliterateToAscii(fastpassText), Charset.forName("windows-1251"))
+            fastpassBat.writeText(toWindowsEol(transliterateToAscii(fastpassText)), Charset.forName("windows-1251"))
             out.add(fastpassBat)
 
             val mgrBat = File(dir, "Batch Manager.bat")
             val mgrText = buildBatchManagerText(batchManagerPy)
-            mgrBat.writeText(transliterateToAscii(mgrText), Charset.forName("windows-1251"))
+            mgrBat.writeText(toWindowsEol(transliterateToAscii(mgrText)), Charset.forName("windows-1251"))
             out.add(mgrBat)
         }
 

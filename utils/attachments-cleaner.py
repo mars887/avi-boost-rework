@@ -431,23 +431,23 @@ def main() -> int:
     ass_count = len([p for p in subs_dir.iterdir() if p.is_file() and p.suffix.casefold() in (".ass", ".ssa")])
     log(f"ASS/SSA files scanned: {ass_count}")
 
-    if ass_count == 0:
-        log("[info] No ASS/SSA subtitles found -> keep attachments as-is.")
-        # Still write report
-        report_obj = {
-            "subs": str(subs_dir),
-            "attachments": str(att_dir),
-            "dry_run": bool(args.dry_run),
-            "fontTools": FONTTOOLS_OK,
-            "used_fonts": [],
-            "removed_fonts": [],
-            "note": "no_ass_subtitles",
-        }
-        report_path = Path(args.report) if args.report else (att_dir / "attachments_cleaner_report.json")
-        report_path.write_text(json.dumps(report_obj, ensure_ascii=False, indent=2), encoding="utf-8")
-        if not args.dry_run:
-            write_marker(workdir)
-        return 0
+    # if ass_count == 0:
+    #     log("[info] No ASS/SSA subtitles found -> keep attachments as-is.")
+    #     # Still write report
+    #     report_obj = {
+    #         "subs": str(subs_dir),
+    #         "attachments": str(att_dir),
+    #         "dry_run": bool(args.dry_run),
+    #         "fontTools": FONTTOOLS_OK,
+    #         "used_fonts": [],
+    #         "removed_fonts": [],
+    #         "note": "no_ass_subtitles",
+    #     }
+    #     report_path = Path(args.report) if args.report else (att_dir / "attachments_cleaner_report.json")
+    #     report_path.write_text(json.dumps(report_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    #     if not args.dry_run:
+    #         write_marker(workdir)
+    #     return 0
 
     log(f"Used font tokens (normalized): {len(used_fonts)}")
     if len(used_fonts) <= 200:
