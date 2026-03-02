@@ -72,7 +72,7 @@ def main() -> int:
     parser.add_argument("--no-fastpass", action="store_true",
                         help="Skip fast-pass and metrics; write uniform scenes with base CRF.")
     parser.add_argument("--stop-before-stage4", "--fastpass-only", action="store_true",
-                        help="Run stages 1-3, then exit before Stage 4 (useful for two-pass batch).")
+                        help="Write Stage 4 draft to scenes-preview.json and stop before Stage 5 (useful for two-pass batch).")
 
     # PSD
     parser.add_argument("--psd-script", default="Progressive-Scene-Detection.py",
@@ -181,6 +181,7 @@ def main() -> int:
 
     base_scenes_path = Path(args.base_scenes).expanduser().resolve() if args.base_scenes else (psd_dir / "scenes.psd.json")
     out_scenes_path = Path(args.out_scenes).expanduser().resolve() if args.out_scenes else (project_dir / "scenes.final.json")
+    preview_scenes_path = out_scenes_path.with_name("scenes-preview.json")
     fastpass_out = Path(args.fastpass_out).expanduser().resolve() if args.fastpass_out else (fastpass_dir / f"{input_file.stem}.fastpass.mkv")
     fastpass_vpy = Path(args.fastpass_vpy).expanduser().resolve() if args.fastpass_vpy else None
     fastpass_proxy = Path(args.fastpass_proxy).expanduser().resolve() if args.fastpass_proxy else None
@@ -235,6 +236,7 @@ def main() -> int:
         if not args.base_scenes:
             safe_unlink(base_scenes_path)
         safe_unlink(out_scenes_path)
+        safe_unlink(preview_scenes_path)
         safe_unlink(ssimu2_log)
         safe_unlink(fastpass_out)
 
@@ -394,24 +396,26 @@ def main() -> int:
                 )
                 touch(marks["ssimu2"])
 
-    if args.stop_before_stage4:
-        print("[stop] requested stop before stage 4; skipping stages 4+.")
-        print(f"Base scenes : {base_scenes_path}")
-        print(f"Fast-pass   : {fastpass_out}")
-        print(f"SSIMU2 log  : {ssimu2_log}")
-        return 0
-
     # -----------------
     # Stage 4: base scenes
     # -----------------
+    stage4_out_scenes_path = preview_scenes_path if args.stop_before_stage4 else out_scenes_path
     if args.stage in (0, 4):
-        if marks["final"].exists() and is_valid_final_scenes(out_scenes_path):
-            print(f"[resume] base scenes already written: {out_scenes_path}")
+        if args.stop_before_stage4:
+            stage4_ready = is_valid_final_scenes(stage4_out_scenes_path)
+        else:
+            stage4_ready = marks["final"].exists() and is_valid_final_scenes(stage4_out_scenes_path)
+
+        if stage4_ready:
+            if args.stop_before_stage4:
+                print(f"[resume] preview scenes already written: {stage4_out_scenes_path}")
+            else:
+                print(f"[resume] base scenes already written: {stage4_out_scenes_path}")
         else:
             if args.no_fastpass:
                 write_uniform_scenes(
                     base_scenes_path=base_scenes_path,
-                    out_scenes_path=out_scenes_path,
+                    out_scenes_path=stage4_out_scenes_path,
                     base_crf=float(args.quality),
                     final_preset=int(args.preset),
                     video_params=str(args.video_params),
@@ -447,7 +451,7 @@ def main() -> int:
 
                 apply_crf_adjustments_to_scenes(
                     base_scenes_path=base_scenes_path,
-                    out_scenes_path=out_scenes_path,
+                    out_scenes_path=stage4_out_scenes_path,
                     scene_ranges=scene_ranges,
                     per_chunk_5=per_chunk_5,
                     avg_total=avg_total_adj,
@@ -461,7 +465,21 @@ def main() -> int:
                     video_params=str(args.video_params),
                     final_override=str(args.final_override)
                 )
-            touch(marks["final"])
+            if args.stop_before_stage4:
+                print(f"[ok] preview scenes written: {stage4_out_scenes_path}")
+            else:
+                touch(marks["final"])
+
+    if args.stop_before_stage4:
+        print(f"Base scenes    : {base_scenes_path}")
+        print(f"Fast-pass      : {fastpass_out}")
+        print(f"SSIMU2 log     : {ssimu2_log}")
+        if args.stage in (0, 4):
+            print("[stop] requested stop before stage 5; preview scenes prepared.")
+            print(f"Preview scenes : {preview_scenes_path}")
+        else:
+            print("[stop] requested stop-before-stage4; stage 4 was not selected by --stage.")
+        return 0
 
     # -----------------
     # Stage 5: apply rules

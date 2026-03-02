@@ -445,6 +445,8 @@ def verify_demux_outputs(workdir: Path, source: Path, ffprobe: Optional[str]) ->
     # attachments
     atts = man.get("attachments") or []
     if isinstance(atts, list):
+        no_check_flag = not (workdir / "attachments" / "NO_CHECK").exists()
+
         for a in atts:
             if not isinstance(a, dict):
                 continue
@@ -459,8 +461,12 @@ def verify_demux_outputs(workdir: Path, source: Path, ffprobe: Optional[str]) ->
                 if (removed_paths or removed_names) and (norm_path(pp) in removed_paths or pp.name in removed_names):
                     print(f"[verify] att: {pp.name} => missing but removed by attachments-cleaner")
                     continue
-                raise RuntimeError("attachment_missing_or_too_small")
-            check_file_exists(pp, MIN_BYTES_ATTACHMENT, "attachment_missing_or_too_small")
+                if no_check_flag:
+                    print(f"[verify] att: {pp.name} => missing")
+                else:
+                    raise RuntimeError("attachment_missing_or_too_small")
+            if not no_check_flag: 
+                check_file_exists(pp, MIN_BYTES_ATTACHMENT, "attachment_missing_or_too_small")
 
     # chapters
     ch = man.get("chapters") or {}

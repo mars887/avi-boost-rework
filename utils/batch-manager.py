@@ -5,13 +5,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from xml.etree import ElementTree as ET
 
 
 VIDEO_EXTS = (".mkv", ".mp4")
@@ -536,6 +538,707 @@ def verify_config(group: SourceGroup, *, check_filters: bool, check_params: bool
         print(f"[err] verify failed (code={p.returncode})")
 
 
+def parse_frame_rate_value(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        return v if v > 0 else None
+    s = str(value).strip()
+    if not s:
+        return None
+    if "/" in s:
+        a, b = s.split("/", 1)
+        try:
+            num = float(a)
+            den = float(b)
+            if den == 0:
+                return None
+            v = num / den
+            return v if v > 0 else None
+        except Exception:
+            return None
+    try:
+        v = float(s)
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
+def get_source_fps(source: Path) -> Optional[float]:
+    if not shutil.which("ffprobe"):
+        return None
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+        "-of", "csv=p=0",
+        str(source),
+    ]
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        return None
+    for line in p.stdout.splitlines():
+        parts = [x.strip() for x in line.split(",") if x.strip()]
+        for part in parts:
+            fps = parse_frame_rate_value(part)
+            if fps:
+                return fps
+    return None
+
+
+def load_pass_chunks(pass_dir: Path) -> Dict[int, Dict[str, Any]]:
+    chunks_path = pass_dir / "chunks.json"
+    if not chunks_path.exists():
+        return {}
+    try:
+        raw = json.loads(read_text_best_effort(chunks_path))
+    except Exception:
+        return {}
+
+    chunks_raw: Any
+    if isinstance(raw, dict):
+        chunks_raw = raw.get("chunks")
+    else:
+        chunks_raw = raw
+    if not isinstance(chunks_raw, list):
+        return {}
+
+    by_index: Dict[int, Dict[str, Any]] = {}
+    for item in chunks_raw:
+        if not isinstance(item, dict):
+            continue
+        if "index" not in item:
+            continue
+        try:
+            idx = int(item["index"])
+        except Exception:
+            continue
+        by_index[idx] = item
+    return by_index
+
+
+def choose_scenes_path_for_analytics(workdir: Path) -> Path:
+    video_dir = workdir / "video"
+    p1 = video_dir / "scenes.json"
+    if p1.exists():
+        return p1
+    p2 = video_dir / "scenes-preview.json"
+    if p2.exists():
+        return p2
+    raise RuntimeError(f"Missing scenes file: expected {p1} or {p2}")
+
+
+def load_scenes_for_analytics(workdir: Path) -> Tuple[Path, List[Dict[str, Any]]]:
+    scenes_path = choose_scenes_path_for_analytics(workdir)
+    try:
+        obj = json.loads(read_text_best_effort(scenes_path))
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse scenes json: {scenes_path} ({e})") from e
+
+    scenes_raw = obj.get("split_scenes")
+    if not isinstance(scenes_raw, list) or not scenes_raw:
+        scenes_raw = obj.get("scenes")
+    if not isinstance(scenes_raw, list) or not scenes_raw:
+        raise RuntimeError(f"Invalid scenes data in {scenes_path}: missing non-empty scenes list")
+
+    out: List[Dict[str, Any]] = []
+    for i, s in enumerate(scenes_raw):
+        if not isinstance(s, dict):
+            raise RuntimeError(f"Invalid scene entry at index {i}: expected object")
+        if "start_frame" not in s or "end_frame" not in s:
+            raise RuntimeError(f"Invalid scene entry at index {i}: missing start_frame/end_frame")
+        out.append(s)
+    return scenes_path, out
+
+
+def parse_crf_from_video_params(tokens: List[str]) -> Optional[float]:
+    idx = -1
+    for i, tok in enumerate(tokens):
+        if tok == "--crf":
+            idx = i
+    if idx < 0 or idx + 1 >= len(tokens):
+        return None
+    try:
+        return float(str(tokens[idx + 1]).strip())
+    except Exception:
+        return None
+
+
+def scene_crf(scene: Optional[Dict[str, Any]]) -> Optional[float]:
+    if not isinstance(scene, dict):
+        return None
+    zo = scene.get("zone_overrides")
+    if not isinstance(zo, dict):
+        return None
+    vp = zo.get("video_params")
+    if not isinstance(vp, list):
+        return None
+    tokens = [str(x) for x in vp]
+    return parse_crf_from_video_params(tokens)
+
+
+def collect_ivf_files_by_index(encode_dir: Path) -> Dict[int, Path]:
+    out: Dict[int, Path] = {}
+    for p in encode_dir.glob("*.ivf"):
+        stem = p.stem.strip()
+        if not stem.isdigit():
+            continue
+        idx = int(stem)
+        prev = out.get(idx)
+        if prev is None:
+            out[idx] = p
+            continue
+        # Prefer shorter stem representation if duplicated (e.g. 1.ivf over 00001.ivf)
+        if len(p.stem) < len(prev.stem):
+            out[idx] = p
+    return out
+
+
+def parse_ssimu2_log_file(path: Path) -> Tuple[int, List[float]]:
+    scores: List[float] = []
+    with path.open("r", encoding="utf-8") as f:
+        first = f.readline()
+        m = re.search(r"skip:\s*([0-9]+)", first)
+        if not m:
+            raise RuntimeError(f"Skip value not detected in SSIMU2 log: {path}")
+        skip = int(m.group(1))
+        for line in f:
+            m2 = re.search(r"([0-9]+):\s*(-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?\d+)?)", line.strip())
+            if not m2:
+                continue
+            try:
+                scores.append(max(float(m2.group(2)), 0.0))
+            except Exception:
+                continue
+    if not scores:
+        raise RuntimeError(f"No SSIMU2 values parsed: {path}")
+    return skip, scores
+
+
+def slice_metric_samples(scores: List[float], st: int, en: int, skip: int) -> List[float]:
+    """
+    scores[k] corresponds to frame index k*skip.
+    Select subset where st <= k*skip < en.
+    """
+    if not scores:
+        return []
+    if skip <= 0:
+        skip = 1
+    if en <= st:
+        k = max(0, min((st + skip - 1) // skip, len(scores) - 1))
+        return [scores[k]]
+    k0 = (st + skip - 1) // skip
+    k1 = (en - 1) // skip
+    k0 = max(0, min(k0, len(scores) - 1))
+    k1 = max(0, min(k1, len(scores) - 1))
+    if k1 < k0:
+        return [scores[k0]]
+    out = scores[k0: k1 + 1]
+    return out if out else [scores[k0]]
+
+
+def slice_metric_samples_strict(scores: List[float], st: int, en: int, skip: int) -> List[float]:
+    if not scores:
+        return []
+    if skip <= 0:
+        skip = 1
+    if en <= st:
+        return []
+    k0 = (st + skip - 1) // skip
+    k1 = (en - 1) // skip
+    k0 = max(0, k0)
+    k1 = min(len(scores) - 1, k1)
+    if k1 < k0:
+        return []
+    return scores[k0: k1 + 1]
+
+
+def calc_avg_p5(values: List[float]) -> Tuple[float, float]:
+    if not values:
+        raise RuntimeError("Cannot compute stats for empty metric list")
+    filtered = [max(float(v), 0.0) for v in values]
+    sorted_vals = sorted(filtered)
+    avg = sum(filtered) / len(filtered)
+    p5 = sorted_vals[max(0, len(filtered) // 20)]
+    return float(avg), float(p5)
+
+
+def format_float(value: Optional[float], digits: int) -> str:
+    if value is None:
+        return "-"
+    if not math.isfinite(value):
+        return "-"
+    return f"{float(value):.{digits}f}"
+
+
+def frame_to_timecode(frame: int, fps: float) -> str:
+    if fps <= 0:
+        return "-"
+    total = max(0.0, float(frame) / float(fps))
+    hours = int(total // 3600)
+    minutes = int((total % 3600) // 60)
+    seconds = total % 60.0
+    return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+
+
+def _xml_local_name(tag: str) -> str:
+    if not tag:
+        return ""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[1]
+    return tag
+
+
+def parse_chapter_time_sec(raw: str) -> Optional[float]:
+    s = str(raw).strip().replace(",", ".")
+    m = re.match(r"^(\d+):(\d+):(\d+(?:\.\d+)?)$", s)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    ss = float(m.group(3))
+    return (hh * 3600.0) + (mm * 60.0) + ss
+
+
+def load_chapters_xml(chapters_path: Path) -> List[Dict[str, Any]]:
+    if not chapters_path.exists():
+        return []
+    try:
+        root = ET.parse(chapters_path).getroot()
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse chapters XML: {chapters_path} ({e})") from e
+
+    raw: List[Tuple[float, str]] = []
+    for atom in root.iter():
+        if _xml_local_name(atom.tag) != "ChapterAtom":
+            continue
+        start_txt: Optional[str] = None
+        title_txt: Optional[str] = None
+        for node in atom.iter():
+            name = _xml_local_name(node.tag)
+            if start_txt is None and name == "ChapterTimeStart" and node.text:
+                start_txt = node.text.strip()
+            elif title_txt is None and name == "ChapterString" and node.text:
+                title_txt = node.text.strip()
+            if start_txt is not None and title_txt is not None:
+                break
+        if not start_txt:
+            continue
+        sec = parse_chapter_time_sec(start_txt)
+        if sec is None:
+            continue
+        raw.append((sec, title_txt or ""))
+
+    if not raw:
+        return []
+    raw.sort(key=lambda x: x[0])
+
+    dedup: List[Tuple[float, str]] = []
+    for sec, title in raw:
+        if dedup and abs(sec - dedup[-1][0]) < 1e-6:
+            if not dedup[-1][1] and title:
+                dedup[-1] = (sec, title)
+            continue
+        dedup.append((sec, title))
+
+    out: List[Dict[str, Any]] = []
+    for i, (sec, title) in enumerate(dedup):
+        end_sec = dedup[i + 1][0] if i + 1 < len(dedup) else float("inf")
+        out.append(
+            {
+                "name": title or f"Chapter {i + 1}",
+                "start_sec": float(sec),
+                "end_sec": float(end_sec),
+            }
+        )
+    return out
+
+
+def build_chapter_frame_ranges(chapters: List[Dict[str, Any]], fps: float, total_frames: int) -> List[Dict[str, Any]]:
+    if fps <= 0:
+        return []
+    out: List[Dict[str, Any]] = []
+    for ch in chapters:
+        start_sec = float(ch.get("start_sec", 0.0))
+        end_sec = float(ch.get("end_sec", float("inf")))
+        st = max(0, int(math.floor(start_sec * fps + 1e-9)))
+        if math.isinf(end_sec):
+            en = max(total_frames, st + 1)
+        else:
+            en = int(math.ceil(end_sec * fps - 1e-9))
+            if en <= st:
+                en = st + 1
+            if total_frames > 0:
+                en = min(en, total_frames)
+        out.append(
+            {
+                "name": str(ch.get("name") or ""),
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "start_frame": st,
+                "end_frame": en,
+            }
+        )
+    return out
+
+
+def chapter_name_for_frame(frame: int, chapters: List[Dict[str, Any]]) -> str:
+    for ch in chapters:
+        st = int(ch.get("start_frame", 0))
+        en = int(ch.get("end_frame", st + 1))
+        if frame >= st and frame < en:
+            name = str(ch.get("name") or "").strip()
+            return name if name else "-"
+    return "-"
+
+
+def mean_or_none(values: List[Optional[float]]) -> Optional[float]:
+    nums = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    if not nums:
+        return None
+    return sum(nums) / len(nums)
+
+
+def render_aligned_pipe_table(rows: List[List[str]]) -> str:
+    if not rows:
+        return ""
+    col_count = max(len(r) for r in rows)
+    normalized: List[List[str]] = []
+    widths = [0] * col_count
+
+    for row in rows:
+        rr = [str(x) for x in row] + [""] * (col_count - len(row))
+        normalized.append(rr)
+        for i, cell in enumerate(rr):
+            if len(cell) > widths[i]:
+                widths[i] = len(cell)
+
+    lines: List[str] = []
+    for rr in normalized:
+        lines.append(" | ".join(rr[i].ljust(widths[i]) for i in range(col_count)))
+    return "\n".join(lines) + "\n"
+
+
+def build_step_series(records: List[Dict[str, Any]], key: str) -> Tuple[List[float], List[float]]:
+    if not records:
+        return [], []
+    x: List[float] = []
+    y: List[float] = []
+    for rec in records:
+        x.append(float(rec["start_frame"]))
+        val = rec.get(key)
+        if isinstance(val, (int, float)) and math.isfinite(float(val)):
+            y.append(float(val))
+        else:
+            y.append(float("nan"))
+    x.append(float(records[-1]["end_frame"]))
+    y.append(y[-1])
+    return x, y
+
+
+def has_any_finite(values: List[float]) -> bool:
+    for v in values:
+        if math.isfinite(v):
+            return True
+    return False
+
+
+def draw_chapter_boundaries(ax: Any, chapters: List[Dict[str, Any]]) -> None:
+    for ch in chapters[1:]:
+        x = int(ch.get("start_frame", 0))
+        ax.axvline(x=x, color="0.55", linestyle="--", linewidth=0.8, alpha=0.6)
+
+
+def write_info_plot(
+    *,
+    out_path: Path,
+    title: str,
+    pass_name: str,
+    records: List[Dict[str, Any]],
+    chapters: List[Dict[str, Any]],
+    ssimu_skip: Optional[int],
+    ssimu_scores: Optional[List[float]],
+) -> None:
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"matplotlib is required to generate {out_path.name}: {e}") from e
+
+    fastpass = pass_name == "fastpass"
+    if fastpass:
+        fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
+        ax_crf, ax_kbps, ax_ssim = axes
+    else:
+        fig, axes = plt.subplots(2, 1, figsize=(16, 7), sharex=True)
+        ax_crf, ax_kbps = axes
+        ax_ssim = None
+
+    x_crf, y_crf = build_step_series(records, "crf")
+    crf_plotted = False
+    if has_any_finite(y_crf):
+        ax_crf.step(x_crf, y_crf, where="post", color="tab:red", linewidth=1.5, label=("new_crf" if fastpass else "crf"))
+        crf_plotted = True
+    ax_crf.set_ylabel("CRF")
+    ax_crf.grid(True, alpha=0.25)
+    if crf_plotted:
+        ax_crf.legend(loc="best")
+
+    x_kbps, y_kbps = build_step_series(records, "kbps")
+    kbps_plotted = False
+    if has_any_finite(y_kbps):
+        ax_kbps.step(x_kbps, y_kbps, where="post", color="tab:blue", linewidth=1.5, label="kbps")
+        kbps_plotted = True
+    ax_kbps.set_ylabel("kbps")
+    ax_kbps.grid(True, alpha=0.25)
+    if kbps_plotted:
+        ax_kbps.legend(loc="best")
+
+    if fastpass and ax_ssim is not None:
+        x_scene_ssim, y_scene_ssim = build_step_series(records, "ssimu_scene")
+        ssim_plotted = False
+        if has_any_finite(y_scene_ssim):
+            ax_ssim.step(
+                x_scene_ssim,
+                y_scene_ssim,
+                where="post",
+                color="tab:orange",
+                linewidth=1.4,
+                label="ssimu_scene",
+            )
+            ssim_plotted = True
+        if ssimu_skip and ssimu_skip > 0 and ssimu_scores:
+            x_frame = [i * int(ssimu_skip) for i in range(len(ssimu_scores))]
+            ax_ssim.plot(x_frame, ssimu_scores, color="tab:green", linewidth=0.8, alpha=0.8, label="ssimu")
+            ssim_plotted = True
+        ax_ssim.set_ylabel("ssimu2")
+        ax_ssim.grid(True, alpha=0.25)
+        if ssim_plotted:
+            ax_ssim.legend(loc="best")
+
+    for ax in axes:
+        draw_chapter_boundaries(ax, chapters)
+
+    axes[-1].set_xlabel("Frame")
+    fig.suptitle(title)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def run_pass_analytics(group: SourceGroup, pass_name: str) -> None:
+    mode = pass_name.strip().lower()
+    if mode not in ("fastpass", "mainpass"):
+        raise RuntimeError(f"Unsupported pass: {pass_name}")
+
+    video_dir = group.workdir / "video"
+    pass_dir = video_dir / mode
+    encode_dir = pass_dir / "encode"
+    if not pass_dir.exists():
+        raise RuntimeError(f"Pass directory not found: {pass_dir}")
+    if not encode_dir.exists():
+        raise RuntimeError(f"Encode directory not found: {encode_dir}")
+
+    scenes_path, scenes = load_scenes_for_analytics(group.workdir)
+    chunks_by_index = load_pass_chunks(pass_dir)
+    ivf_by_index = collect_ivf_files_by_index(encode_dir)
+    if not ivf_by_index:
+        raise RuntimeError(f"No numeric IVF files found in {encode_dir}")
+
+    fps_default: Optional[float] = None
+    for idx in sorted(chunks_by_index.keys()):
+        fps_default = parse_frame_rate_value(chunks_by_index[idx].get("frame_rate"))
+        if fps_default:
+            break
+    if fps_default is None:
+        fps_default = get_source_fps(group.source)
+    if fps_default is None:
+        raise RuntimeError("Unable to determine FPS from chunks.json or ffprobe.")
+
+    records: List[Dict[str, Any]] = []
+    for idx in sorted(ivf_by_index.keys()):
+        scene = scenes[idx] if 0 <= idx < len(scenes) else None
+        ch = chunks_by_index.get(idx)
+
+        st: Optional[int] = None
+        en: Optional[int] = None
+        if isinstance(ch, dict):
+            try:
+                st = int(ch.get("start_frame"))
+                en = int(ch.get("end_frame"))
+            except Exception:
+                st, en = None, None
+        if (st is None or en is None) and isinstance(scene, dict):
+            try:
+                st = int(scene.get("start_frame"))
+                en = int(scene.get("end_frame"))
+            except Exception:
+                st, en = None, None
+        if st is None or en is None or en <= st:
+            print(f"[skip] cannot determine frame range for {mode} index={idx}")
+            continue
+
+        fps_scene = parse_frame_rate_value(ch.get("frame_rate") if isinstance(ch, dict) else None) or fps_default
+        if fps_scene <= 0:
+            print(f"[skip] invalid fps for {mode} index={idx}")
+            continue
+
+        duration = (en - st) / fps_scene
+        if duration <= 0:
+            print(f"[skip] invalid duration for {mode} index={idx}")
+            continue
+
+        ivf_path = ivf_by_index[idx]
+        try:
+            size_bytes = ivf_path.stat().st_size
+        except Exception:
+            print(f"[skip] failed to stat IVF: {ivf_path}")
+            continue
+        kbps = (size_bytes * 8.0) / duration / 1000.0
+
+        records.append(
+            {
+                "index": idx,
+                "start_frame": st,
+                "end_frame": en,
+                "starttime": frame_to_timecode(st, fps_scene),
+                "crf": scene_crf(scene),
+                "kbps": kbps,
+                "duration": duration,
+                "chapter": "-",
+                "ssimu_scene": None,
+                "ssimu_p5": None,
+            }
+        )
+
+    if not records:
+        raise RuntimeError(f"No valid IVF scene records collected for {mode}")
+
+    ssimu_skip: Optional[int] = None
+    ssimu_scores: Optional[List[float]] = None
+    if mode == "fastpass":
+        ssimu_log = pass_dir / f"{group.base}_ssimu2.log"
+        if not ssimu_log.exists():
+            raise RuntimeError(f"Required SSIMU2 log not found: {ssimu_log}")
+        ssimu_skip, ssimu_scores = parse_ssimu2_log_file(ssimu_log)
+        for rec in records:
+            st = int(rec["start_frame"])
+            en = int(rec["end_frame"])
+            scene_scores = slice_metric_samples(ssimu_scores, st, en, ssimu_skip)
+            if not scene_scores:
+                continue
+            avg, p5 = calc_avg_p5(scene_scores)
+            rec["ssimu_scene"] = avg
+            rec["ssimu_p5"] = p5
+
+    total_frames = max(int(r["end_frame"]) for r in records)
+    chapters_xml = group.workdir / "chapters" / "chapters.xml"
+    chapters: List[Dict[str, Any]] = []
+    if chapters_xml.exists():
+        chapters_raw = load_chapters_xml(chapters_xml)
+        chapters = build_chapter_frame_ranges(chapters_raw, fps_default, total_frames)
+        if chapters:
+            for rec in records:
+                rec["chapter"] = chapter_name_for_frame(int(rec["start_frame"]), chapters)
+
+    analytics_dir = group.workdir / f"{mode}-analytics"
+    analytics_dir.mkdir(parents=True, exist_ok=True)
+
+    ivf_rows: List[List[str]] = []
+    for rec in records:
+        if mode == "fastpass":
+            ivf_rows.append(
+                [
+                    str(rec["index"]),
+                    str(rec["starttime"]),
+                    format_float(rec.get("crf"), 2),
+                    format_float(rec.get("kbps"), 2),
+                    format_float(rec.get("ssimu_scene"), 4),
+                    format_float(rec.get("ssimu_p5"), 4),
+                    format_float(rec.get("duration"), 3),
+                    str(rec.get("chapter") or "-"),
+                ]
+            )
+        else:
+            ivf_rows.append(
+                [
+                    str(rec["index"]),
+                    str(rec["starttime"]),
+                    format_float(rec.get("crf"), 2),
+                    format_float(rec.get("kbps"), 2),
+                    format_float(rec.get("duration"), 3),
+                    str(rec.get("chapter") or "-"),
+                ]
+            )
+
+    ivf_info_path = analytics_dir / "ivf-info.csv"
+    ivf_info_path.write_text(render_aligned_pipe_table(ivf_rows), encoding="utf-8", newline="\n")
+    print(f"[write] {ivf_info_path}")
+
+    chapters_info_path = analytics_dir / "chapters-info.csv"
+    if chapters:
+        chapter_rows: List[List[str]] = []
+        for ch in chapters:
+            st = int(ch["start_frame"])
+            en = int(ch["end_frame"])
+            in_chapter = [r for r in records if int(r["start_frame"]) >= st and int(r["start_frame"]) < en]
+            if not in_chapter:
+                continue
+            first_idx = int(in_chapter[0]["index"])
+            last_idx = int(in_chapter[-1]["index"])
+            avg_crf = mean_or_none([r.get("crf") for r in in_chapter])
+            avg_kbps = mean_or_none([r.get("kbps") for r in in_chapter])
+
+            if mode == "fastpass":
+                ch_scores = slice_metric_samples_strict(ssimu_scores or [], st, en, ssimu_skip or 1)
+                ch_avg: Optional[float] = None
+                ch_p5: Optional[float] = None
+                if ch_scores:
+                    ch_avg, ch_p5 = calc_avg_p5(ch_scores)
+                chapter_rows.append(
+                    [
+                        str(ch["name"]),
+                        f"{first_idx}-{last_idx}",
+                        format_float(avg_crf, 2),
+                        format_float(avg_kbps, 2),
+                        format_float(ch_avg, 4),
+                        format_float(ch_p5, 4),
+                    ]
+                )
+            else:
+                chapter_rows.append(
+                    [
+                        str(ch["name"]),
+                        f"{first_idx}-{last_idx}",
+                        format_float(avg_crf, 2),
+                        format_float(avg_kbps, 2),
+                    ]
+                )
+
+        if chapter_rows:
+            chapters_info_path.write_text(render_aligned_pipe_table(chapter_rows), encoding="utf-8", newline="\n")
+            print(f"[write] {chapters_info_path}")
+    elif chapters_info_path.exists():
+        remove_path(chapters_info_path)
+
+    info_png_path = analytics_dir / "info.png"
+    plot_title = f"{group.base} | {mode} | scenes={len(records)} | source={scenes_path.name}"
+    write_info_plot(
+        out_path=info_png_path,
+        title=plot_title,
+        pass_name=mode,
+        records=records,
+        chapters=chapters,
+        ssimu_skip=ssimu_skip,
+        ssimu_scores=ssimu_scores,
+    )
+    print(f"[write] {info_png_path}")
+
+
 def print_menu() -> None:
     print()
     print("Menu:")
@@ -545,6 +1248,7 @@ def print_menu() -> None:
     print("  4) Full Clear")
     print("  5) Config Dump")
     print("  6) Verify")
+    print("  7) Pass Analytics")
     print("  Q) Quit")
 
 
@@ -556,6 +1260,15 @@ def print_clear_stage_menu() -> None:
     print("  3) Zoning")
     print("  4) Calculation")
     print("  5) Auto Boost Fastpass")
+    print("  B) Back")
+
+
+def print_pass_analytics_menu() -> None:
+    print()
+    print("Pass Analytics:")
+    print("  1) Fastpass")
+    print("  2) Mainpass")
+    print("  3) Both")
     print("  B) Back")
 
 
@@ -650,6 +1363,30 @@ def main(argv: List[str]) -> int:
                 print()
                 print(f"[Verify] {g.base}")
                 verify_config(g, check_filters=check_filters, check_params=check_params)
+        elif choice == "7":
+            while True:
+                print_pass_analytics_menu()
+                c3 = input("Select: ").strip().lower()
+                if c3 in ("b", "back", ""):
+                    break
+                if c3 == "1":
+                    selected = ["fastpass"]
+                elif c3 == "2":
+                    selected = ["mainpass"]
+                elif c3 == "3":
+                    selected = ["fastpass", "mainpass"]
+                else:
+                    print("Unknown option.")
+                    continue
+
+                for g in groups:
+                    for mode in selected:
+                        print()
+                        print(f"[Pass Analytics: {mode}] {g.base}")
+                        try:
+                            run_pass_analytics(g, mode)
+                        except Exception as e:
+                            print(f"[err] pass analytics failed for {g.base} ({mode}): {e}")
         else:
             print("Unknown option.")
 
