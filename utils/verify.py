@@ -445,7 +445,7 @@ def verify_demux_outputs(workdir: Path, source: Path, ffprobe: Optional[str]) ->
     # attachments
     atts = man.get("attachments") or []
     if isinstance(atts, list):
-        no_check_flag = not (workdir / "attachments" / "NO_CHECK").exists()
+        no_check_flag = (workdir / "attachments" / "NO_CHECK").exists()
 
         for a in atts:
             if not isinstance(a, dict):

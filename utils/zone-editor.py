@@ -26,6 +26,7 @@ import re
 import shlex
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
@@ -152,7 +153,7 @@ META_KEY = "pb_meta"
 def _run_ffprobe_json(args: List[str]) -> Dict[str, Any]:
     cmd = ["ffprobe", "-v", "error", "-print_format", "json"] + args
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     except FileNotFoundError:
         raise RuntimeError("ffprobe not found in PATH. Install FFmpeg and ensure ffprobe is available.")
 
@@ -190,6 +191,35 @@ def _parse_fraction(s: str) -> Fraction:
         return Fraction(Decimal(str(float(s))))
 
 
+def _normalize_chapter_title(value: Any) -> str:
+    text = str(value or "")
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("\ufeff", "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    text = re.sub(r"\s+", " ", text, flags=re.UNICODE)
+    return text.strip()
+
+
+def _extract_chapter_title(chapter: Dict[str, Any]) -> str:
+    tags = chapter.get("tags") or {}
+    if not isinstance(tags, dict):
+        tags = {}
+
+    preferred_keys = ("title", "TITLE", "ChapterString", "CHAPTERSTRING")
+    for key in preferred_keys:
+        title = _normalize_chapter_title(tags.get(key))
+        if title:
+            return title
+
+    for key, value in tags.items():
+        key_norm = str(key or "").strip().casefold()
+        if key_norm == "title" or key_norm.startswith("title-") or key_norm == "chapterstring" or key_norm.startswith("chapterstring-"):
+            title = _normalize_chapter_title(value)
+            if title:
+                return title
+
+    return ""
+
+
 def read_video_info(source_path: str) -> VideoInfo:
     data = _run_ffprobe_json([
         "-show_streams",
@@ -222,8 +252,7 @@ def read_video_info(source_path: str) -> VideoInfo:
     raw_ch = data.get("chapters") or []
     chapters: List[Chapter] = []
     for ch in raw_ch:
-        tags = ch.get("tags") or {}
-        title = str(tags.get("title") or "").strip()
+        title = _extract_chapter_title(ch)
         start_time = float(ch.get("start_time") or 0.0)
         end_time = ch.get("end_time")
         end_time_f = float(end_time) if end_time is not None else 0.0
@@ -454,17 +483,17 @@ def expand_preset_tokens(
 
 
 def find_chapter_ranges_by_title(chapters: List[Chapter], title_query: str) -> List[Tuple[float, float, str]]:
-    q = title_query.strip().casefold()
+    q = _normalize_chapter_title(title_query).casefold()
     if not q:
         return []
 
     # 1) exact match (case-insensitive)
-    exact = [c for c in chapters if c.title.strip().casefold() == q]
+    exact = [c for c in chapters if _normalize_chapter_title(c.title).casefold() == q]
     if exact:
         return [(c.start_sec, c.end_sec, c.title) for c in exact]
 
     # 2) substring match
-    sub = [c for c in chapters if q in c.title.strip().casefold()]
+    sub = [c for c in chapters if q in _normalize_chapter_title(c.title).casefold()]
     return [(c.start_sec, c.end_sec, c.title) for c in sub]
 
 

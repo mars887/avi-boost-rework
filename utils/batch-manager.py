@@ -18,7 +18,7 @@ from xml.etree import ElementTree as ET
 
 VIDEO_EXTS = (".mkv", ".mp4")
 VPY_KEYS = ("MAIN_VPY", "FAST_VPY", "PROXY_VPY")
-ADDITIONAL_WORK_EXTS = ("mkv.ffindex", "mkv.lvi")
+ADDITIONAL_WORK_EXTS = ("ffindex", "lvi")
 KNOWN_WORKDIR_TOP_LEVEL = {
     "tracks.json",
     "zone_edit_command.txt",
@@ -35,6 +35,7 @@ GENERATED_BATCH_FILES = (
     "batch-fastpass.bat",
     "Batch Manager.bat",
 )
+CALL_RUN_RE = re.compile(r'^\s*call\s+:run\s+"([^"]+)"\s*$', re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,15 @@ class SourceGroup:
     per_file_bat: Path
     result_mkv: Path
     result_mp4: Path
+
+
+@dataclass(frozen=True)
+class EditMatch:
+    index: int
+    group: SourceGroup
+    file_path: Path
+    line_no: int
+    line_text: str
 
 
 def is_result_name(name: str) -> bool:
@@ -476,6 +486,7 @@ def confirm_full_clear_workdirs(groups: List[SourceGroup]) -> bool:
 def remove_additional_work_files(group: SourceGroup) -> None:
     for ext in ADDITIONAL_WORK_EXTS:
         remove_path(group.source_dir / f"{group.base}.{ext}")
+        remove_path(group.source_dir / f"{group.source.name}.{ext}")
 
 
 def dump_configs_to_meta(groups: List[SourceGroup]) -> Dict[Path, List[SourceGroup]]:
@@ -512,6 +523,531 @@ def full_clear(groups: List[SourceGroup]) -> None:
 
 def config_dump(groups: List[SourceGroup]) -> None:
     dump_configs_to_meta(groups)
+
+
+def to_windows_eol(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
+
+
+def write_text_with_fallback(path: Path, text: str, *, preferred_encoding: str = "cp1251") -> None:
+    try:
+        path.write_text(text, encoding=preferred_encoding)
+    except UnicodeEncodeError:
+        path.write_text(text, encoding="utf-8")
+
+
+def enter_numbers(raw: str, min_value: int, max_value: int) -> List[int]:
+    selected: List[int] = []
+    for token in raw.split():
+        try:
+            if token == "*":
+                selected.extend(range(min_value, max_value + 1))
+                continue
+            if ".." in token:
+                parts = token.split("..", 1)
+                a = int(parts[0])
+                b = int(parts[1])
+                lo = min(a, b)
+                hi = max(a, b)
+                selected.extend(range(lo, hi + 1))
+                continue
+            if "-." in token:
+                parts = token.split("-.", 1)
+                a = int(parts[0])
+                b = int(parts[1])
+                lo = min(a, b)
+                hi = max(a, b)
+                selected = [x for x in selected if x < lo or x > hi]
+                continue
+            if token.startswith("/") and token[1:].isdigit():
+                value = int(token[1:])
+                selected = [x for x in selected if x != value]
+                continue
+            if token.isdigit():
+                selected.append(int(token))
+                continue
+            print(f"[warn] invalid selection token skipped: {token}")
+        except Exception as e:
+            print(f"[warn] failed to parse selection token {token!r}: {e}")
+
+    out: List[int] = []
+    seen: set[int] = set()
+    for value in selected:
+        if value < min_value or value > max_value:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def prompt_edit_target() -> Optional[str]:
+    print()
+    print("Edit:")
+    print("  1) per-file.bat")
+    print("  2) tracks.json")
+    print("  3) zone_edit_command.txt")
+    print("  B) Back")
+    while True:
+        choice = input("Select file to edit: ").strip().lower()
+        if choice in ("b", "back", ""):
+            return None
+        if choice == "1":
+            return "bat"
+        if choice == "2":
+            return "tracks"
+        if choice == "3":
+            return "zone"
+        print("Unknown option.")
+
+
+def edit_target_path(group: SourceGroup, target: str) -> Path:
+    if target == "bat":
+        return group.per_file_bat
+    if target == "tracks":
+        return group.workdir / "tracks.json"
+    if target == "zone":
+        return group.workdir / "zone_edit_command.txt"
+    raise ValueError(f"Unsupported edit target: {target}")
+
+
+def edit_target_label(target: str) -> str:
+    if target == "bat":
+        return "per-file.bat"
+    if target == "tracks":
+        return "tracks.json"
+    if target == "zone":
+        return "zone_edit_command.txt"
+    return target
+
+
+def find_edit_matches(groups: List[SourceGroup], target: str, needle: str) -> List[EditMatch]:
+    matches: List[EditMatch] = []
+    idx = 1
+    for group in groups:
+        file_path = edit_target_path(group, target)
+        if not file_path.exists():
+            continue
+        try:
+            text = read_text_best_effort(file_path)
+        except Exception as e:
+            print(f"[err] failed to read {file_path}: {e}")
+            continue
+        for line_no, line in enumerate(text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), start=1):
+            if needle not in line:
+                continue
+            matches.append(
+                EditMatch(
+                    index=idx,
+                    group=group,
+                    file_path=file_path,
+                    line_no=line_no,
+                    line_text=line,
+                )
+            )
+            idx += 1
+    return matches
+
+
+def print_edit_matches(matches: List[EditMatch]) -> None:
+    print()
+    print("Matches:")
+    for match in matches:
+        print(f"  {match.index}) {match.group.base} | {match.file_path.name}:{match.line_no}")
+        print(f"     {match.line_text}")
+
+
+def replace_selected_lines(matches: List[EditMatch], replacement: str) -> int:
+    by_file: Dict[Path, List[EditMatch]] = {}
+    for match in matches:
+        by_file.setdefault(match.file_path, []).append(match)
+
+    changed = 0
+    for file_path, file_matches in by_file.items():
+        try:
+            raw = read_text_best_effort(file_path)
+        except Exception as e:
+            print(f"[err] failed to read {file_path}: {e}")
+            continue
+
+        normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+        trailing_newline = normalized.endswith("\n")
+        lines = normalized.split("\n")
+        if trailing_newline and lines and lines[-1] == "":
+            lines = lines[:-1]
+
+        changed_here = 0
+        for match in file_matches:
+            index = match.line_no - 1
+            if index < 0 or index >= len(lines):
+                print(f"[warn] line out of range, skipped: {file_path}:{match.line_no}")
+                continue
+            lines[index] = replacement
+            changed_here += 1
+
+        if changed_here == 0:
+            continue
+
+        out = "\n".join(lines)
+        if trailing_newline:
+            out += "\n"
+
+        preferred_encoding = "cp1251" if file_path.suffix.lower() == ".bat" else "utf-8"
+        try:
+            write_text_with_fallback(file_path, to_windows_eol(out) if file_path.suffix.lower() == ".bat" else out, preferred_encoding=preferred_encoding)
+            print(f"[write] {file_path} ({changed_here} line(s))")
+            changed += changed_here
+        except Exception as e:
+            print(f"[err] failed to write {file_path}: {e}")
+    return changed
+
+
+def edit_config_lines(groups: List[SourceGroup]) -> None:
+    target = prompt_edit_target()
+    if target is None:
+        return
+
+    needle = input(f"Find string in {edit_target_label(target)}: ")
+    if needle == "":
+        print("[skip] empty search string.")
+        return
+
+    matches = find_edit_matches(groups, target, needle)
+    if not matches:
+        print(f"[skip] no matches found in {edit_target_label(target)}.")
+        return
+
+    print_edit_matches(matches)
+    selection_raw = input("Select matches to edit (e.g. 1 2 5..7 * /3): ").strip()
+    selected_ids = enter_numbers(selection_raw, 1, len(matches))
+    if not selected_ids:
+        print("[skip] nothing selected.")
+        return
+
+    selected = [m for m in matches if m.index in set(selected_ids)]
+    replacement = input("Replacement line: ")
+    changed = replace_selected_lines(selected, replacement)
+    print(f"[done] Edit completed, replaced {changed} line(s).")
+
+
+def is_template_source(group: SourceGroup) -> bool:
+    return group.per_file_bat.exists() and (group.workdir / "tracks.json").exists()
+
+
+def is_new_source_without_config(group: SourceGroup) -> bool:
+    return (not group.per_file_bat.exists()) and (not group.workdir.exists())
+
+
+def is_partial_source_state(group: SourceGroup) -> bool:
+    if is_template_source(group):
+        return False
+    if is_new_source_without_config(group):
+        return False
+    return group.per_file_bat.exists() or group.workdir.exists()
+
+
+def choose_template_group(candidates: List[SourceGroup], source_dir: Path) -> Optional[SourceGroup]:
+    print()
+    print(f"[Expand] Sources with existing config in: {source_dir}")
+    for idx, g in enumerate(candidates, start=1):
+        print(f"  {idx}) {g.base} ({g.per_file_bat.name})")
+
+    while True:
+        raw = input("Select template source [number, Enter=skip]: ").strip().lower()
+        if raw in ("", "q", "quit", "b", "back", "s", "skip"):
+            return None
+        if not raw.isdigit():
+            print("Please enter a valid number.")
+            continue
+        idx = int(raw)
+        if 1 <= idx <= len(candidates):
+            return candidates[idx - 1]
+        print("Index out of range.")
+
+
+def rewrite_template_bat_for_target(template_text: str, target: SourceGroup) -> str:
+    normalized = template_text.replace("\r\n", "\n").replace("\r", "\n")
+    trailing_newline = normalized.endswith("\n")
+    lines = normalized.split("\n")
+    if trailing_newline and lines and lines[-1] == "":
+        lines = lines[:-1]
+
+    src_value = str(target.source)
+    workdir_value = str(target.workdir)
+    out: List[str] = []
+    for line in lines:
+        if re.match(r'^\s*set\s+"?SRC=', line, flags=re.IGNORECASE):
+            out.append(f'set "SRC={src_value}"')
+            continue
+        if re.match(r'^\s*set\s+"?WORKDIR=', line, flags=re.IGNORECASE):
+            out.append(f'set "WORKDIR={workdir_value}"')
+            continue
+        if re.match(r'^\s*REM\s+Source:\s*', line, flags=re.IGNORECASE):
+            out.append(f"REM  Source:  {src_value}")
+            continue
+        if re.match(r'^\s*REM\s+Workdir:\s*', line, flags=re.IGNORECASE):
+            out.append(f"REM  Workdir: {workdir_value}")
+            continue
+        out.append(line)
+
+    result = "\r\n".join(out)
+    if trailing_newline:
+        result += "\r\n"
+    return result
+
+
+def copy_tracks_config(template: SourceGroup, target: SourceGroup) -> bool:
+    src_tracks = template.workdir / "tracks.json"
+    dst_tracks = target.workdir / "tracks.json"
+    if not src_tracks.exists():
+        print(f"[err] missing template tracks: {src_tracks}")
+        return False
+    try:
+        obj = json.loads(read_text_best_effort(src_tracks))
+        if isinstance(obj, dict):
+            obj["source"] = str(target.source)
+            obj["workdir"] = str(target.workdir)
+            dst_tracks.write_text(
+                json.dumps(obj, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+        else:
+            shutil.copy2(src_tracks, dst_tracks)
+        print(f"[write] {dst_tracks}")
+        return True
+    except Exception as e:
+        print(f"[err] failed to write tracks config {dst_tracks}: {e}")
+        return False
+
+
+def copy_zone_command(template: SourceGroup, target: SourceGroup) -> bool:
+    src_zone = template.workdir / "zone_edit_command.txt"
+    dst_zone = target.workdir / "zone_edit_command.txt"
+    dst_zone.write_text("", encoding="utf-8", newline="\n")
+    try:
+        if src_zone.exists():
+            shutil.copy2(src_zone, dst_zone)
+        else:
+            dst_zone.write_text("", encoding="utf-8", newline="\n")
+        print(f"[write] {dst_zone}")
+        return True
+    except Exception as e:
+        print(f"[err] failed to write zoning command {dst_zone}: {e}")
+        return False
+
+
+def clone_source_config(template: SourceGroup, target: SourceGroup) -> bool:
+    if target.per_file_bat.exists() or target.workdir.exists():
+        print(f"[skip] target already has config: {target.base}")
+        return False
+    if not template.per_file_bat.exists():
+        print(f"[err] missing template bat: {template.per_file_bat}")
+        return False
+
+    try:
+        target.workdir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[err] failed to create workdir {target.workdir}: {e}")
+        return False
+
+    try:
+        template_bat_text = read_text_best_effort(template.per_file_bat)
+        out_bat_text = rewrite_template_bat_for_target(template_bat_text, target)
+        write_text_with_fallback(target.per_file_bat, out_bat_text, preferred_encoding="cp1251")
+        print(f"[write] {target.per_file_bat}")
+    except Exception as e:
+        print(f"[err] failed to write per-file bat {target.per_file_bat}: {e}")
+        return False
+
+    ok_tracks = copy_tracks_config(template, target)
+    ok_zone = copy_zone_command(template, target) # None = empty
+    return ok_tracks and ok_zone
+
+
+def parse_runner_script_bases(text: str) -> List[str]:
+    bases: List[str] = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        m = CALL_RUN_RE.match(line)
+        if not m:
+            continue
+        base = m.group(1).strip()
+        if base:
+            bases.append(base)
+    return bases
+
+
+def build_runner_script_text(bases: List[str], *, fastpass: bool) -> str:
+    lines: List[str] = [
+        "@echo off",
+        "setlocal EnableExtensions DisableDelayedExpansion",
+        "chcp 1251 >nul",
+        "pushd \"%~dp0\"",
+        "",
+    ]
+    for base in bases:
+        lines.append(f'call :run "{base}"')
+        lines.append("if errorlevel 1 goto :fail")
+    lines.extend(["", "echo OK", "exit /b 0", "", ":run", "set \"BASENAME=%~1\""])
+    if fastpass:
+        lines.extend(
+            [
+                "set \"BAT=%~dp0%BASENAME%.bat\"",
+                "echo.",
+                "echo ==========================================================",
+                "echo ====== FASTPASS %BASENAME% ======",
+                "echo ==========================================================",
+                "if not exist \"%BAT%\" (",
+                "  echo [skip] missing bat: \"%BAT%\"",
+                "  exit /b 0",
+                ")",
+                "call \"%BAT%\" --fastpass-only",
+                "exit /b %errorlevel%",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "set \"OUT=%~dp0%BASENAME%-av1.mkv\"",
+                "set \"BAT=%~dp0%BASENAME%.bat\"",
+                "echo.",
+                "echo ==========================================================",
+                "echo ====== %BASENAME% ======",
+                "echo ==========================================================",
+                "if exist \"%OUT%\" (",
+                "  echo [skip] output exists: \"%OUT%\"",
+                "  exit /b 0",
+                ")",
+                "if not exist \"%BAT%\" (",
+                "  echo [skip] missing bat: \"%BAT%\"",
+                "  exit /b 0",
+                ")",
+                "call \"%BAT%\"",
+                "exit /b %errorlevel%",
+            ]
+        )
+    lines.extend(["", ":fail", "echo FAILED (code=%errorlevel%)", "exit /b 1", ""])
+    return to_windows_eol("\n".join(lines))
+
+
+def find_runner_insert_index(lines: List[str]) -> int:
+    for idx, line in enumerate(lines):
+        if line.strip().lower().startswith("echo ok"):
+            return idx
+    for idx, line in enumerate(lines):
+        if line.strip().lower() == ":run":
+            return idx
+    return len(lines)
+
+
+def ensure_runner_script_entries(script_path: Path, bases_to_add: List[str], *, fastpass: bool) -> None:
+    if not bases_to_add:
+        return
+    if not script_path.exists():
+        out_text = build_runner_script_text(bases_to_add, fastpass=fastpass)
+        write_text_with_fallback(script_path, out_text, preferred_encoding="cp1251")
+        print(f"[write] {script_path}")
+        return
+
+    raw = read_text_best_effort(script_path)
+    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    trailing_newline = normalized.endswith("\n")
+    lines = normalized.split("\n")
+    if trailing_newline and lines and lines[-1] == "":
+        lines = lines[:-1]
+
+    existing_lower = {b.lower() for b in parse_runner_script_bases(raw)}
+    add_list = [b for b in bases_to_add if b.lower() not in existing_lower]
+    if not add_list:
+        return
+
+    insert_at = find_runner_insert_index(lines)
+    to_insert: List[str] = []
+    for base in add_list:
+        to_insert.append(f'call :run "{base}"')
+        to_insert.append("if errorlevel 1 goto :fail")
+    lines[insert_at:insert_at] = to_insert
+
+    out = "\r\n".join(lines)
+    if trailing_newline:
+        out += "\r\n"
+    write_text_with_fallback(script_path, out, preferred_encoding="cp1251")
+    print(f"[write] {script_path}")
+
+
+def update_batch_runner_scripts(source_dir: Path, bases: List[str]) -> None:
+    ordered: List[str] = []
+    seen: set[str] = set()
+    for base in bases:
+        key = base.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(base)
+    if not ordered:
+        return
+
+    ensure_runner_script_entries(source_dir / "start-batch.bat", ordered, fastpass=False)
+    ensure_runner_script_entries(source_dir / "batch-fastpass.bat", ordered, fastpass=True)
+
+
+def expand_configs_for_new_sources(groups: List[SourceGroup]) -> None:
+    by_dir: Dict[Path, List[SourceGroup]] = {}
+    for g in groups:
+        by_dir.setdefault(g.source_dir, []).append(g)
+
+    had_new = False
+    total_created = 0
+    for source_dir, items in sorted(by_dir.items(), key=lambda x: str(x[0]).lower()):
+        items_sorted = sorted(items, key=lambda g: g.base.lower())
+        new_sources = [g for g in items_sorted if is_new_source_without_config(g)]
+        if not new_sources:
+            continue
+        had_new = True
+
+        print()
+        print(f"[Expand] New sources in: {source_dir}")
+        for g in new_sources:
+            print(f"  - {g.source.name}")
+
+        partial = [g for g in items_sorted if is_partial_source_state(g)]
+        if partial:
+            print("[warn] Found partial config state:")
+            for g in partial:
+                bat_state = "yes" if g.per_file_bat.exists() else "no"
+                work_state = "yes" if g.workdir.exists() else "no"
+                tracks_state = "yes" if (g.workdir / "tracks.json").exists() else "no"
+                print(f"  - {g.base}: bat={bat_state}, workdir={work_state}, tracks={tracks_state}")
+
+        templates = [g for g in items_sorted if is_template_source(g)]
+        if not templates:
+            print("[warn] No template sources with per-file bat + tracks.json in this folder.")
+            continue
+
+        template = choose_template_group(templates, source_dir)
+        if template is None:
+            print("[skip] Expand skipped for this folder.")
+            continue
+
+        created_bases: List[str] = []
+        for target in new_sources:
+            print()
+            print(f"[Expand] {target.base} <= {template.base}")
+            if clone_source_config(template, target):
+                created_bases.append(target.base)
+
+        if not created_bases:
+            continue
+
+        total_created += len(created_bases)
+        configured_bases = [g.base for g in items_sorted if g.per_file_bat.exists()]
+        update_batch_runner_scripts(source_dir, configured_bases)
+
+    if not had_new:
+        print("[skip] No new sources without per-file bat and workdir.")
+        return
+    print(f"[done] Expand completed, created {total_created} config(s).")
 
 
 def verify_config(group: SourceGroup, *, check_filters: bool, check_params: bool) -> None:
@@ -1249,6 +1785,8 @@ def print_menu() -> None:
     print("  5) Config Dump")
     print("  6) Verify")
     print("  7) Pass Analytics")
+    print("  8) Expand")
+    print("  9) Edit")
     print("  Q) Quit")
 
 
@@ -1387,6 +1925,10 @@ def main(argv: List[str]) -> int:
                             run_pass_analytics(g, mode)
                         except Exception as e:
                             print(f"[err] pass analytics failed for {g.base} ({mode}): {e}")
+        elif choice == "8":
+            expand_configs_for_new_sources(groups)
+        elif choice == "9":
+            edit_config_lines(groups)
         else:
             print("Unknown option.")
 
