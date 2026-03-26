@@ -600,11 +600,11 @@ def pick_extracted_subs(workdir: Path, demux_manifest: Optional[Dict[str, Any]])
             res[tid_i] = pp
     return res
 
-def pick_audio_outputs(workdir: Path, audio_manifest: Optional[Dict[str, Any]]) -> Dict[int, Path]:
+def pick_audio_outputs(workdir: Path, audio_manifest: Optional[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
     """
-    Returns map: trackId -> primary output file path
+    Returns map: trackId -> {"path": Path, "mux_delay_ms": int}
     """
-    res: Dict[int, Path] = {}
+    res: Dict[int, Dict[str, Any]] = {}
     if not audio_manifest:
         return res
     outs = audio_manifest.get("outputs")
@@ -626,7 +626,11 @@ def pick_audio_outputs(workdir: Path, audio_manifest: Optional[Dict[str, Any]]) 
         if not p.is_absolute():
             p = workdir / p
         if p.exists() and p.stat().st_size > 0:
-            res[tid] = p
+            try:
+                mux_delay_ms = int(o.get("mux_delay_ms") or 0)
+            except Exception:
+                mux_delay_ms = 0
+            res[tid] = {"path": p, "mux_delay_ms": mux_delay_ms}
     return res
 
 
@@ -735,11 +739,23 @@ def build_mux_command(
             tmux = {}
 
         if tid in audio_out:
-            ap = audio_out[tid]
+            ao = audio_out[tid]
+            ap = Path(str(ao["path"]))
+            try:
+                mux_delay_ms = int(ao.get("mux_delay_ms") or 0)
+            except Exception:
+                mux_delay_ms = 0
             # metadata for single-track external file index=0
             add_track_meta_args(args, tmux, 0)
+            if mux_delay_ms != 0:
+                args += ["--sync", f"0:{mux_delay_ms}"]
             args += [str(ap)]
-            plan["audio_sources"].append({"trackId": tid, "path": str(ap), "from": "audio_manifest"})
+            plan["audio_sources"].append({
+                "trackId": tid,
+                "path": str(ap),
+                "from": "audio_manifest",
+                "mux_delay_ms": mux_delay_ms,
+            })
         else:
             # fallback: allow COPY from source
             if is_copy(status):

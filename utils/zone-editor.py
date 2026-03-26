@@ -530,21 +530,25 @@ def parse_selectors(
 
         m = _RX_TIME.match(raw)
         if m:
-            t0 = parse_time_token(m.group(1))
-            t1 = parse_time_token(m.group(2))
-            if t1 < t0:
-                t0, t1 = t1, t0
+            try:
+                t0 = parse_time_token(m.group(1))
+                t1 = parse_time_token(m.group(2))
+            except ValueError:
+                pass
+            else:
+                if t1 < t0:
+                    t0, t1 = t1, t0
 
-            f0 = sec_to_frame_floor(t0, video.fps)
-            f1 = sec_to_frame_ceil(t1, video.fps)
+                f0 = sec_to_frame_floor(t0, video.fps)
+                f1 = sec_to_frame_ceil(t1, video.fps)
 
-            if total_frames is not None:
-                f0 = max(0, min(f0, total_frames))
-                f1 = max(0, min(f1, total_frames))
+                if total_frames is not None:
+                    f0 = max(0, min(f0, total_frames))
+                    f1 = max(0, min(f1, total_frames))
 
-            fr = FrameRange(start=f0, end=f1)
-            out.append(Selector(kind="time", frame_ranges=(fr,), raw=raw))
-            continue
+                fr = FrameRange(start=f0, end=f1)
+                out.append(Selector(kind="time", frame_ranges=(fr,), raw=raw))
+                continue
 
         # Otherwise: chapter title
         if not video.chapters:

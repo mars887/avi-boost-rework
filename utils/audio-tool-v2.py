@@ -5,7 +5,7 @@
 #
 # Key behaviors (updated per January 2026 clarifications):
 # - Source is always MKV.
-# - COPY: extract/remux without transcoding; container/extension chosen adaptively (not necessarily .mka).
+# - COPY: extract/remux without transcoding; default output stays in .mka so source timestamps are preserved.
 # - EDIT: encode ONLY via opusenc (opus-tools). Decode via ffmpeg, optionally via pipe (ffmpeg -> opusenc).
 #         For complex inputs, create intermediate FLAC/WAV before opusenc (policy-controlled).
 # - Optional preservation of "special" original tracks (TrueHD / DTS-HD / Atmos-ish) as an extra .mka alongside .opus.
@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 TOOL_NAME = "audio-tool"
-TOOL_VERSION = "1.1"
+TOOL_VERSION = "1.2"
 
 MIN_OUT_BYTES = 1024  # sanity check
 DEFAULT_TMP_CODEC = "flac"  # preferred intermediate for "complex" EDIT
@@ -208,10 +208,20 @@ def write_json(p: Path, obj: Any) -> None:
     p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+
+def parse_time_ms(value: Any) -> int:
+    try:
+        if value in (None, "", "N/A"):
+            return 0
+        return int(round(float(value) * 1000.0))
+    except Exception:
+        return 0
+
 def ffprobe_audio_info(ffprobe: str, path: Path) -> Dict[str, Any]:
     """
     Return minimal audio stream info for a single-audio file (or first audio stream):
-    codec, container (best-effort), channels, sample_rate, bitrate_kbps, duration_ms, profile, tags(title/lang).
+    codec, container (best-effort), channels, sample_rate, bitrate_kbps, duration_ms,
+    start_time_ms, profile, tags(title/lang).
     """
     cmd = [
         ffprobe,
@@ -249,6 +259,9 @@ def ffprobe_audio_info(ffprobe: str, path: Path) -> Dict[str, Any]:
     channels = a.get("channels")
     sr = a.get("sample_rate")
     duration = fmt.get("duration") or a.get("duration")
+    start_time = a.get("start_time")
+    if start_time in (None, "", "N/A"):
+        start_time = fmt.get("start_time")
     bit_rate = a.get("bit_rate") or fmt.get("bit_rate")
 
     # tags
@@ -262,7 +275,8 @@ def ffprobe_audio_info(ffprobe: str, path: Path) -> Dict[str, Any]:
         "profile": profile,
         "channels": int(channels) if channels is not None else None,
         "sample_rate": int(sr) if sr is not None else None,
-        "duration_ms": int(float(duration) * 1000.0) if duration is not None else 0,
+        "duration_ms": parse_time_ms(duration),
+        "start_time_ms": parse_time_ms(start_time),
         "bitrate_kbps": int(int(bit_rate) / 1000) if bit_rate is not None and str(bit_rate).isdigit() else None,
         "title": title,
         "lang": lang,
@@ -413,6 +427,8 @@ class OutputEntry:
     sample_rate: Optional[int]
     bitrate_kbps: Optional[int]
     duration_ms: int
+    source_start_time_ms: int = 0
+    mux_delay_ms: int = 0
     notes: str = ""
 
 
@@ -622,7 +638,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--opusenc", default="opusenc")
 
     ap.add_argument("--temp-policy", default="auto", choices=["auto", "flac", "wav", "none"])
-    ap.add_argument("--copy-container", default="auto", choices=["auto", "mka", "native"])
+    ap.add_argument("--copy-container", default="mka", choices=["auto", "mka", "native"])
     ap.add_argument("--no-preserve-special", action="store_true", help="Disable extra .mka copy for special formats in EDIT")
 
     ap.add_argument("--overwrite", action="store_true")
@@ -733,9 +749,21 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             # Probe source track info from tmp_in
             src_info = ffprobe_audio_info(ffprobe, tmp_in)
+            source_start_time_ms = int(src_info.get("start_time_ms") or 0)
 
             if status == "COPY":
                 ext = choose_copy_ext(src_info.get("codec") or "", src_info.get("profile") or "", args.copy_container)
+                if source_start_time_ms != 0 and ext.lower() != ".mka":
+                    print(
+                        f"[{TOOL_NAME}] trackId={track_id_int} COPY forcing .mka to preserve delay={source_start_time_ms}ms"
+                    )
+                    log_event({
+                        "trackId": track_id_int,
+                        "action": "force_copy_mka_for_delay",
+                        "delay_ms": source_start_time_ms,
+                        "requested_ext": ext,
+                    })
+                    ext = ".mka"
                 out_path = audio_dir / f"{file_base}{ext}"
                 print(f"[{TOOL_NAME}] trackId={track_id_int} COPY -> {out_path.name}")
                 log_event({"trackId": track_id_int, "status": "COPY", "out": str(out_path), "ext": ext})
@@ -754,6 +782,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         sample_rate=info.get("sample_rate"),
                         bitrate_kbps=info.get("bitrate_kbps"),
                         duration_ms=int(info.get("duration_ms") or 0),
+                        source_start_time_ms=source_start_time_ms,
+                        mux_delay_ms=0,
                         notes="skip_exists",
                     ))
                     continue
@@ -779,6 +809,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     sample_rate=info.get("sample_rate"),
                     bitrate_kbps=info.get("bitrate_kbps"),
                     duration_ms=int(info.get("duration_ms") or 0),
+                    source_start_time_ms=source_start_time_ms,
+                    mux_delay_ms=0,
                 ))
                 continue
 
@@ -812,6 +844,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         sample_rate=info_o.get("sample_rate"),
                         bitrate_kbps=info_o.get("bitrate_kbps"),
                         duration_ms=int(info_o.get("duration_ms") or 0),
+                        source_start_time_ms=source_start_time_ms,
+                        mux_delay_ms=0,
                         notes="preserve_special_original_bitstream",
                     ))
 
@@ -829,6 +863,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     sample_rate=info.get("sample_rate"),
                     bitrate_kbps=info.get("bitrate_kbps") or bitrate_kbps,
                     duration_ms=int(info.get("duration_ms") or 0),
+                    source_start_time_ms=source_start_time_ms,
+                    mux_delay_ms=source_start_time_ms,
                     notes="skip_exists",
                 ))
                 continue
@@ -864,6 +900,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sample_rate=info.get("sample_rate"),
                 bitrate_kbps=info.get("bitrate_kbps") or bitrate_kbps,
                 duration_ms=int(info.get("duration_ms") or 0),
+                source_start_time_ms=source_start_time_ms,
+                mux_delay_ms=source_start_time_ms,
             ))
 
         manifest = {
