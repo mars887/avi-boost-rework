@@ -50,7 +50,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -327,6 +327,72 @@ class Hdr10Static:
     chroma_sample_position: Optional[str] = None
     mastering_display: Optional[str] = None
     content_light: Optional[str] = None
+
+
+def hdr10_static_has_hdr_signal(static: Hdr10Static) -> bool:
+    transfer = (static.transfer_characteristics or "").strip().lower()
+    primaries = (static.color_primaries or "").strip().lower()
+    matrix = (static.matrix_coefficients or "").strip().lower()
+    if transfer in ("smpte2084", "arib-std-b67"):
+        return True
+    if primaries.startswith("bt2020"):
+        return True
+    if matrix.startswith("bt2020"):
+        return True
+    if static.mastering_display or static.content_light:
+        return True
+    return False
+
+
+def build_hdr10_static_params(
+    static: Hdr10Static,
+    *,
+    add_enable_hdr: bool,
+    require_hdr_signal: bool = False,
+) -> List[str]:
+    has_hdr_signal = hdr10_static_has_hdr_signal(static)
+    if require_hdr_signal and not has_hdr_signal:
+        return []
+
+    params: List[str] = []
+    if add_enable_hdr and (has_hdr_signal or not require_hdr_signal):
+        params.extend(["--enable-hdr", "1"])
+    if static.color_primaries:
+        params.extend(["--color-primaries", static.color_primaries])
+    if static.transfer_characteristics:
+        params.extend(["--transfer-characteristics", static.transfer_characteristics])
+    if static.matrix_coefficients:
+        params.extend(["--matrix-coefficients", static.matrix_coefficients])
+    if static.color_range:
+        params.extend(["--color-range", static.color_range])
+    if static.chroma_sample_position:
+        params.extend(["--chroma-sample-position", static.chroma_sample_position])
+    if static.mastering_display:
+        params.extend(["--mastering-display", static.mastering_display])
+    if static.content_light:
+        params.extend(["--content-light", static.content_light])
+    return params
+
+
+def apply_flag_pairs(params: List[str], flag_pairs: List[str]) -> List[str]:
+    out = params[:]
+    for idx in range(0, len(flag_pairs), 2):
+        if idx + 1 >= len(flag_pairs):
+            break
+        out = upsert_flag_value(out, flag_pairs[idx], flag_pairs[idx + 1])
+    return out
+
+
+def build_hdr10_static_payload(static: Hdr10Static, *, add_enable_hdr: bool) -> Dict[str, Any]:
+    return {
+        "has_hdr_signal": hdr10_static_has_hdr_signal(static),
+        "video_params": build_hdr10_static_params(
+            static,
+            add_enable_hdr=add_enable_hdr,
+            require_hdr_signal=True,
+        ),
+        "static": asdict(static),
+    }
 
 
 def ffprobe_json(
@@ -719,6 +785,11 @@ def patch_hdr10_static_inplace(
 ) -> int:
     keys = iter_scene_sections(scenes_data)
     patched = 0
+    static_params = build_hdr10_static_params(
+        static,
+        add_enable_hdr=add_enable_hdr,
+        require_hdr_signal=False,
+    )
 
     for key in keys:
         for scene in scenes_data.get(key, []):
@@ -731,25 +802,7 @@ def patch_hdr10_static_inplace(
             if not isinstance(params, list):
                 continue
 
-            new_params = params[:]
-            # Enable HDR metadata writing if requested
-            if add_enable_hdr:
-                new_params = upsert_flag_value(new_params, "--enable-hdr", "1")
-
-            if static.color_primaries:
-                new_params = upsert_flag_value(new_params, "--color-primaries", static.color_primaries)
-            if static.transfer_characteristics:
-                new_params = upsert_flag_value(new_params, "--transfer-characteristics", static.transfer_characteristics)
-            if static.matrix_coefficients:
-                new_params = upsert_flag_value(new_params, "--matrix-coefficients", static.matrix_coefficients)
-            if static.color_range:
-                new_params = upsert_flag_value(new_params, "--color-range", static.color_range)
-            if static.chroma_sample_position:
-                new_params = upsert_flag_value(new_params, "--chroma-sample-position", static.chroma_sample_position)
-            if static.mastering_display:
-                new_params = upsert_flag_value(new_params, "--mastering-display", static.mastering_display)
-            if static.content_light:
-                new_params = upsert_flag_value(new_params, "--content-light", static.content_light)
+            new_params = apply_flag_pairs(params, static_params)
 
             if new_params != params:
                 zo["video_params"] = new_params
@@ -828,7 +881,7 @@ def main() -> None:
     )
 
     parser.add_argument("--source", required=True, help="Source file (used to extract all metadata).")
-    parser.add_argument("--scenes", required=True, help="Input av1an scenes.json (generated by av1an --sc-only).")
+    parser.add_argument("--scenes", required=False, help="Input av1an scenes.json (generated by av1an --sc-only).")
 
     parser.add_argument("--workdir", default="hdrmeta_work", help="Work directory for extracted/chunk metadata.")
     parser.add_argument("--output", default="scenes_patched.json", help="Output scenes.json filename (inside workdir).")
@@ -844,12 +897,29 @@ def main() -> None:
 
     parser.add_argument("--hdr10-add-enable-hdr", action="store_true", help="Also add --enable-hdr 1 to every scene (recommended).")
     parser.add_argument("--hdr10-scan-frames", type=int, default=120, help="How many initial frames to scan with ffprobe to find Mastering Display / Content Light Level side data (default: 120).")
+    parser.add_argument("--print-hdr10-json", action="store_true", help="Print extracted HDR10 static metadata as JSON to stdout and exit.")
     parser.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute).")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging.")
 
     args = parser.parse_args()
 
     source = Path(args.source).resolve()
+    if not source.exists():
+        raise FileNotFoundError(source)
+
+    if args.print_hdr10_json:
+        static = extract_hdr10_static(source, scan_frames=int(args.hdr10_scan_frames))
+        json.dump(
+            build_hdr10_static_payload(static, add_enable_hdr=bool(args.hdr10_add_enable_hdr)),
+            sys.stdout,
+            ensure_ascii=False,
+        )
+        sys.stdout.write("\n")
+        return
+
+    if not args.scenes:
+        parser.error("--scenes is required unless --print-hdr10-json is used.")
+
     scenes_in = Path(args.scenes).resolve()
     workdir = Path(args.workdir).resolve()
     setup_logging(args.log, args.verbose, workdir)
@@ -859,8 +929,6 @@ def main() -> None:
         return
     workdir.mkdir(parents=True, exist_ok=True)
 
-    if not source.exists():
-        raise FileNotFoundError(source)
     if not scenes_in.exists():
         raise FileNotFoundError(scenes_in)
 

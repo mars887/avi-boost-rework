@@ -183,6 +183,9 @@ class BdremBatGenerator(
             "av1an"
         }
         val noFastpass = getTrackMuxValue(videoTrack, "noFastpass", "false").lowercase() == "true"
+        val fastpassHdr = getTrackMuxValue(videoTrack, "fastpassHdr", "false").lowercase() == "true"
+        val noDolbyVision = getTrackMuxValue(videoTrack, "noDolbyVision", "false").lowercase() == "true"
+        val noHdr10Plus = getTrackMuxValue(videoTrack, "noHdr10Plus", "false").lowercase() == "true"
         val abMultiplier = getTrackMuxValue(videoTrack, "abMultiplier", "0.9")
         val abPosDev = getTrackMuxValue(videoTrack, "abPosDev", "3")
         val abNegDev = getTrackMuxValue(videoTrack, "abNegDev", "3")
@@ -300,6 +303,7 @@ class BdremBatGenerator(
         }
         sb.appendLine("  --sdm \"%SCENE_DETECTION%\" ^")
         if (noFastpass) sb.appendLine("  --no-fastpass ^")
+        if (fastpassHdr) sb.appendLine("  --fastpass-hdr ^")
         sb.appendLine("  --input \"%SRC%\" ^")
         sb.appendLine("  --out-scenes \"%SCENES%\" ^")
         sb.appendLine("  --temp \"%VIDEO_TEMP%\" ^")
@@ -337,6 +341,8 @@ class BdremBatGenerator(
         sb.appendLine("  --scenes \"%SCENES%\" ^")
         sb.appendLine("  --output \"%SCENES_HDR%\" ^")
         sb.appendLine("  --workdir \"%HDR_WORKDIR%\" ^")
+        if (noHdr10Plus) sb.appendLine("  --no-hdr10plus ^")
+        if (noDolbyVision) sb.appendLine("  --no-dv ^")
         sb.appendLine("  --log \"%LOGDIR%\\04_hdr_patch.log\"")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()

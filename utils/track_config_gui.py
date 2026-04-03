@@ -25,6 +25,9 @@ class DefaultSettings:
         mainpass="",
         scene_detection="",
         no_fastpass=False,
+        fastpass_hdr=True,
+        no_dolby_vision=False,
+        no_hdr10plus=False,
         fastpass_workers="",
         mainpass_workers="",
         workers="",
@@ -46,10 +49,10 @@ class DefaultSettings:
         if sd not in ("psd", "av1an"):
             sd = "av1an"
         self.scene_detection = sd
-        if isinstance(no_fastpass, bool):
-            self.no_fastpass = no_fastpass
-        else:
-            self.no_fastpass = str(no_fastpass).strip().lower() in ("1", "true", "yes", "on")
+        self.no_fastpass = parse_bool_value(no_fastpass, default=False)
+        self.fastpass_hdr = parse_bool_value(fastpass_hdr, default=True)
+        self.no_dolby_vision = parse_bool_value(no_dolby_vision, default=False)
+        self.no_hdr10plus = parse_bool_value(no_hdr10plus, default=False)
         self.workers = workers or ""
         self.fastpass_workers = fastpass_workers or self.workers or ""
         self.mainpass_workers = mainpass_workers or self.workers or ""
@@ -143,6 +146,21 @@ def parse_int_value(raw_value, default_value):
         return default_value
 
 
+def parse_bool_value(raw_value, default=False):
+    if raw_value is None:
+        return default
+    if isinstance(raw_value, bool):
+        return raw_value
+    text = str(raw_value).strip().lower()
+    if not text:
+        return default
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def rule_matches_track(rule, track):
     kind, value = rule
     if kind == "any":
@@ -208,6 +226,9 @@ def build_results(files, tracks_by_file, settings, defaults):
     default_mainpass = defaults.mainpass
     default_scene_detection = defaults.scene_detection
     default_no_fastpass = defaults.no_fastpass
+    default_fastpass_hdr = defaults.fastpass_hdr
+    default_no_dolby_vision = defaults.no_dolby_vision
+    default_no_hdr10plus = defaults.no_hdr10plus
     default_fastpass_workers = defaults.fastpass_workers or defaults.workers
     default_mainpass_workers = defaults.mainpass_workers or defaults.workers
     default_ab_multiplier = defaults.ab_multiplier
@@ -340,6 +361,9 @@ def build_results(files, tracks_by_file, settings, defaults):
                 track_mux["mainpass"] = default_mainpass
                 track_mux["sceneDetection"] = default_scene_detection
                 track_mux["noFastpass"] = "true" if default_no_fastpass else "false"
+                track_mux["fastpassHdr"] = "true" if default_fastpass_hdr else "false"
+                track_mux["noDolbyVision"] = "true" if default_no_dolby_vision else "false"
+                track_mux["noHdr10Plus"] = "true" if default_no_hdr10plus else "false"
                 track_mux["fastpassWorkers"] = default_fastpass_workers
                 track_mux["mainpassWorkers"] = default_mainpass_workers
                 track_mux["workers"] = default_fastpass_workers
@@ -421,6 +445,9 @@ class TrackConfigGui:
             mainpass=defaults_raw.get("mainpass") or "",
             scene_detection=defaults_raw.get("sceneDetection") or defaults_raw.get("scene_detection") or "",
             no_fastpass=defaults_raw.get("noFastpass") or defaults_raw.get("no_fastpass") or False,
+            fastpass_hdr=defaults_raw["fastpassHdr"] if "fastpassHdr" in defaults_raw else defaults_raw.get("fastpass_hdr", True),
+            no_dolby_vision=defaults_raw.get("noDolbyVision") or defaults_raw.get("no_dolby_vision") or False,
+            no_hdr10plus=defaults_raw.get("noHdr10Plus") or defaults_raw.get("no_hdr10plus") or False,
             fastpass_workers=defaults_raw.get("fastpassWorkers") or defaults_raw.get("fastpass_workers") or "",
             mainpass_workers=defaults_raw.get("mainpassWorkers") or defaults_raw.get("mainpass_workers") or "",
             workers=defaults_raw.get("workers") or "",
@@ -524,6 +551,9 @@ class TrackConfigGui:
         self.default_mainpass_var = tk.StringVar(value=self.defaults.mainpass)
         self.scene_detection_var = tk.StringVar(value=self.defaults.scene_detection or "av1an")
         self.no_fastpass_var = tk.BooleanVar(value=bool(self.defaults.no_fastpass))
+        self.fastpass_hdr_var = tk.BooleanVar(value=bool(self.defaults.fastpass_hdr))
+        self.no_dolby_vision_var = tk.BooleanVar(value=bool(self.defaults.no_dolby_vision))
+        self.no_hdr10plus_var = tk.BooleanVar(value=bool(self.defaults.no_hdr10plus))
         self.fastpass_workers_var = tk.StringVar(value=self.defaults.fastpass_workers or self.defaults.workers)
         self.mainpass_workers_var = tk.StringVar(value=self.defaults.mainpass_workers or self.defaults.workers)
         self.ab_multiplier_var = tk.StringVar(value=self.defaults.ab_multiplier)
@@ -580,6 +610,21 @@ class TrackConfigGui:
         )
         row += 1
 
+        ttk.Checkbutton(frame, text="fastpass HDR", variable=self.fastpass_hdr_var).grid(
+            row=row, column=1, sticky=tk.W, pady=2
+        )
+        row += 1
+
+        ttk.Checkbutton(frame, text="no DolbyVision", variable=self.no_dolby_vision_var).grid(
+            row=row, column=1, sticky=tk.W, pady=2
+        )
+        row += 1
+
+        ttk.Checkbutton(frame, text="no HDR10+", variable=self.no_hdr10plus_var).grid(
+            row=row, column=1, sticky=tk.W, pady=2
+        )
+        row += 1
+
         ttk.Label(frame, text="fastpass workers").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
         ttk.Entry(frame, textvariable=self.fastpass_workers_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
         row += 1
@@ -623,6 +668,9 @@ class TrackConfigGui:
         self.default_mainpass_var.trace_add("write", self.on_defaults_change)
         self.scene_detection_var.trace_add("write", self.on_defaults_change)
         self.no_fastpass_var.trace_add("write", self.on_defaults_change)
+        self.fastpass_hdr_var.trace_add("write", self.on_defaults_change)
+        self.no_dolby_vision_var.trace_add("write", self.on_defaults_change)
+        self.no_hdr10plus_var.trace_add("write", self.on_defaults_change)
         self.fastpass_workers_var.trace_add("write", self.on_defaults_change)
         self.mainpass_workers_var.trace_add("write", self.on_defaults_change)
         self.ab_pos_dev_var.trace_add("write", self.on_defaults_change)
@@ -831,6 +879,9 @@ class TrackConfigGui:
             mainpass=self._get_var_value("default_mainpass_var"),
             scene_detection=self._get_var_value("scene_detection_var"),
             no_fastpass=bool(getattr(self, "no_fastpass_var", tk.BooleanVar(value=False)).get()),
+            fastpass_hdr=bool(getattr(self, "fastpass_hdr_var", tk.BooleanVar(value=True)).get()),
+            no_dolby_vision=bool(getattr(self, "no_dolby_vision_var", tk.BooleanVar(value=False)).get()),
+            no_hdr10plus=bool(getattr(self, "no_hdr10plus_var", tk.BooleanVar(value=False)).get()),
             fastpass_workers=self._get_var_value("fastpass_workers_var"),
             mainpass_workers=self._get_var_value("mainpass_workers_var"),
             workers=self.defaults.workers,

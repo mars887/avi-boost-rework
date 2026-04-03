@@ -206,10 +206,17 @@ def move_if_exists(src: Path, dst: Path) -> None:
 def read_text_best_effort(path: Path) -> str:
     for enc in ("utf-8-sig", "utf-8", "cp1251"):
         try:
-            return path.read_text(encoding=enc)
+            with path.open("r", encoding=enc, newline="") as f:
+                return f.read()
         except Exception:
             continue
-    return path.read_text(encoding="utf-8", errors="ignore")
+    with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+        return f.read()
+
+
+def normalize_text_newlines(text: str) -> str:
+    text = re.sub(r"\r+\n", "\n", text)
+    return text.replace("\r", "\n")
 
 
 def parse_bat_vpy_vars(bat_path: Path) -> Dict[str, str]:
@@ -531,9 +538,9 @@ def to_windows_eol(text: str) -> str:
 
 def write_text_with_fallback(path: Path, text: str, *, preferred_encoding: str = "cp1251") -> None:
     try:
-        path.write_text(text, encoding=preferred_encoding)
+        path.write_text(text, encoding=preferred_encoding, newline="")
     except UnicodeEncodeError:
-        path.write_text(text, encoding="utf-8")
+        path.write_text(text, encoding="utf-8", newline="")
 
 
 def enter_numbers(raw: str, min_value: int, max_value: int) -> List[int]:
@@ -634,7 +641,7 @@ def find_edit_matches(groups: List[SourceGroup], target: str, needle: str) -> Li
         except Exception as e:
             print(f"[err] failed to read {file_path}: {e}")
             continue
-        for line_no, line in enumerate(text.replace("\r\n", "\n").replace("\r", "\n").split("\n"), start=1):
+        for line_no, line in enumerate(normalize_text_newlines(text).split("\n"), start=1):
             if needle not in line:
                 continue
             matches.append(
@@ -671,7 +678,7 @@ def replace_selected_lines(matches: List[EditMatch], replacement: str) -> int:
             print(f"[err] failed to read {file_path}: {e}")
             continue
 
-        normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+        normalized = normalize_text_newlines(raw)
         trailing_newline = normalized.endswith("\n")
         lines = normalized.split("\n")
         if trailing_newline and lines and lines[-1] == "":
@@ -747,6 +754,34 @@ def is_partial_source_state(group: SourceGroup) -> bool:
     return group.per_file_bat.exists() or group.workdir.exists()
 
 
+def find_result_backed_template_groups(source_dir: Path, known_bases: Iterable[str]) -> List[SourceGroup]:
+    known = {b.lower() for b in known_bases}
+    found: List[SourceGroup] = []
+    for ext in VIDEO_EXTS:
+        for result_path in sorted(source_dir.glob(f"*-av1{ext}"), key=lambda p: p.name.lower()):
+            base = result_path.stem
+            if base.lower() in known:
+                continue
+
+            workdir = source_dir / base
+            per_file_bat = source_dir / f"{base}.bat"
+            if not per_file_bat.exists() or not (workdir / "tracks.json").exists():
+                continue
+
+            found.append(
+                SourceGroup(
+                    source=result_path.resolve(),
+                    base=base,
+                    source_dir=source_dir,
+                    workdir=workdir,
+                    per_file_bat=per_file_bat,
+                    result_mkv=source_dir / f"{base}-av1.mkv",
+                    result_mp4=source_dir / f"{base}-av1.mp4",
+                )
+            )
+    return found
+
+
 def choose_template_group(candidates: List[SourceGroup], source_dir: Path) -> Optional[SourceGroup]:
     print()
     print(f"[Expand] Sources with existing config in: {source_dir}")
@@ -767,7 +802,7 @@ def choose_template_group(candidates: List[SourceGroup], source_dir: Path) -> Op
 
 
 def rewrite_template_bat_for_target(template_text: str, target: SourceGroup) -> str:
-    normalized = template_text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalize_text_newlines(template_text)
     trailing_newline = normalized.endswith("\n")
     lines = normalized.split("\n")
     if trailing_newline and lines and lines[-1] == "":
@@ -868,7 +903,7 @@ def clone_source_config(template: SourceGroup, target: SourceGroup) -> bool:
 
 def parse_runner_script_bases(text: str) -> List[str]:
     bases: List[str] = []
-    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+    for line in normalize_text_newlines(text).split("\n"):
         m = CALL_RUN_RE.match(line)
         if not m:
             continue
@@ -951,7 +986,7 @@ def ensure_runner_script_entries(script_path: Path, bases_to_add: List[str], *, 
         return
 
     raw = read_text_best_effort(script_path)
-    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalize_text_newlines(raw)
     trailing_newline = normalized.endswith("\n")
     lines = normalized.split("\n")
     if trailing_newline and lines and lines[-1] == "":
@@ -1021,6 +1056,11 @@ def expand_configs_for_new_sources(groups: List[SourceGroup]) -> None:
                 print(f"  - {g.base}: bat={bat_state}, workdir={work_state}, tracks={tracks_state}")
 
         templates = [g for g in items_sorted if is_template_source(g)]
+        if templates:
+            known_template_bases = [g.base for g in templates]
+        else:
+            known_template_bases = [g.base for g in items_sorted]
+        templates.extend(find_result_backed_template_groups(source_dir, known_template_bases))
         if not templates:
             print("[warn] No template sources with per-file bat + tracks.json in this folder.")
             continue

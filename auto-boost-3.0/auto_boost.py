@@ -105,6 +105,11 @@ def main() -> int:
                         help="Overriding params from video-params for final encoding scenes.")
     parser.add_argument("-f", "--ffmpeg", default="",
                         help="FFmpeg options for av1an. If it starts with '-', passed as-is to av1an -f. Otherwise treated as a filtergraph and wrapped as -vf \"...\".")
+    default_hdr_patch_script = Path(__file__).resolve().parent.parent / "utils" / "av1an_hdr_metadata_patch_v2.py"
+    parser.add_argument("--fastpass-hdr", action="store_true",
+                        help="Apply static HDR10 params to fast-pass by querying av1an_hdr_metadata_patch_v2.py.")
+    parser.add_argument("--hdr-patch-script", default=str(default_hdr_patch_script),
+                        help="Path to av1an_hdr_metadata_patch_v2.py (used for --fastpass-hdr).")
     parser.add_argument("--verbose", action="store_true", help="Verbose output (fast-pass + rules logging).")
     parser.add_argument("--keep", action="store_true", help="Pass --keep to av1an (keep temp files).")
     parser.add_argument("--av1an-log-file", default="auto",
@@ -185,6 +190,9 @@ def main() -> int:
     fastpass_out = Path(args.fastpass_out).expanduser().resolve() if args.fastpass_out else (fastpass_dir / f"{input_file.stem}.fastpass.mkv")
     fastpass_vpy = Path(args.fastpass_vpy).expanduser().resolve() if args.fastpass_vpy else None
     fastpass_proxy = Path(args.fastpass_proxy).expanduser().resolve() if args.fastpass_proxy else None
+    hdr_patch_script = Path(args.hdr_patch_script).expanduser().resolve()
+    if args.fastpass_hdr:
+        ensure_exists(hdr_patch_script, "HDR patch script")
 
     # Metrics reference: if fast-pass input is a .vpy (may crop/scale), compare against that pipeline, not the original source.
     metrics_ref_src = fastpass_vpy if fastpass_vpy is not None else input_file
@@ -316,6 +324,8 @@ def main() -> int:
                             None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
                             else str(args.av1an_log_level).strip()
                         ),
+                        fastpass_hdr=bool(args.fastpass_hdr),
+                        hdr_patch_script=hdr_patch_script,
                     )
                     touch(marks["fastpass"])
             else:
@@ -348,6 +358,8 @@ def main() -> int:
                             None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
                             else str(args.av1an_log_level).strip()
                         ),
+                        fastpass_hdr=bool(args.fastpass_hdr),
+                        hdr_patch_script=hdr_patch_script,
                     )
                     touch(marks["fastpass"])
 
