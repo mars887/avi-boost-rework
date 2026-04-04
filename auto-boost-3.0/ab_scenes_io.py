@@ -76,8 +76,9 @@ def write_uniform_scenes(
     *,
     base_scenes_path: Path,
     out_scenes_path: Path,
+    encoder: str,
     base_crf: float,
-    final_preset: int,
+    final_preset: str,
     video_params: str,
     final_override: str,
 ) -> None:
@@ -86,6 +87,7 @@ def write_uniform_scenes(
     base_norm = sanitize_scenes_json(base)
     out_obj = build_uniform_scenes_obj(
         base_norm=base_norm,
+        encoder=encoder,
         base_crf=base_crf,
         final_preset=final_preset,
         video_params=video_params,
@@ -103,13 +105,14 @@ def apply_crf_adjustments_to_scenes(
     scene_ranges: List[Tuple[int, int]],
     per_chunk_5: List[float],
     avg_total: float,
+    encoder: str,
     base_crf: float,
     pos_dev_multiplier: float,
     neg_dev_multiplier: float,
     deviation: float,
     max_positive_dev: Optional[float],
     max_negative_dev: Optional[float],
-    final_preset: int,
+    final_preset: str,
     video_params: str,
     final_override: str,
 ) -> None:
@@ -121,6 +124,7 @@ def apply_crf_adjustments_to_scenes(
         scene_ranges=scene_ranges,
         per_chunk_5=per_chunk_5,
         avg_total=avg_total,
+        encoder=encoder,
         base_crf=base_crf,
         pos_dev_multiplier=pos_dev_multiplier,
         neg_dev_multiplier=neg_dev_multiplier,

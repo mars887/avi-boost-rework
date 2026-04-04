@@ -22,6 +22,7 @@ if ROOT not in sys.path:
 
 
 from ab_fastpass import run_fastpass_av1an
+from ab_encoder import normalize_encoder, resolve_preset
 from ab_fs import ensure_dir, ensure_exists, load_json, save_json, safe_unlink, touch, which_or_none
 from ab_logging import eprint, setup_logging
 from ab_nvof import (
@@ -93,14 +94,18 @@ def main() -> int:
                         help="Optional .vpy path for fast-pass input (used for av1an -i). Adds --vspipe-args src=<input>.")
     parser.add_argument("--fastpass-proxy", default=None,
                         help="Optional av1an --proxy path for fast-pass. Adds --proxy and --vspipe-args src=<input>.")
+    parser.add_argument("--encoder", default="svt-av1",
+                        help="Encoder for fast-pass and scene overrides: svt-av1 (default), libx265/x265.")
     parser.add_argument("--workers", type=int, default=8,
                         help="av1an workers for fast-pass.")
     parser.add_argument("--lp", type=int, default=3, help="--lp for fast-pass encoding (svt-av1).")
     parser.add_argument("-q", "--quality", type=float, default=30.0, help="Base CRF for targeting (also used for fast-pass).")
-    parser.add_argument("--fast-preset", type=int, default=7, help="Fast-pass SVT preset (speed).")
-    parser.add_argument("-p", "--preset", type=int, default=2, help="Final SVT preset embedded into zone_overrides.")
+    parser.add_argument("--fast-preset", default=None,
+                        help="Fast-pass preset. Defaults depend on encoder (svt-av1: 7, x265: fast).")
+    parser.add_argument("-p", "--preset", default=None,
+                        help="Final preset embedded into zone_overrides. Defaults depend on encoder (svt-av1: 2, x265: slow).")
     parser.add_argument("-v", "--video-params", default="",
-                        help="Extra SVT encoder params to embed into zone_overrides (string). Do NOT include --crf/--preset.")
+                        help="Extra encoder params to embed into zone_overrides (string). Do NOT include --crf/--preset.")
     parser.add_argument("--final-override", default="",
                         help="Overriding params from video-params for final encoding scenes.")
     parser.add_argument("-f", "--ffmpeg", default="",
@@ -163,6 +168,9 @@ def main() -> int:
                         help="Adjust metric avg: +N/-N (shift), !N (set), or target%percent (move toward target by percent).")
 
     args = parser.parse_args()
+    args.encoder = normalize_encoder(args.encoder)
+    fastpass_preset = resolve_preset(args.encoder, args.fast_preset, fast=True)
+    final_preset = resolve_preset(args.encoder, args.preset, fast=False)
 
     if args.rule_test and not args.verbose:
         args.verbose = True
@@ -312,8 +320,9 @@ def main() -> int:
                         sdm=str(args.sdm),
                         workers=int(args.workers),
                         lp=int(args.lp),
-                        fast_preset=int(args.fast_preset),
+                        fast_preset=fastpass_preset,
                         fast_crf=float(args.quality),
+                        encoder=str(args.encoder),
                         video_params=str(args.video_params),
                         ffmpeg_arg=str(args.ffmpeg),
                         verbose=bool(args.verbose),
@@ -346,8 +355,9 @@ def main() -> int:
                         sdm=str(args.sdm),
                         workers=int(args.workers),
                         lp=int(args.lp),
-                        fast_preset=int(args.fast_preset),
+                        fast_preset=fastpass_preset,
                         fast_crf=float(args.quality),
+                        encoder=str(args.encoder),
                         video_params=str(args.video_params),
                         ffmpeg_arg=str(args.ffmpeg),
                         verbose=bool(args.verbose),
@@ -428,8 +438,9 @@ def main() -> int:
                 write_uniform_scenes(
                     base_scenes_path=base_scenes_path,
                     out_scenes_path=stage4_out_scenes_path,
+                    encoder=str(args.encoder),
                     base_crf=float(args.quality),
-                    final_preset=int(args.preset),
+                    final_preset=final_preset,
                     video_params=str(args.video_params),
                     final_override=str(args.final_override),
                 )
@@ -467,13 +478,14 @@ def main() -> int:
                     scene_ranges=scene_ranges,
                     per_chunk_5=per_chunk_5,
                     avg_total=avg_total_adj,
+                    encoder=str(args.encoder),
                     base_crf=float(args.quality),
                     pos_dev_multiplier=pos_dev_multiplier,
                     neg_dev_multiplier=neg_dev_multiplier,
                     deviation=float(args.deviation),
                     max_positive_dev=args.max_positive_dev,
                     max_negative_dev=args.max_negative_dev,
-                    final_preset=int(args.preset),
+                    final_preset=final_preset,
                     video_params=str(args.video_params),
                     final_override=str(args.final_override)
                 )

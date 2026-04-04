@@ -182,10 +182,17 @@ class BdremBatGenerator(
         } else {
             "av1an"
         }
+        val videoEncoder = normalizeVideoEncoder(getTrackMuxValue(videoTrack, "encoder", "svt-av1"))
+        val av1anEncoder = toAv1anEncoder(videoEncoder)
         val noFastpass = getTrackMuxValue(videoTrack, "noFastpass", "false").lowercase() == "true"
         val fastpassHdr = getTrackMuxValue(videoTrack, "fastpassHdr", "false").lowercase() == "true"
+        val strictSdr8bit = getTrackMuxValue(videoTrack, "strictSdr8bit", "false").lowercase() == "true"
         val noDolbyVision = getTrackMuxValue(videoTrack, "noDolbyVision", "false").lowercase() == "true"
         val noHdr10Plus = getTrackMuxValue(videoTrack, "noHdr10Plus", "false").lowercase() == "true"
+        val effectiveFastpassHdr = fastpassHdr
+        val effectiveNoDolbyVision = noDolbyVision || strictSdr8bit
+        val effectiveNoHdr10Plus = noHdr10Plus || strictSdr8bit
+        val av1anPixFormat = if (strictSdr8bit) "yuv420p" else "yuv420p10le"
         val abMultiplier = getTrackMuxValue(videoTrack, "abMultiplier", "0.9")
         val abPosDev = getTrackMuxValue(videoTrack, "abPosDev", "3")
         val abNegDev = getTrackMuxValue(videoTrack, "abNegDev", "3")
@@ -230,6 +237,9 @@ class BdremBatGenerator(
         sb.appendLine("set \"FASTPASS_WORKERS=$fastpassWorkers\"")
         sb.appendLine("set \"MAINPASS_WORKERS=$mainpassWorkers\"")
         sb.appendLine("set \"SCENE_DETECTION=$sceneDetection\"")
+        sb.appendLine("set \"VIDEO_ENCODER=$videoEncoder\"")
+        sb.appendLine("set \"AV1AN_ENCODER=$av1anEncoder\"")
+        sb.appendLine("set \"STRICT_SDR_8BIT=${if (strictSdr8bit) "1" else "0"}\"")
         sb.appendLine("set \"FASTPASS=$fastpass\"")
         sb.appendLine("set \"MAINPASS=$mainpass\"")
         sb.appendLine("set \"AB_MULTIPIER=$abMultiplier\"")
@@ -302,8 +312,9 @@ class BdremBatGenerator(
             sb.appendLine("  --psd-script \"${Paths.PSD_SCRIPT_PY}\" ^")
         }
         sb.appendLine("  --sdm \"%SCENE_DETECTION%\" ^")
+        sb.appendLine("  --encoder \"%VIDEO_ENCODER%\" ^")
         if (noFastpass) sb.appendLine("  --no-fastpass ^")
-        if (fastpassHdr) sb.appendLine("  --fastpass-hdr ^")
+        if (effectiveFastpassHdr) sb.appendLine("  --fastpass-hdr ^")
         sb.appendLine("  --input \"%SRC%\" ^")
         sb.appendLine("  --out-scenes \"%SCENES%\" ^")
         sb.appendLine("  --temp \"%VIDEO_TEMP%\" ^")
@@ -341,8 +352,10 @@ class BdremBatGenerator(
         sb.appendLine("  --scenes \"%SCENES%\" ^")
         sb.appendLine("  --output \"%SCENES_HDR%\" ^")
         sb.appendLine("  --workdir \"%HDR_WORKDIR%\" ^")
-        if (noHdr10Plus) sb.appendLine("  --no-hdr10plus ^")
-        if (noDolbyVision) sb.appendLine("  --no-dv ^")
+        sb.appendLine("  --encoder \"%VIDEO_ENCODER%\" ^")
+        if (strictSdr8bit) sb.appendLine("  --no-hdr10 ^")
+        if (effectiveNoHdr10Plus) sb.appendLine("  --no-hdr10plus ^")
+        if (effectiveNoDolbyVision) sb.appendLine("  --no-dv ^")
         sb.appendLine("  --log \"%LOGDIR%\\04_hdr_patch.log\"")
         sb.appendLine("if errorlevel 1 goto :fail")
         sb.appendLine()
@@ -370,8 +383,8 @@ class BdremBatGenerator(
         sb.appendLine("  --log-file \"%LOGDIR%\\06_av1an_mainpass.log\" ^")
         sb.appendLine("  --log-level info ^")
         sb.appendLine("  --chunk-method ffms2 ^")
-        sb.appendLine("  -e svt-av1 ^")
-        sb.appendLine("  --pix-format yuv420p10le ^")
+        sb.appendLine("  -e %AV1AN_ENCODER% ^")
+        sb.appendLine("  --pix-format $av1anPixFormat ^")
         sb.appendLine("  --no-defaults ^")
         // sb.appendLine("  -v \"$mainpassBase\" ^")
         if (mainpassVf.isNotBlank()) sb.appendLine("  -f \"-vf %MAINPASS_VF%\" ^")
@@ -604,6 +617,18 @@ class BdremBatGenerator(
             }
         }
         return parts.joinToString(" ")
+    }
+
+    private fun normalizeVideoEncoder(raw: String): String {
+        val value = raw.trim().lowercase().replace("_", "-")
+        return when (value) {
+            "x265", "libx265" -> "libx265"
+            else -> "svt-av1"
+        }
+    }
+
+    private fun toAv1anEncoder(raw: String): String {
+        return if (normalizeVideoEncoder(raw) == "libx265") "x265" else "svt-av1"
     }
 
     private fun normalizeType(raw: String): String {

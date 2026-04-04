@@ -7,6 +7,7 @@ import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from ab_encoder import normalize_encoder, scene_encoder_name
 from ab_params import find_last_option, is_param_key, strip_params_tokens
 from ab_ssimu2 import calc_stats, parse_ssimu2_log, slice_samples_for_scene
 
@@ -68,12 +69,15 @@ def compute_chunk_5p_single_metric(
 
 def build_zone_overrides(
     *,
+    encoder: str,
     crf: float,
-    preset: int,
+    preset: str,
     video_params_str: str,
     final_override: str,
 ) -> Dict[str, Any]:
     """Build zone_overrides payload for a scene."""
+    normalized_encoder = normalize_encoder(encoder)
+
     def apply_override(base_tokens: List[str], override_tokens: List[str]) -> List[str]:
         i = 0
         while i < len(override_tokens):
@@ -109,7 +113,7 @@ def build_zone_overrides(
     tokens = shlex.split(video_params_str) if video_params_str else []
     tokens = strip_params_tokens(tokens, keys=["--crf", "--preset"])
 
-    video_params: List[str] = ["--crf", f"{crf:.2f}", "--preset", str(int(preset))]
+    video_params: List[str] = ["--crf", f"{crf:.2f}", "--preset", str(preset).strip()]
     video_params.extend(tokens)
 
     override_tokens = shlex.split(final_override) if final_override else []
@@ -117,7 +121,7 @@ def build_zone_overrides(
         video_params = apply_override(video_params, override_tokens)
 
     return {
-        "encoder": "svt_av1",
+        "encoder": scene_encoder_name(normalized_encoder),
         "passes": 1,
         "video_params": video_params,
         "photon_noise": None,
@@ -132,8 +136,9 @@ def build_zone_overrides(
 def build_uniform_scenes_obj(
     *,
     base_norm: Dict[str, Any],
+    encoder: str,
     base_crf: float,
-    final_preset: int,
+    final_preset: str,
     video_params: str,
     final_override: str,
 ) -> Dict[str, Any]:
@@ -149,8 +154,9 @@ def build_uniform_scenes_obj(
             "start_frame": st,
             "end_frame": en,
             "zone_overrides": build_zone_overrides(
+                encoder=encoder,
                 crf=float(base_crf),
-                preset=int(final_preset),
+                preset=str(final_preset),
                 video_params_str=str(video_params),
                 final_override=str(final_override),
             ),
@@ -165,13 +171,14 @@ def build_crf_adjusted_scenes_obj(
     scene_ranges: List[Tuple[int, int]],
     per_chunk_5: List[float],
     avg_total: float,
+    encoder: str,
     base_crf: float,
     pos_dev_multiplier: float,
     neg_dev_multiplier: float,
     deviation: float,
     max_positive_dev: Optional[float],
     max_negative_dev: Optional[float],
-    final_preset: int,
+    final_preset: str,
     video_params: str,
     final_override: str,
 ) -> Dict[str, Any]:
@@ -212,8 +219,9 @@ def build_crf_adjusted_scenes_obj(
             "start_frame": st,
             "end_frame": en,
             "zone_overrides": build_zone_overrides(
+                encoder=encoder,
                 crf=new_crf,
-                preset=final_preset,
+                preset=str(final_preset),
                 video_params_str=video_params,
                 final_override=final_override,
             ),

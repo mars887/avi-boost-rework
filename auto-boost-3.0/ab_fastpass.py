@@ -6,8 +6,9 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
+from ab_encoder import build_fastpass_hdr10_params, build_fastpass_params, normalize_encoder
 from ab_cmd import run_cmd
 from ab_fs import ensure_dir, ensure_exists
 
@@ -28,7 +29,7 @@ def build_av1an_filter_arg(ffmpeg_arg: str) -> List[str]:
     return ["-f", f'-vf "{s}"']
 
 
-def query_fastpass_hdr10_params(*, input_file: Path, hdr_patch_script: Path) -> str:
+def query_fastpass_hdr10_payload(*, input_file: Path, hdr_patch_script: Path) -> Dict[str, Any]:
     ensure_exists(hdr_patch_script, "HDR patch script")
     cmd = [
         sys.executable,
@@ -55,12 +56,9 @@ def query_fastpass_hdr10_params(*, input_file: Path, hdr_patch_script: Path) -> 
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Failed to parse HDR10 metadata response: {exc}") from exc
 
-    video_params = payload.get("video_params") or []
-    if not isinstance(video_params, list):
-        raise RuntimeError("HDR10 metadata response is missing a valid 'video_params' list.")
-
-    tokens = [str(item).strip() for item in video_params if str(item).strip()]
-    return " ".join(tokens).strip()
+    if not isinstance(payload, dict):
+        raise RuntimeError("HDR10 metadata response is not a JSON object.")
+    return payload
 
 
 def run_fastpass_av1an(
@@ -74,8 +72,9 @@ def run_fastpass_av1an(
     sdm: str,
     workers: int,
     lp: int,
-    fast_preset: int,
+    fast_preset: str,
     fast_crf: float,
+    encoder: str,
     video_params: str,
     ffmpeg_arg: str,
     verbose: bool,
@@ -87,6 +86,7 @@ def run_fastpass_av1an(
     hdr_patch_script: Optional[Path] = None,
 ) -> None:
     """Build and execute the av1an fast-pass command (or sc-only)."""
+    encoder = normalize_encoder(encoder)
     if scenes_path is not None and str(sdm).strip().lower() == "psd":
         ensure_exists(scenes_path, "Base scenes.json")
     ensure_dir(av1an_temp)
@@ -130,16 +130,22 @@ def run_fastpass_av1an(
     cmd.extend(["--cache-mode", "temp"])
 
     # Encoder & encode settings (fast pass)
-    cmd.extend(["-e", "svt-av1", "--force"])
+    cmd.extend(["-e", encoder, "--force"])
     cmd.extend(["-a","-an -sn"])
 
-    enc_params = f'--preset {int(fast_preset)} --crf {float(fast_crf):.2f} --lp {int(lp)}'
-    if video_params:
-        enc_params += f" {video_params.strip()}"
+    enc_params = build_fastpass_params(
+        encoder=encoder,
+        preset=str(fast_preset),
+        crf=float(fast_crf),
+        lp=int(lp),
+        video_params=str(video_params),
+    )
     if fastpass_hdr:
         script_path = hdr_patch_script or (Path(__file__).resolve().parent.parent / "utils" / "av1an_hdr_metadata_patch_v2.py")
-        hdr_params = query_fastpass_hdr10_params(input_file=input_file, hdr_patch_script=script_path)
-        if hdr_params:
+        hdr_payload = query_fastpass_hdr10_payload(input_file=input_file, hdr_patch_script=script_path)
+        hdr_tokens = build_fastpass_hdr10_params(hdr_payload, encoder=encoder)
+        if hdr_tokens:
+            hdr_params = " ".join(hdr_tokens)
             print(f"[hdr] fast-pass static HDR params: {hdr_params}")
             enc_params += f" {hdr_params}"
         else:

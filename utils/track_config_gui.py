@@ -12,7 +12,46 @@ VIDEO_MODE_OPTIONS = ["COPY", "EDIT"]
 AUDIO_MODE_OPTIONS = ["COPY", "EDIT", "SKIP"]
 SUB_MODE_OPTIONS = ["COPY", "SKIP"]
 DEFAULT_OPTIONS = ["auto", "true", "false"]
+VIDEO_ENCODER_OPTIONS = ["svt-av1", "libx265"]
 TYPE_ORDER = {"video": 0, "audio": 1, "sub": 2}
+DEFAULT_VIDEO_ENCODER = "svt-av1"
+STRICT_SDR_8BIT_PARAMS = {
+    "svt-av1": {
+        "--matrix-coefficients": "1",
+        "--transfer-characteristics": "1",
+        "--color-primaries": "1",
+        "--input-depth": "8",
+        "--hbd-mds": "0",
+    },
+    "libx265": {
+        "--colormatrix": "bt709",
+        "--transfer": "bt709",
+        "--colorprim": "bt709",
+    },
+}
+LIBX265_UNSUPPORTED_FLAGS = {
+    "--ac-bias",
+    "--cdef-scaling",
+    "--chroma-qm-min",
+    "--color-primaries",
+    "--complex-hvs",
+    "--enable-dlf",
+    "--enable-restoration",
+    "--fast-decode",
+    "--film-grain",
+    "--hbd-mds",
+    "--lp",
+    "--matrix-coefficients",
+    "--noise-adaptive-filtering",
+    "--qm-min",
+    "--scm",
+    "--sharpness",
+    "--sharp-tx",
+    "--transfer-characteristics",
+    "--variance-boost-curve",
+    "--variance-boost-strength",
+    "--variance-octile",
+}
 
 
 class DefaultSettings:
@@ -26,11 +65,13 @@ class DefaultSettings:
         scene_detection="",
         no_fastpass=False,
         fastpass_hdr=True,
+        strict_sdr_8bit=False,
         no_dolby_vision=False,
         no_hdr10plus=False,
         fastpass_workers="",
         mainpass_workers="",
         workers="",
+        encoder=DEFAULT_VIDEO_ENCODER,
         ab_multiplier="",
         ab_pos_dev="",
         ab_neg_dev="",
@@ -51,11 +92,13 @@ class DefaultSettings:
         self.scene_detection = sd
         self.no_fastpass = parse_bool_value(no_fastpass, default=False)
         self.fastpass_hdr = parse_bool_value(fastpass_hdr, default=True)
+        self.strict_sdr_8bit = parse_bool_value(strict_sdr_8bit, default=False)
         self.no_dolby_vision = parse_bool_value(no_dolby_vision, default=False)
         self.no_hdr10plus = parse_bool_value(no_hdr10plus, default=False)
         self.workers = workers or ""
         self.fastpass_workers = fastpass_workers or self.workers or ""
         self.mainpass_workers = mainpass_workers or self.workers or ""
+        self.encoder = normalize_encoder(encoder)
         self.ab_multiplier = ab_multiplier or ""
         self.ab_pos_dev = ab_pos_dev or ""
         self.ab_neg_dev = ab_neg_dev or ""
@@ -128,6 +171,15 @@ def parse_params_string(raw_value):
     return result
 
 
+def normalize_encoder(value):
+    raw = str(value or "").strip().lower().replace("_", "-")
+    if raw in ("", "auto", "default", "svt-av1"):
+        return "svt-av1"
+    if raw in ("x265", "libx265"):
+        return "libx265"
+    return DEFAULT_VIDEO_ENCODER
+
+
 def get_param_value(params_map, key):
     if not params_map:
         return ""
@@ -135,6 +187,34 @@ def get_param_value(params_map, key):
     if value is None:
         return ""
     return str(value).strip()
+
+
+def apply_strict_sdr_8bit_params(params_map, encoder):
+    result = dict(params_map or {})
+    for key, value in STRICT_SDR_8BIT_PARAMS.get(normalize_encoder(encoder), {}).items():
+        result[key] = value
+    return result
+
+
+def find_encoder_param_conflicts(encoder, params_map):
+    normalized = normalize_encoder(encoder)
+    if normalized != "libx265":
+        return []
+
+    normalized_items = {
+        str(key).replace("^", "-"): str(value).strip()
+        for key, value in (params_map or {}).items()
+    }
+    conflicts = {flag for flag in LIBX265_UNSUPPORTED_FLAGS if flag in normalized_items}
+
+    preset_value = normalized_items.get("--preset", "")
+    tune_value = normalized_items.get("--tune", "")
+    if preset_value and preset_value.replace(".", "", 1).isdigit():
+        conflicts.add("--preset=<numeric>")
+    if tune_value and tune_value.replace(".", "", 1).isdigit():
+        conflicts.add("--tune=<numeric>")
+
+    return sorted(conflicts)
 
 
 def parse_int_value(raw_value, default_value):
@@ -227,10 +307,12 @@ def build_results(files, tracks_by_file, settings, defaults):
     default_scene_detection = defaults.scene_detection
     default_no_fastpass = defaults.no_fastpass
     default_fastpass_hdr = defaults.fastpass_hdr
+    default_strict_sdr_8bit = defaults.strict_sdr_8bit
     default_no_dolby_vision = defaults.no_dolby_vision
     default_no_hdr10plus = defaults.no_hdr10plus
     default_fastpass_workers = defaults.fastpass_workers or defaults.workers
     default_mainpass_workers = defaults.mainpass_workers or defaults.workers
+    default_encoder = normalize_encoder(defaults.encoder)
     default_ab_multiplier = defaults.ab_multiplier
     default_ab_pos_dev = defaults.ab_pos_dev
     default_ab_neg_dev = defaults.ab_neg_dev
@@ -337,11 +419,14 @@ def build_results(files, tracks_by_file, settings, defaults):
                     param_map.update(track_param_map)
                 if track_last_param_map:
                     last_param_map.update(track_last_param_map)
+                if default_strict_sdr_8bit:
+                    last_param_map = apply_strict_sdr_8bit_params(last_param_map, default_encoder)
                 if param_map:
                     track_param.update(param_map)
                 if last_param_map:
                     track_param.update({key.replace("-", "^"): value for key, value in last_param_map.items()})
                 param_parts = []
+                param_parts.append(f"encoder={default_encoder}")
                 if entry["params"]:
                     param_parts.append(f"params={entry['params']}")
                 if entry["last_params"]:
@@ -356,14 +441,16 @@ def build_results(files, tracks_by_file, settings, defaults):
 
             track_mux = {}
             if track_type == "video":
+                track_mux["encoder"] = default_encoder
                 track_mux["zoning"] = default_zoning
                 track_mux["fastpass"] = default_fastpass
                 track_mux["mainpass"] = default_mainpass
                 track_mux["sceneDetection"] = default_scene_detection
                 track_mux["noFastpass"] = "true" if default_no_fastpass else "false"
                 track_mux["fastpassHdr"] = "true" if default_fastpass_hdr else "false"
-                track_mux["noDolbyVision"] = "true" if default_no_dolby_vision else "false"
-                track_mux["noHdr10Plus"] = "true" if default_no_hdr10plus else "false"
+                track_mux["strictSdr8bit"] = "true" if default_strict_sdr_8bit else "false"
+                track_mux["noDolbyVision"] = "true" if default_no_dolby_vision or default_strict_sdr_8bit else "false"
+                track_mux["noHdr10Plus"] = "true" if default_no_hdr10plus or default_strict_sdr_8bit else "false"
                 track_mux["fastpassWorkers"] = default_fastpass_workers
                 track_mux["mainpassWorkers"] = default_mainpass_workers
                 track_mux["workers"] = default_fastpass_workers
@@ -446,11 +533,13 @@ class TrackConfigGui:
             scene_detection=defaults_raw.get("sceneDetection") or defaults_raw.get("scene_detection") or "",
             no_fastpass=defaults_raw.get("noFastpass") or defaults_raw.get("no_fastpass") or False,
             fastpass_hdr=defaults_raw["fastpassHdr"] if "fastpassHdr" in defaults_raw else defaults_raw.get("fastpass_hdr", True),
+            strict_sdr_8bit=defaults_raw.get("strictSdr8bit") if "strictSdr8bit" in defaults_raw else defaults_raw.get("strict_sdr_8bit", False),
             no_dolby_vision=defaults_raw.get("noDolbyVision") or defaults_raw.get("no_dolby_vision") or False,
             no_hdr10plus=defaults_raw.get("noHdr10Plus") or defaults_raw.get("no_hdr10plus") or False,
             fastpass_workers=defaults_raw.get("fastpassWorkers") or defaults_raw.get("fastpass_workers") or "",
             mainpass_workers=defaults_raw.get("mainpassWorkers") or defaults_raw.get("mainpass_workers") or "",
             workers=defaults_raw.get("workers") or "",
+            encoder=defaults_raw.get("encoder") or DEFAULT_VIDEO_ENCODER,
             ab_multiplier=defaults_raw.get("abMultiplier") or defaults_raw.get("ab_multiplier") or "",
             ab_pos_dev=defaults_raw.get("abPosDev") or defaults_raw.get("ab_pos_dev") or "",
             ab_neg_dev=defaults_raw.get("abNegDev") or defaults_raw.get("ab_neg_dev") or "",
@@ -550,8 +639,10 @@ class TrackConfigGui:
         self.default_fastpass_var = tk.StringVar(value=self.defaults.fastpass)
         self.default_mainpass_var = tk.StringVar(value=self.defaults.mainpass)
         self.scene_detection_var = tk.StringVar(value=self.defaults.scene_detection or "av1an")
+        self.encoder_var = tk.StringVar(value=self.defaults.encoder or DEFAULT_VIDEO_ENCODER)
         self.no_fastpass_var = tk.BooleanVar(value=bool(self.defaults.no_fastpass))
         self.fastpass_hdr_var = tk.BooleanVar(value=bool(self.defaults.fastpass_hdr))
+        self.strict_sdr_8bit_var = tk.BooleanVar(value=bool(self.defaults.strict_sdr_8bit))
         self.no_dolby_vision_var = tk.BooleanVar(value=bool(self.defaults.no_dolby_vision))
         self.no_hdr10plus_var = tk.BooleanVar(value=bool(self.defaults.no_hdr10plus))
         self.fastpass_workers_var = tk.StringVar(value=self.defaults.fastpass_workers or self.defaults.workers)
@@ -605,6 +696,12 @@ class TrackConfigGui:
         )
         row += 1
 
+        ttk.Label(frame, text="encoder").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Combobox(frame, textvariable=self.encoder_var, values=VIDEO_ENCODER_OPTIONS, width=57, state="readonly").grid(
+            row=row, column=1, sticky=tk.W, pady=2
+        )
+        row += 1
+
         ttk.Checkbutton(frame, text="no fastpass", variable=self.no_fastpass_var).grid(
             row=row, column=1, sticky=tk.W, pady=2
         )
@@ -612,6 +709,9 @@ class TrackConfigGui:
 
         ttk.Checkbutton(frame, text="fastpass HDR", variable=self.fastpass_hdr_var).grid(
             row=row, column=1, sticky=tk.W, pady=2
+        )
+        ttk.Checkbutton(frame, text="Strict SDR 8bit", variable=self.strict_sdr_8bit_var).grid(
+            row=row, column=2, sticky=tk.W, padx=(12, 0), pady=2
         )
         row += 1
 
@@ -667,8 +767,10 @@ class TrackConfigGui:
         self.default_fastpass_var.trace_add("write", self.on_defaults_change)
         self.default_mainpass_var.trace_add("write", self.on_defaults_change)
         self.scene_detection_var.trace_add("write", self.on_defaults_change)
+        self.encoder_var.trace_add("write", self.on_defaults_change)
         self.no_fastpass_var.trace_add("write", self.on_defaults_change)
         self.fastpass_hdr_var.trace_add("write", self.on_defaults_change)
+        self.strict_sdr_8bit_var.trace_add("write", self.on_defaults_change)
         self.no_dolby_vision_var.trace_add("write", self.on_defaults_change)
         self.no_hdr10plus_var.trace_add("write", self.on_defaults_change)
         self.fastpass_workers_var.trace_add("write", self.on_defaults_change)
@@ -878,8 +980,10 @@ class TrackConfigGui:
             fastpass=self._get_var_value("default_fastpass_var"),
             mainpass=self._get_var_value("default_mainpass_var"),
             scene_detection=self._get_var_value("scene_detection_var"),
+            encoder=self._get_var_value("encoder_var"),
             no_fastpass=bool(getattr(self, "no_fastpass_var", tk.BooleanVar(value=False)).get()),
             fastpass_hdr=bool(getattr(self, "fastpass_hdr_var", tk.BooleanVar(value=True)).get()),
+            strict_sdr_8bit=bool(getattr(self, "strict_sdr_8bit_var", tk.BooleanVar(value=False)).get()),
             no_dolby_vision=bool(getattr(self, "no_dolby_vision_var", tk.BooleanVar(value=False)).get()),
             no_hdr10plus=bool(getattr(self, "no_hdr10plus_var", tk.BooleanVar(value=False)).get()),
             fastpass_workers=self._get_var_value("fastpass_workers_var"),
@@ -1127,6 +1231,7 @@ class TrackConfigGui:
         result, _ = build_results(self.files, self.tracks_by_file, self.settings, self.defaults)
         missing = []
         mismatch = []
+        encoder_conflicts = []
         for file_path, tracks in result.items():
             for t in tracks:
                 t_type = normalize_type(t.get("type") or "")
@@ -1146,12 +1251,25 @@ class TrackConfigGui:
                         same = (fast_crf == main_crf)
                     if not same:
                         mismatch.append(f"{os.path.basename(file_path)} (trackId={t.get('trackId')})")
+                encoder = normalize_encoder((t.get("trackMux") or {}).get("encoder"))
+                conflicts = find_encoder_param_conflicts(encoder, track_param)
+                if conflicts:
+                    encoder_conflicts.append(
+                        f"{os.path.basename(file_path)} (trackId={t.get('trackId')}): " + ", ".join(conflicts)
+                    )
 
         if missing:
             messagebox.showwarning(
                 "CRF required",
                 "Specify --crf in params or last params for video EDIT.\n"
                 "Missing --crf for:\n  " + "\n  ".join(missing),
+            )
+            return
+        if encoder_conflicts:
+            messagebox.showwarning(
+                "Encoder params mismatch",
+                "Selected encoder has incompatible video params.\n"
+                "Fix or remove these params before applying:\n  " + "\n  ".join(encoder_conflicts),
             )
             return
         if mismatch:

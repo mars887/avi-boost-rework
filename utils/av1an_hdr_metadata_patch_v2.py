@@ -46,6 +46,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,80 @@ from typing import Any, Dict, List, Optional, Tuple
 LOG = logging.getLogger("av1an_hdrmeta_patch")
 STATE_DIR_NAME = ".state"
 HDR_PATCH_MARKER = "HDR_PATCH_DONE"
+DEFAULT_ENCODER = "svt-av1"
+_MASTER_DISPLAY_PATTERN = re.compile(
+    r"^G\((?P<gx>[0-9.]+),(?P<gy>[0-9.]+)\)"
+    r"B\((?P<bx>[0-9.]+),(?P<by>[0-9.]+)\)"
+    r"R\((?P<rx>[0-9.]+),(?P<ry>[0-9.]+)\)"
+    r"WP\((?P<wpx>[0-9.]+),(?P<wpy>[0-9.]+)\)"
+    r"L\((?P<max_l>[0-9.]+),(?P<min_l>[0-9.]+)\)$"
+)
+
+
+def _normalize_x265_value(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-")
+
+
+def normalize_x265_colorprim(value: Any) -> Optional[str]:
+    v = _normalize_x265_value(value)
+    if not v:
+        return None
+    mapping = {
+        "bt709": "bt709",
+        "bt2020": "bt2020",
+        "display-p3": "smpte432",
+        "display p3": "smpte432",
+        "p3-d65": "smpte432",
+        "p3 d65": "smpte432",
+        "smpte432": "smpte432",
+    }
+    return mapping.get(v, v)
+
+
+def normalize_x265_transfer(value: Any) -> Optional[str]:
+    v = _normalize_x265_value(value)
+    if not v:
+        return None
+    mapping = {
+        "pq": "smpte2084",
+        "smpte2084": "smpte2084",
+        "hlg": "arib-std-b67",
+        "arib-std-b67": "arib-std-b67",
+    }
+    return mapping.get(v, v)
+
+
+def normalize_x265_matrix(value: Any) -> Optional[str]:
+    v = _normalize_x265_value(value)
+    if not v:
+        return None
+    mapping = {
+        "bt2020-ncl": "bt2020nc",
+        "bt2020 non-constant": "bt2020nc",
+        "bt2020nc": "bt2020nc",
+        "bt2020-cl": "bt2020c",
+        "bt2020 constant": "bt2020c",
+        "bt2020c": "bt2020c",
+    }
+    return mapping.get(v, v)
+
+
+def normalize_x265_range(value: Any) -> Optional[str]:
+    v = _normalize_x265_value(value)
+    if not v:
+        return None
+    mapping = {
+        "tv": "limited",
+        "mpeg": "limited",
+        "studio": "limited",
+        "video": "limited",
+        "limited": "limited",
+        "pc": "full",
+        "jpeg": "full",
+        "data": "full",
+        "full": "full",
+    }
+    return mapping.get(v, v)
 
 
 # --------------------------
@@ -282,6 +357,17 @@ def dump_json(path: Path, obj: Any) -> None:
     path.write_text(json.dumps(obj, indent=4, ensure_ascii=False), encoding="utf-8")
 
 
+def normalize_encoder(value: Optional[str], *, default: str = DEFAULT_ENCODER) -> str:
+    raw = str(value or "").strip().lower().replace("_", "-")
+    if raw in ("", "auto", "default"):
+        raw = default
+    if raw == "svt-av1":
+        return "svt-av1"
+    if raw in ("x265", "libx265"):
+        return "x265"
+    raise ValueError(f"Unsupported encoder: {value!r}")
+
+
 def upsert_flag_value(params: List[str], flag: str, value: str) -> List[str]:
     """
     Idempotent:
@@ -374,6 +460,88 @@ def build_hdr10_static_params(
     return params
 
 
+def convert_mastering_display_to_x265(raw_value: Optional[str]) -> Optional[str]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+    match = _MASTER_DISPLAY_PATTERN.match(text)
+    if not match:
+        return None
+
+    def scale_coord(group: str) -> int:
+        return int(round(float(match.group(group)) * 50000.0))
+
+    def scale_luminance(group: str) -> int:
+        return int(round(float(match.group(group)) * 10000.0))
+
+    return (
+        f"G({scale_coord('gx')},{scale_coord('gy')})"
+        f"B({scale_coord('bx')},{scale_coord('by')})"
+        f"R({scale_coord('rx')},{scale_coord('ry')})"
+        f"WP({scale_coord('wpx')},{scale_coord('wpy')})"
+        f"L({scale_luminance('max_l')},{scale_luminance('min_l')})"
+    )
+
+
+def build_x265_hdr10_static_params(
+    static: Hdr10Static,
+    *,
+    add_enable_hdr: bool,
+    require_hdr_signal: bool = False,
+) -> List[str]:
+    has_hdr_signal = hdr10_static_has_hdr_signal(static)
+    if require_hdr_signal and not has_hdr_signal:
+        return []
+
+    params: List[str] = []
+    if has_hdr_signal or (add_enable_hdr and not require_hdr_signal):
+        params.append("--hdr10")
+    if static.color_primaries:
+        value = normalize_x265_colorprim(static.color_primaries)
+        if value:
+            params.extend(["--colorprim", value])
+    if static.transfer_characteristics:
+        value = normalize_x265_transfer(static.transfer_characteristics)
+        if value:
+            params.extend(["--transfer", value])
+    if static.matrix_coefficients:
+        value = normalize_x265_matrix(static.matrix_coefficients)
+        if value:
+            params.extend(["--colormatrix", value])
+    if static.color_range:
+        value = normalize_x265_range(static.color_range)
+        if value:
+            params.extend(["--range", value])
+
+    master_display = convert_mastering_display_to_x265(static.mastering_display)
+    if master_display:
+        params.extend(["--master-display", master_display])
+    if static.content_light:
+        params.extend(["--max-cll", static.content_light])
+    return params
+
+
+def build_hdr10_static_params_for_encoder(
+    static: Hdr10Static,
+    *,
+    encoder: str,
+    add_enable_hdr: bool,
+    require_hdr_signal: bool = False,
+) -> List[str]:
+    normalized = normalize_encoder(encoder)
+    if normalized == "x265":
+        return build_x265_hdr10_static_params(
+            static,
+            add_enable_hdr=add_enable_hdr,
+            require_hdr_signal=require_hdr_signal,
+        )
+    return build_hdr10_static_params(
+        static,
+        add_enable_hdr=add_enable_hdr,
+        require_hdr_signal=require_hdr_signal,
+    )
+
+
 def apply_flag_pairs(params: List[str], flag_pairs: List[str]) -> List[str]:
     out = params[:]
     for idx in range(0, len(flag_pairs), 2):
@@ -393,6 +561,13 @@ def build_hdr10_static_payload(static: Hdr10Static, *, add_enable_hdr: bool) -> 
         ),
         "static": asdict(static),
     }
+
+
+def hdr10plus_flag_for_encoder(encoder: str) -> str:
+    normalized = normalize_encoder(encoder)
+    if normalized == "x265":
+        return "--dhdr10-info"
+    return "--hdr10plus-json"
 
 
 def ffprobe_json(
@@ -781,12 +956,14 @@ def patch_hdr10_static_inplace(
     scenes_data: Dict[str, Any],
     static: Hdr10Static,
     *,
+    encoder: str,
     add_enable_hdr: bool,
 ) -> int:
     keys = iter_scene_sections(scenes_data)
     patched = 0
-    static_params = build_hdr10_static_params(
+    static_params = build_hdr10_static_params_for_encoder(
         static,
+        encoder=encoder,
         add_enable_hdr=add_enable_hdr,
         require_hdr_signal=False,
     )
@@ -877,11 +1054,13 @@ def unique_scene_ranges(scenes_data: Dict[str, Any]) -> List[Tuple[int, int]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Patch av1an scenes.json to pass HDR10/HDR10+/Dolby Vision metadata per-scene (svt-av1 flags)."
+        description="Patch av1an scenes.json to pass HDR10/HDR10+/Dolby Vision metadata per-scene."
     )
 
     parser.add_argument("--source", required=True, help="Source file (used to extract all metadata).")
     parser.add_argument("--scenes", required=False, help="Input av1an scenes.json (generated by av1an --sc-only).")
+    parser.add_argument("--encoder", default=DEFAULT_ENCODER,
+                        help="Target encoder for per-scene params: svt-av1 (default), libx265/x265.")
 
     parser.add_argument("--workdir", default="hdrmeta_work", help="Work directory for extracted/chunk metadata.")
     parser.add_argument("--output", default="scenes_patched.json", help="Output scenes.json filename (inside workdir).")
@@ -902,6 +1081,7 @@ def main() -> None:
     parser.add_argument("--verbose", action="store_true", help="Verbose logging.")
 
     args = parser.parse_args()
+    args.encoder = normalize_encoder(args.encoder)
 
     source = Path(args.source).resolve()
     if not source.exists():
@@ -955,6 +1135,7 @@ def main() -> None:
         patched = patch_hdr10_static_inplace(
             scenes_data,
             static,
+            encoder=str(args.encoder),
             add_enable_hdr=bool(args.hdr10_add_enable_hdr),
         )
         LOG.info("HDR10 static patched scenes: %d", patched)
@@ -995,7 +1176,11 @@ def main() -> None:
                 else:
                     LOG.warning("HDR10+ chunk skipped for %d-%d", start, end)
 
-            patched = patch_per_scene_file_flag(scenes_data, "--hdr10plus-json", hdr10plus_map)
+            patched = patch_per_scene_file_flag(
+                scenes_data,
+                hdr10plus_flag_for_encoder(str(args.encoder)),
+                hdr10plus_map,
+            )
             LOG.info("HDR10+ patched scenes: %d", patched)
 
         except Exception as e:

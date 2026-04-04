@@ -269,8 +269,10 @@ private fun buildGuiDefaults(): GuiDefaults {
         mainpass = "",
         sceneDetection = "av1an",
         noFastpass = false,
+        strictSdr8bit = false,
         fastpassWorkers = "8",
         mainpassWorkers = "8",
+        encoder = "svt-av1",
         abMultiplier = "0.7",
         abPosDev = "5",
         abNegDev = "4",
@@ -361,6 +363,11 @@ private fun buildGuiDefaultsFromPerFileBat(batFile: File): GuiDefaults {
     val fastPreset = extractFlagValue(lines, "--fast-preset")
     val mainPreset = extractFlagValue(lines, "--preset")
     val noFastpass = lines.any { it.contains("--no-fastpass", ignoreCase = true) }
+    val strictSdr8bit = parseBooleanValue(envValue(env, "STRICT_SDR_8BIT"))
+        ?: (
+            extractFlagValue(lines, "--pix-format")?.equals("yuv420p", ignoreCase = true) == true &&
+                hasFlag(lines, "--no-hdr10")
+            )
 
     val params = buildParamsFromBat(envValue(env, "FASTPASS"), quality, fastPreset)
     val lastParams = buildParamsFromBat(envValue(env, "MAINPASS"), quality, mainPreset)
@@ -370,6 +377,12 @@ private fun buildGuiDefaultsFromPerFileBat(batFile: File): GuiDefaults {
 
     val sceneDetection = envValue(env, "SCENE_DETECTION")
         ?: extractFlagValue(lines, "--sdm")?.takeIf { !it.contains("%") }
+    val encoder = normalizeVideoEncoder(
+        envValue(env, "VIDEO_ENCODER")
+            ?: envValue(env, "AV1AN_ENCODER")
+            ?: extractFlagValue(lines, "--encoder")
+            ?: extractFlagValue(lines, "-e")
+    )
 
     return GuiDefaults(
         params = params ?: base.params,
@@ -379,8 +392,10 @@ private fun buildGuiDefaultsFromPerFileBat(batFile: File): GuiDefaults {
         mainpass = envValue(env, "MAINPASS_VF") ?: base.mainpass,
         sceneDetection = sceneDetection ?: base.sceneDetection,
         noFastpass = noFastpass,
+        strictSdr8bit = strictSdr8bit,
         fastpassWorkers = envValue(env, "FASTPASS_WORKERS") ?: base.fastpassWorkers,
         mainpassWorkers = envValue(env, "MAINPASS_WORKERS") ?: base.mainpassWorkers,
+        encoder = encoder ?: base.encoder,
         abMultiplier = envValue(env, "AB_MULTIPIER")
             ?: envValue(env, "AB_MULTIPLIER")
             ?: base.abMultiplier,
@@ -415,6 +430,20 @@ private fun parseBatEnv(lines: List<String>): Map<String, String> {
 private fun envValue(env: Map<String, String>, key: String): String? {
     val upperKey = key.uppercase()
     return if (env.containsKey(upperKey)) env[upperKey] ?: "" else null
+}
+
+private fun parseBooleanValue(value: String?): Boolean? {
+    val normalized = value?.trim()?.lowercase() ?: return null
+    return when (normalized) {
+        "1", "true", "yes", "on" -> true
+        "0", "false", "no", "off" -> false
+        else -> false
+    }
+}
+
+private fun hasFlag(lines: List<String>, flag: String): Boolean {
+    val regex = Regex("""(?:^|\s)${Regex.escape(flag)}(?:\s|$)""", RegexOption.IGNORE_CASE)
+    return lines.any { regex.containsMatchIn(it.trim()) }
 }
 
 private fun extractFlagValue(lines: List<String>, flag: String): String? {
@@ -475,6 +504,16 @@ private fun formatParamValue(value: String): String {
     if (trimmed.isEmpty()) return trimmed
     if (trimmed.startsWith("\"") && trimmed.endsWith("\"")) return trimmed
     return if (trimmed.any { it.isWhitespace() }) "\"$trimmed\"" else trimmed
+}
+
+private fun normalizeVideoEncoder(value: String?): String? {
+    val normalized = value?.trim()?.lowercase()?.replace("_", "-") ?: return null
+    return when (normalized) {
+        "", "auto", "default" -> null
+        "svt-av1" -> "svt-av1"
+        "x265", "libx265" -> "libx265"
+        else -> null
+    }
 }
 
 private fun readZoneEdit(workdir: String?, batFile: File): String? {
@@ -676,8 +715,10 @@ private data class GuiDefaults(
     val mainpass: String,
     val sceneDetection: String,
     val noFastpass: Boolean,
+    val strictSdr8bit: Boolean,
     val fastpassWorkers: String,
     val mainpassWorkers: String,
+    val encoder: String,
     val abMultiplier: String,
     val abPosDev: String,
     val abNegDev: String,
