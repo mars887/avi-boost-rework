@@ -20,6 +20,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.plan_model import resolve_file_plan
+
 
 MIN_BYTES_SUB = 0          # subtitles can be tiny
 MIN_BYTES_ATTACHMENT = 16
@@ -324,10 +330,12 @@ def is_skip(status: str) -> bool:
 
 
 def verify_video(workdir: Path, tracks: List[Dict[str, Any]], ffprobe: Optional[str]) -> Tuple[Optional[Path], int]:
-    # If any video track is not SKIP -> expect video-final.mkv
-    need_video = any(norm_type(str(t.get("type") or "")) == "video" and not is_skip(str(t.get("trackStatus") or "")) for t in tracks)
-    if not need_video:
-        print("[verify] video: no active video tracks => skip video-final check")
+    need_video_final = any(
+        norm_type(str(t.get("type") or "")) == "video" and str(t.get("trackStatus") or "").strip().upper() == "EDIT"
+        for t in tracks
+    )
+    if not need_video_final:
+        print("[verify] video: no EDIT video tracks => skip video-final check")
         return None, 0
 
     vpath = workdir / "video" / "video-final.mkv"
@@ -507,17 +515,30 @@ def verify_duration_consistency(
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="verify")
-    ap.add_argument("--source", required=True)
-    ap.add_argument("--workdir", required=True)
-    ap.add_argument("--tracksData", required=True, help="Relative is relative to --workdir")
+    ap.add_argument("--plan", default="")
+    ap.add_argument("--source", default="")
+    ap.add_argument("--workdir", default="")
+    ap.add_argument("--tracksData", default="", help="Relative is relative to --workdir")
     ap.add_argument("--ffprobe", default="ffprobe", help="Optional; used if available")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
     args = ap.parse_args(argv)
 
-    source = Path(args.source)
-    workdir = Path(args.workdir)
+    if args.plan:
+        resolved_plan = resolve_file_plan(Path(args.plan))
+        source = resolved_plan.paths.source
+        workdir = resolved_plan.paths.workdir
+        tracks = resolved_plan.legacy_tracks()
+        tracks_path = resolved_plan.paths.plan_path
+    else:
+        if not args.source or not args.workdir or not args.tracksData:
+            eprint("[verify] ERROR: Either --plan or (--source, --workdir, --tracksData) is required.")
+            return 2
+        source = Path(args.source)
+        workdir = Path(args.workdir)
+        tracks_path = resolve_rel_to_workdir(workdir, args.tracksData)
+        tracks = []
+
     setup_logging(args.log, workdir)
-    tracks_path = resolve_rel_to_workdir(workdir, args.tracksData)
     marker = marker_path(workdir)
     if marker.exists():
         print(f"[verify] skip: marker exists: {marker}")
@@ -547,8 +568,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             print("[verify] ffprobe: not found => media-structure checks will be skipped")
 
-        tracks_json = read_json(tracks_path)
-        tracks = parse_tracks(tracks_json)
+        if not args.plan:
+            tracks_json = read_json(tracks_path)
+            tracks = parse_tracks(tracks_json)
 
         # 1) demux artifacts if manifest exists
         verify_demux_outputs(workdir, source, ffprobe)

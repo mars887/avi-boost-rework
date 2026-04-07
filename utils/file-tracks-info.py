@@ -6,6 +6,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.plan_model import build_summary_rows, probe_source_tracks
+
 
 def run_mkvmerge(path: Path) -> Optional[Dict[str, Any]]:
     """Run mkvmerge and return parsed JSON, or None on error."""
@@ -189,11 +195,35 @@ def main():
         description="Print track info for media files using mkvmerge."
     )
     parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Output machine-readable JSON instead of human-readable text.",
+    )
+    parser.add_argument(
         "files",
         nargs="+",
         help="Input media files (mkv, mp4, etc.)",
     )
     args = parser.parse_args()
+
+    if args.json_output:
+        source_paths: List[Path] = []
+        summary_tracks: Dict[int, List[Any]] = {}
+        for index, raw in enumerate(args.files, start=1):
+            path = Path(raw)
+            if not path.exists():
+                print(f"File not found: {path}", file=sys.stderr)
+                continue
+            source_paths.append(path)
+            summary_tracks[len(source_paths)] = probe_source_tracks(path)
+        payload = {
+            "files": [str(path) for path in source_paths],
+            "tracksByFile": {str(idx): [track.__dict__ for track in tracks] for idx, tracks in summary_tracks.items()},
+            "summary": build_summary_rows(source_paths, summary_tracks),
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
 
     for f in args.files:
         path = Path(f)

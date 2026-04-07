@@ -15,6 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.plan_model import normalize_track_type, resolve_file_plan
+
 
 NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
 CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
@@ -234,6 +240,40 @@ def validate_tracks_json(obj: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def validate_resolved_plan_tracks(tracks: List[Dict[str, Any]]) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(tracks, list):
+        return ["plan: invalid track list"]
+    for i, t in enumerate(tracks):
+        if not isinstance(t, dict):
+            errors.append(f"plan: track[{i}] not an object")
+            continue
+        if "trackId" not in t:
+            errors.append(f"plan: track[{i}] missing trackId")
+        if "type" not in t:
+            errors.append(f"plan: track[{i}] missing type")
+        if "trackStatus" not in t:
+            errors.append(f"plan: track[{i}] missing trackStatus")
+    return errors
+
+
+def build_plan_cfg(resolved_plan: Any) -> BatConfig:
+    primary = resolved_plan.plan.video.primary
+    details = resolved_plan.plan.video.details
+    return BatConfig(
+        fastpass_workers=int(primary.fastpass_workers),
+        mainpass_workers=int(primary.mainpass_workers),
+        ab_multiplier=float(primary.ab_multiplier),
+        ab_pos_dev=float(primary.ab_pos_dev),
+        ab_neg_dev=float(primary.ab_neg_dev),
+        quality=float(primary.quality),
+        fastpass=resolved_plan.build_fastpass_params_text(),
+        mainpass=resolved_plan.build_mainpass_params_text(),
+        fastpass_vf=str(details.fastpass_filter or ""),
+        mainpass_vf=str(details.mainpass_filter or ""),
+    )
+
+
 def check_zone_syntax(zone_path: Path, source: Path) -> Tuple[List[str], List[str]]:
     errors: List[str] = []
     warnings: List[str] = []
@@ -431,7 +471,8 @@ def run_param_check(source: Path, params: List[str]) -> Tuple[bool, str]:
 
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(description="Batch config verifier")
-    ap.add_argument("--source", required=True)
+    ap.add_argument("--plan", default="")
+    ap.add_argument("--source", default="")
     ap.add_argument("--workdir", default="")
     ap.add_argument("--per-file-bat", default="")
     ap.add_argument("--result-mkv", default="")
@@ -443,31 +484,42 @@ def main(argv: List[str]) -> int:
     errors: List[str] = []
     warnings: List[str] = []
 
-    source = Path(args.source)
+    resolved_plan = None
+    if args.plan:
+        resolved_plan = resolve_file_plan(Path(args.plan))
+        source = resolved_plan.paths.source
+        workdir = resolved_plan.paths.workdir
+        bat_cfg = build_plan_cfg(resolved_plan)
+        errors.extend(validate_resolved_plan_tracks(resolved_plan.legacy_tracks()))
+        zone_path = resolved_plan.paths.zone_file
+    else:
+        source = Path(args.source)
+        workdir = Path(args.workdir) if args.workdir else Path()
+        zone_path = workdir / "zone_edit_command.txt" if args.workdir else Path()
+        bat_cfg = None
+
     if not source.exists():
         errors.append(f"source missing: {source}")
 
-    bat_cfg: Optional[BatConfig] = None
-    if args.per_file_bat:
+    if args.per_file_bat and resolved_plan is None:
         bat_cfg, errs, warns = validate_bat(Path(args.per_file_bat))
         errors.extend(errs)
         warnings.extend(warns)
 
-    if args.workdir:
-        workdir = Path(args.workdir)
+    if args.workdir or resolved_plan is not None:
         if not workdir.exists():
             warnings.append(f"workdir missing: {workdir}")
-        tracks_path = workdir / "tracks.json"
-        if tracks_path.exists():
-            try:
-                obj = load_json(tracks_path)
-                errors.extend(validate_tracks_json(obj))
-            except Exception as exc:
-                errors.append(str(exc))
-        else:
-            warnings.append(f"tracks.json missing: {tracks_path}")
+        if resolved_plan is None:
+            tracks_path = workdir / "tracks.json"
+            if tracks_path.exists():
+                try:
+                    obj = load_json(tracks_path)
+                    errors.extend(validate_tracks_json(obj))
+                except Exception as exc:
+                    errors.append(str(exc))
+            else:
+                warnings.append(f"tracks.json missing: {tracks_path}")
 
-        zone_path = workdir / "zone_edit_command.txt"
         if source.exists():
             z_errs, z_warns = check_zone_syntax(zone_path, source)
             errors.extend(z_errs)

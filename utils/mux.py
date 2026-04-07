@@ -38,6 +38,12 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.plan_model import resolve_file_plan
+
 
 # ---------------------------
 # utils
@@ -821,14 +827,20 @@ def pick_video_track_mux(tracks: List[Dict[str, Any]]) -> Dict[str, Any]:
             return tmux
     return {}
 
-def prepare_global_tags(workdir: Path, source: Path, tracks: List[Dict[str, Any]]) -> Tuple[Optional[Path], List[Dict[str, str]]]:
+def prepare_global_tags(
+    workdir: Path,
+    source: Path,
+    tracks: List[Dict[str, Any]],
+    *,
+    encode_params_text: Optional[str] = None,
+) -> Tuple[Optional[Path], List[Dict[str, str]]]:
     video_track_mux = pick_video_track_mux(tracks)
     if not parse_bool_flag(video_track_mux.get("attachEncodeInfo")):
         return None, []
 
     tags: List[Tuple[str, str]] = []
 
-    encode_params = build_encode_params_text(source.with_suffix(".bat"))
+    encode_params = encode_params_text or build_encode_params_text(source.with_suffix(".bat"))
     if encode_params:
         tags.append(("Encode Params", encode_params))
 
@@ -1163,15 +1175,26 @@ def build_mux_command(
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="mux")
-    ap.add_argument("--source", required=True)
-    ap.add_argument("--workdir", required=True)
+    ap.add_argument("--plan", default="")
+    ap.add_argument("--source", default="")
+    ap.add_argument("--workdir", default="")
     ap.add_argument("--mkvmerge", default="mkvmerge", help="Path to mkvmerge (MKVToolNix)")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
     ap.add_argument("--no-source-bitrate", action="store_true", help="Skip per-scene source bitrate calculation.")
     args = ap.parse_args(argv)
 
-    source = Path(args.source)
-    workdir = Path(args.workdir)
+    resolved_plan = None
+    if args.plan:
+        resolved_plan = resolve_file_plan(Path(args.plan))
+        source = resolved_plan.paths.source
+        workdir = resolved_plan.paths.workdir
+    else:
+        if not args.source or not args.workdir:
+            eprint("[mux] ERROR: Either --plan or (--source, --workdir) is required.")
+            return 2
+        source = Path(args.source)
+        workdir = Path(args.workdir)
+
     mkvmerge = which_or(args.mkvmerge)
     setup_logging(args.log, workdir)
     marker = marker_path(workdir)
@@ -1191,8 +1214,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         update_scene_bitrates(workdir, source, include_source=(not args.no_source_bitrate))
 
-        tracks = load_tracks(workdir)
-        global_tags_path, global_tags = prepare_global_tags(workdir, source, tracks)
+        tracks = resolved_plan.legacy_tracks() if resolved_plan is not None else load_tracks(workdir)
+        global_tags_path, global_tags = prepare_global_tags(
+            workdir,
+            source,
+            tracks,
+            encode_params_text=(resolved_plan.build_encode_params_text() if resolved_plan is not None else None),
+        )
 
         cmd, plan = build_mux_command(mkvmerge, source, workdir, tracks, global_tags_path=global_tags_path)
 

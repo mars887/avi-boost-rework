@@ -1,9 +1,28 @@
+import argparse
 import json
 import os
 import shlex
 import sys
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk, messagebox
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.plan_model import (
+    build_summary_rows,
+    create_default_file_plan,
+    file_plan_from_gui_result,
+    gui_defaults_from_file_plan,
+    gui_settings_from_file_plan,
+    load_file_plan,
+    plan_path_for_source,
+    probe_source_tracks,
+    resolve_paths,
+    save_plan,
+)
 
 
 TYPE_OPTIONS = ["auto", "video", "audio", "sub"]
@@ -527,11 +546,86 @@ def build_results(files, tracks_by_file, settings, defaults):
     return result, lines
 
 
+def build_default_defaults_dict():
+    return {
+        "params": "--variance-boost-strength 2 --variance-octile 6 --variance-boost-curve 3 --tune 0 --qm-min 7 --chroma-qm-min 10 --scm 0 --enable-dlf 2 --sharp-tx 1 --enable-restoration 0 --color-primaries 9 --transfer-characteristics 16 --matrix-coefficients 9 --lp 3 --sharpness 1 --hbd-mds 1 --ac-bias 2.00 --crf 30",
+        "last_params": "--film-grain 14 --complex-hvs 1 --crf 30",
+        "zoning": "",
+        "fastpass": "",
+        "mainpass": "",
+        "scene_detection": "av1an",
+        "no_fastpass": False,
+        "fastpass_hdr": True,
+        "strict_sdr_8bit": False,
+        "no_dolby_vision": False,
+        "no_hdr10plus": False,
+        "fastpass_workers": "8",
+        "mainpass_workers": "8",
+        "workers": "",
+        "encoder": DEFAULT_VIDEO_ENCODER,
+        "ab_multiplier": "0.7",
+        "ab_pos_dev": "5",
+        "ab_neg_dev": "4",
+        "ab_pos_multiplier": "",
+        "ab_neg_multiplier": "",
+        "main_vpy": "",
+        "fast_vpy": "",
+        "proxy_vpy": "",
+        "attach_encode_info": False,
+        "note": "",
+    }
+
+
+def load_gui_data_from_paths(raw_paths):
+    files = []
+    plan_paths = {}
+    tracks_by_file = {}
+    defaults = build_default_defaults_dict()
+    settings = []
+
+    normalized_paths = [Path(item).expanduser().resolve() for item in raw_paths]
+    if not normalized_paths:
+        raise RuntimeError("No input paths provided")
+
+    for index, path in enumerate(normalized_paths, start=1):
+        if path.suffix.lower() == ".plan":
+            plan = load_file_plan(path)
+            source = resolve_paths(plan, path).source
+            if len(normalized_paths) == 1:
+                defaults.update(gui_defaults_from_file_plan(plan))
+                settings = gui_settings_from_file_plan(plan)
+            plan_paths[str(source)] = str(path)
+            files.append(str(source))
+            tracks_by_file[index] = list(probe_source_tracks(source))
+            continue
+
+        source = path
+        if not source.exists():
+            raise RuntimeError(f"Input file not found: {source}")
+        existing_plan = plan_path_for_source(source)
+        if existing_plan.exists() and len(normalized_paths) == 1:
+            plan = load_file_plan(existing_plan)
+            defaults.update(gui_defaults_from_file_plan(plan))
+            settings = gui_settings_from_file_plan(plan)
+        files.append(str(source))
+        plan_paths[str(source)] = str(existing_plan)
+        tracks_by_file[index] = list(probe_source_tracks(source))
+
+    summary = build_summary_rows([Path(item) for item in files], tracks_by_file)
+    return {
+        "files": files,
+        "summary": summary,
+        "defaults": defaults,
+        "settings": settings,
+        "planPaths": plan_paths,
+        "outputMode": "plans",
+    }
+
+
 class TrackConfigGui:
     def __init__(self, data):
         self.files = data.get("files") or []
         self.summary = data.get("summary") or []
-        self.settings = []
         defaults_raw = data.get("defaults") or {}
         self.defaults = DefaultSettings(
             params=defaults_raw.get("params") or "",
@@ -560,6 +654,9 @@ class TrackConfigGui:
             attach_encode_info=defaults_raw["attachEncodeInfo"] if "attachEncodeInfo" in defaults_raw else defaults_raw.get("attach_encode_info", False),
             note=defaults_raw.get("note") or "",
         )
+        self.plan_paths = data.get("planPaths") or {}
+        self.output_mode = data.get("outputMode") or "plans"
+        self.settings = list(data.get("settings") or [])
 
         self.match_tracks = []
         for row in self.summary:
@@ -1303,7 +1400,55 @@ class TrackConfigGui:
                 "CRF mismatch",
                 "Different --crf values in params and last params for:\n  " + "\n  ".join(mismatch),
             )
-        payload = {"status": "ok", "result": result}
+        if self.output_mode == "json":
+            payload = {"status": "ok", "result": result}
+            sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+            sys.stdout.flush()
+            self.root.destroy()
+            return
+
+        defaults_map = {
+            "params": self.defaults.params,
+            "last_params": self.defaults.last_params,
+            "zoning": self.defaults.zoning,
+            "fastpass_filter": self.defaults.fastpass,
+            "mainpass_filter": self.defaults.mainpass,
+            "scene_detection": self.defaults.scene_detection,
+            "no_fastpass": self.defaults.no_fastpass,
+            "fastpass_hdr": self.defaults.fastpass_hdr,
+            "strict_sdr_8bit": self.defaults.strict_sdr_8bit,
+            "no_dolby_vision": self.defaults.no_dolby_vision,
+            "no_hdr10plus": self.defaults.no_hdr10plus,
+            "fastpass_workers": self.defaults.fastpass_workers,
+            "mainpass_workers": self.defaults.mainpass_workers,
+            "encoder": self.defaults.encoder,
+            "ab_multiplier": self.defaults.ab_multiplier,
+            "ab_pos_dev": self.defaults.ab_pos_dev,
+            "ab_neg_dev": self.defaults.ab_neg_dev,
+            "ab_pos_multiplier": self.defaults.ab_pos_multiplier,
+            "ab_neg_multiplier": self.defaults.ab_neg_multiplier,
+            "main_vpy": self.defaults.main_vpy,
+            "fast_vpy": self.defaults.fast_vpy,
+            "proxy_vpy": self.defaults.proxy_vpy,
+            "attach_encode_info": self.defaults.attach_encode_info,
+            "note": self.defaults.note,
+        }
+        saved = []
+        for file_path, tracks in result.items():
+            source_path = Path(file_path)
+            plan_path = Path(self.plan_paths.get(file_path) or plan_path_for_source(source_path))
+            plan = file_plan_from_gui_result(
+                source=source_path,
+                defaults=defaults_map,
+                track_results=tracks,
+                plan_path=plan_path,
+            )
+            save_plan(plan, plan_path)
+            resolved = resolve_paths(plan, plan_path)
+            resolved.zone_file.parent.mkdir(parents=True, exist_ok=True)
+            resolved.zone_file.write_text(self.defaults.zoning or "", encoding="utf-8", newline="\n")
+            saved.append(str(plan_path))
+        payload = {"status": "ok", "savedPlans": saved}
         sys.stdout.write(json.dumps(payload, ensure_ascii=False))
         sys.stdout.flush()
         self.root.destroy()
@@ -1319,11 +1464,18 @@ class TrackConfigGui:
 
 
 def main():
-    raw = sys.stdin.read()
-    if not raw.strip():
-        sys.stderr.write("No input provided\n")
-        sys.exit(1)
-    data = json.loads(raw)
+    parser = argparse.ArgumentParser(description="Track config GUI for .plan files.")
+    parser.add_argument("paths", nargs="*")
+    args = parser.parse_args()
+    if args.paths:
+        data = load_gui_data_from_paths(args.paths)
+    else:
+        raw = sys.stdin.read()
+        if not raw.strip():
+            sys.stderr.write("No input provided\n")
+            sys.exit(1)
+        data = json.loads(raw)
+        data.setdefault("outputMode", "json")
     gui = TrackConfigGui(data)
     gui.run()
 

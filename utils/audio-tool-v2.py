@@ -37,6 +37,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO, Tuple
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.plan_model import resolve_file_plan
+
 TOOL_NAME = "audio-tool"
 TOOL_VERSION = "1.2"
 
@@ -628,9 +634,10 @@ def encode_opus_with_opusenc(
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog=TOOL_NAME)
-    ap.add_argument("--source", required=True, help="Path to source MKV")
-    ap.add_argument("--workdir", required=True, help="Episode workdir")
-    ap.add_argument("--tracksData", required=True, help="Path to tracks.json (relative is relative to --workdir)")
+    ap.add_argument("--plan", default="", help="Path to file .plan")
+    ap.add_argument("--source", default="", help="Path to source MKV")
+    ap.add_argument("--workdir", default="", help="Episode workdir")
+    ap.add_argument("--tracksData", default="", help="Path to tracks.json (relative is relative to --workdir)")
 
     ap.add_argument("--ffmpeg", default="ffmpeg")
     ap.add_argument("--ffprobe", default="ffprobe")
@@ -648,10 +655,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = ap.parse_args(argv)
 
-    source = Path(args.source)
-    workdir = Path(args.workdir)
+    resolved_plan = None
+    if args.plan:
+        resolved_plan = resolve_file_plan(Path(args.plan))
+        source = resolved_plan.paths.source
+        workdir = resolved_plan.paths.workdir
+    else:
+        if not args.source or not args.workdir or not args.tracksData:
+            eprint(f"[{TOOL_NAME}] ERROR: Either --plan or (--source, --workdir, --tracksData) is required.")
+            return 2
+        source = Path(args.source)
+        workdir = Path(args.workdir)
     setup_logging(args.log, workdir)
-    tracks_data = Path(args.tracksData)
+    tracks_data = Path(args.tracksData) if args.tracksData else Path()
     marker = marker_path(workdir)
     if marker.exists() and not args.overwrite:
         print(f"[{TOOL_NAME}] skip: marker exists: {marker}")
@@ -667,13 +683,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_error_marker(workdir, "audio_invalid_source_container")
         eprint(f"[{TOOL_NAME}] ERROR: source must be MKV: {source}")
 #         return 2
-
-    if not tracks_data.is_absolute():
-        tracks_data = workdir / tracks_data
-    if not tracks_data.exists():
-        write_error_marker(workdir, "audio_missing_tracksjson")
-        eprint(f"[{TOOL_NAME}] ERROR: tracks.json not found: {tracks_data}")
-        return 2
 
     ffmpeg = which_or_path(args.ffmpeg)
     ffprobe = which_or_path(args.ffprobe)
@@ -706,10 +715,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         machine_log["events"].append({"t": time.time(), **ev})
 
     try:
-        data = read_json(tracks_data)
-        tracks = data.get("tracks") if isinstance(data, dict) else None
-        if not isinstance(tracks, list):
-            raise AudioToolError("invalid_tracksjson", "tracks.json has no 'tracks' array")
+        if resolved_plan is not None:
+            tracks = resolved_plan.legacy_tracks()
+        else:
+            if not tracks_data.is_absolute():
+                tracks_data = workdir / tracks_data
+            if not tracks_data.exists():
+                raise AudioToolError("audio_missing_tracksjson", f"tracks.json not found: {tracks_data}")
+            data = read_json(tracks_data)
+            tracks = data.get("tracks") if isinstance(data, dict) else None
+            if not isinstance(tracks, list):
+                raise AudioToolError("invalid_tracksjson", "tracks.json has no 'tracks' array")
 
         outputs: List[OutputEntry] = []
 
