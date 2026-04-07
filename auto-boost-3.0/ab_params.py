@@ -83,7 +83,7 @@ def normalize_video_params(tokens: List[str]) -> None:
             if cur is None:
                 eprint(f"[warn] --crf value is not numeric: {tokens[k_idx + 1]}")
             else:
-                cur = max(0.0, min(63.0, float(cur)))
+                cur = max(0.0, min(70.0, float(cur)))
                 tokens[k_idx + 1] = f"{cur:.2f}"
         else:
             eprint("[warn] --crf flag present without value.")

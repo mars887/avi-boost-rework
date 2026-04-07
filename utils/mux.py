@@ -28,10 +28,13 @@ import atexit
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -42,6 +45,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 STATE_DIR_NAME = ".state"
 MUX_MARKER = "MUX_DONE"
+CRF_METADATA_STEP = 1.0
 
 class TeeStream:
     def __init__(self, stream, log_file) -> None:
@@ -509,6 +513,347 @@ def bool_yesno(v: Optional[str]) -> Optional[str]:
         return "no"
     return None
 
+def parse_bool_flag(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def read_text_guess(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="cp1251", errors="replace")
+
+def merge_bat_lines(lines: List[str]) -> List[str]:
+    out: List[str] = []
+    buf = ""
+    for raw in lines:
+        line = raw.rstrip()
+        if line.endswith("^"):
+            buf += line[:-1].strip() + " "
+            continue
+        if buf:
+            line = buf + line.strip()
+            buf = ""
+        out.append(line)
+    if buf:
+        out.append(buf)
+    return out
+
+def strip_outer_quotes(value: str) -> str:
+    s = str(value or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+def split_cmd_tokens(value: Any) -> List[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    try:
+        tokens = shlex.split(text, posix=False)
+    except ValueError:
+        tokens = text.split()
+    return [strip_outer_quotes(tok) for tok in tokens if str(tok).strip()]
+
+def parse_bat_vars(lines: List[str]) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    regex = re.compile(r'^\s*set\s+"([^=]+)=(.*)"\s*$', re.IGNORECASE)
+    for raw in lines:
+        match = regex.match(raw)
+        if not match:
+            continue
+        key = match.group(1).strip().upper()
+        value = match.group(2)
+        env[key] = value
+    return env
+
+def extract_flag_value(lines: List[str], flag: str) -> Optional[str]:
+    flag_norm = flag.strip().lower()
+    for line in merge_bat_lines(lines):
+        tokens = split_cmd_tokens(line)
+        for idx, tok in enumerate(tokens):
+            token_norm = tok.lower()
+            if token_norm == flag_norm and idx + 1 < len(tokens):
+                value = strip_outer_quotes(tokens[idx + 1])
+                return value or None
+            if token_norm.startswith(flag_norm + "="):
+                value = strip_outer_quotes(tok.split("=", 1)[1])
+                return value or None
+    return None
+
+def is_param_key(tok: str) -> bool:
+    t = str(tok or "").strip()
+    return t.startswith("--") or t.startswith("-")
+
+def find_last_option(tokens: List[str], key: str) -> Optional[Tuple[int, bool]]:
+    for idx in range(len(tokens) - 1, -1, -1):
+        if tokens[idx] != key:
+            continue
+        has_value = (idx + 1 < len(tokens)) and (not is_param_key(tokens[idx + 1]))
+        return idx, has_value
+    return None
+
+def apply_override(base_tokens: List[str], override_tokens: List[str]) -> List[str]:
+    i = 0
+    while i < len(override_tokens):
+        tok = override_tokens[i]
+        if not is_param_key(tok):
+            i += 1
+            continue
+
+        key = tok
+        has_value = (i + 1 < len(override_tokens)) and (not is_param_key(override_tokens[i + 1]))
+        val = override_tokens[i + 1] if has_value else None
+
+        loc = find_last_option(base_tokens, key)
+        if loc is None:
+            base_tokens.append(key)
+            if val is not None:
+                base_tokens.append(val)
+        else:
+            key_idx, base_has_value = loc
+            if val is None:
+                if base_has_value:
+                    del base_tokens[key_idx + 1]
+            else:
+                if base_has_value:
+                    base_tokens[key_idx + 1] = val
+                else:
+                    base_tokens.insert(key_idx + 1, val)
+
+        i += 2 if has_value else 1
+
+    return base_tokens
+
+def strip_param_tokens(tokens: List[str], keys: List[str]) -> List[str]:
+    keys_set = {str(key) for key in keys}
+    out: List[str] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok in keys_set:
+            has_value = (idx + 1 < len(tokens)) and (not is_param_key(tokens[idx + 1]))
+            idx += 2 if has_value else 1
+            continue
+        out.append(tok)
+        idx += 1
+    return out
+
+def parse_decimal_value(value: Any) -> Optional[Decimal]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return Decimal(text)
+    except Exception:
+        return None
+
+def format_number(value: Any) -> str:
+    dec = parse_decimal_value(value)
+    if dec is None:
+        return str(value)
+    normalized = dec.normalize()
+    text = format(normalized, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+def quantize_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    units = (value / step).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return units * step
+
+def build_encode_params_text(bat_path: Path) -> Optional[str]:
+    if not bat_path.exists():
+        print(f"[warn] per-file bat not found; Encode Params skipped: {bat_path}")
+        return None
+    try:
+        lines = read_text_guess(bat_path).splitlines()
+    except Exception as exc:
+        print(f"[warn] failed to read per-file bat: {exc}")
+        return None
+
+    env = parse_bat_vars(lines)
+    fastpass = split_cmd_tokens(env.get("FASTPASS"))
+    mainpass = split_cmd_tokens(env.get("MAINPASS"))
+    merged = apply_override(list(fastpass), mainpass) if mainpass else list(fastpass)
+    merged = strip_param_tokens(merged, ["--crf", "--preset"])
+
+    quality = strip_outer_quotes(env.get("QUALITY", ""))
+    preset = extract_flag_value(lines, "--preset")
+    if quality:
+        merged.extend(["--crf", quality])
+    if preset:
+        merged.extend(["--preset", preset])
+
+    if not merged:
+        return None
+    return subprocess.list2cmdline(merged)
+
+def extract_scene_crf(scene: Dict[str, Any]) -> Optional[Decimal]:
+    zo = scene.get("zone_overrides")
+    if not isinstance(zo, dict):
+        return None
+    vp = zo.get("video_params")
+    if isinstance(vp, list):
+        tokens = [strip_outer_quotes(str(item)) for item in vp]
+    elif isinstance(vp, str):
+        tokens = split_cmd_tokens(vp)
+    else:
+        return None
+    loc = find_last_option(tokens, "--crf")
+    if loc is None:
+        return None
+    idx, has_value = loc
+    if not has_value or idx + 1 >= len(tokens):
+        return None
+    return parse_decimal_value(tokens[idx + 1])
+
+def build_crf_deviation_text(workdir: Path) -> Optional[str]:
+    scenes_path = workdir / "video" / "scenes-final.json"
+    if not scenes_path.exists():
+        print(f"[warn] scenes-final.json not found; CRF Deviation skipped: {scenes_path}")
+        return None
+
+    try:
+        data = read_json(scenes_path)
+    except Exception as exc:
+        print(f"[warn] failed to read scenes-final.json: {exc}")
+        return None
+
+    scenes = data.get("scenes") if isinstance(data.get("scenes"), list) else None
+    if scenes is None:
+        scenes = data.get("split_scenes") if isinstance(data.get("split_scenes"), list) else None
+    if not scenes:
+        return None
+
+    step = parse_decimal_value(CRF_METADATA_STEP) or Decimal("1.0")
+    buckets: Dict[Decimal, int] = {}
+    total_frames = 0
+    skipped_frames = 0
+
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        try:
+            start_frame = int(scene.get("start_frame"))
+            end_frame = int(scene.get("end_frame"))
+        except Exception:
+            continue
+        frames = max(0, end_frame - start_frame)
+        if frames <= 0:
+            continue
+        crf = extract_scene_crf(scene)
+        if crf is None:
+            skipped_frames += frames
+            continue
+        bucket = quantize_step(crf, step)
+        buckets[bucket] = buckets.get(bucket, 0) + frames
+        total_frames += frames
+
+    if skipped_frames:
+        print(f"[warn] CRF Deviation skipped {skipped_frames} frame(s) without scene CRF.")
+    if total_frames <= 0 or not buckets:
+        return None
+
+    parts: List[str] = []
+    for crf in sorted(buckets.keys()):
+        pct = (Decimal(buckets[crf]) * Decimal("100")) / Decimal(total_frames)
+        pct_text = format_number(pct.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+        parts.append(f"{format_number(crf)}:{pct_text}%")
+    return " | ".join(parts)
+
+def query_encoder_metadata(preferred_encoder: str) -> Optional[str]:
+    normalized = str(preferred_encoder or "").strip().lower().replace("_", "-")
+    if normalized and normalized not in ("svt-av1", "svt-av1-psy", "svt"):
+        return preferred_encoder.strip()
+
+    for exe in ("SvtAv1EncApp", "SvtAv1EncApp.exe"):
+        try:
+            p = subprocess.run(
+                [exe, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except Exception:
+            continue
+        for raw in (p.stdout or "").splitlines():
+            line = raw.strip()
+            if line.startswith("Svt[info]:"):
+                value = line[len("Svt[info]:"):].strip()
+                if value:
+                    return value
+
+    fallback = preferred_encoder.strip()
+    return fallback or None
+
+def write_global_tags_xml(path: Path, tags: List[Tuple[str, str]]) -> None:
+    ensure_dir(path.parent)
+    root = ET.Element("Tags")
+    tag_el = ET.SubElement(root, "Tag")
+    for name, value in tags:
+        if not value:
+            continue
+        simple = ET.SubElement(tag_el, "Simple")
+        ET.SubElement(simple, "Name").text = name
+        ET.SubElement(simple, "String").text = value
+    try:
+        ET.indent(root, space="  ")
+    except Exception:
+        pass
+    xml_bytes = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+    path.write_bytes(xml_bytes)
+
+def pick_video_track_mux(tracks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    for track in tracks:
+        if norm_type(str(track.get("type") or "")) != "video":
+            continue
+        tmux = track.get("trackMux")
+        if isinstance(tmux, dict):
+            return tmux
+    return {}
+
+def prepare_global_tags(workdir: Path, source: Path, tracks: List[Dict[str, Any]]) -> Tuple[Optional[Path], List[Dict[str, str]]]:
+    video_track_mux = pick_video_track_mux(tracks)
+    if not parse_bool_flag(video_track_mux.get("attachEncodeInfo")):
+        return None, []
+
+    tags: List[Tuple[str, str]] = []
+
+    encode_params = build_encode_params_text(source.with_suffix(".bat"))
+    if encode_params:
+        tags.append(("Encode Params", encode_params))
+
+    encoder_info = query_encoder_metadata(str(video_track_mux.get("encoder") or ""))
+    if encoder_info:
+        tags.append(("Encoder", encoder_info))
+
+    crf_deviation = build_crf_deviation_text(workdir)
+    if crf_deviation:
+        tags.append(("CRF Deviation", crf_deviation))
+
+    tags.append(("Source Name", source.name))
+
+    note = str(video_track_mux.get("note") or "").strip()
+    if note:
+        tags.append(("Note", note))
+
+    if not tags:
+        return None, []
+
+    tags_path = workdir / "00_meta" / "mux_global_tags.xml"
+    write_global_tags_xml(tags_path, tags)
+    print(f"[ok] global tags prepared: {tags_path}")
+    return tags_path, [{"name": name, "value": value} for name, value in tags]
+
 
 # ---------------------------
 # plan loading
@@ -668,6 +1013,7 @@ def build_mux_command(
     source: Path,
     workdir: Path,
     tracks: List[Dict[str, Any]],
+    global_tags_path: Optional[Path] = None,
 ) -> Tuple[List[str], Dict[str, Any]]:
     mkvj = mkvmerge_json(mkvmerge, source)
 
@@ -697,6 +1043,8 @@ def build_mux_command(
     # chapters
     if chapters:
         args += ["--chapters", str(chapters)]
+    if global_tags_path is not None:
+        args += ["--global-tags", str(global_tags_path)]
 
     # Start building inputs.
     plan: Dict[str, Any] = {
@@ -705,6 +1053,7 @@ def build_mux_command(
         "audio_sources": [],
         "sub_sources": [],
         "chapters": str(chapters) if chapters else None,
+        "global_tags": str(global_tags_path) if global_tags_path is not None else None,
         "attachments": attachments,
         "fallbacks": [],
     }
@@ -843,8 +1192,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         update_scene_bitrates(workdir, source, include_source=(not args.no_source_bitrate))
 
         tracks = load_tracks(workdir)
+        global_tags_path, global_tags = prepare_global_tags(workdir, source, tracks)
 
-        cmd, plan = build_mux_command(mkvmerge, source, workdir, tracks)
+        cmd, plan = build_mux_command(mkvmerge, source, workdir, tracks, global_tags_path=global_tags_path)
 
         # Save manifest for debugging/reproducibility
         write_json(workdir / "00_meta" / "mux_manifest.json", {
@@ -852,6 +1202,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "workdir": str(workdir),
             "mkvmerge": str(mkvmerge),
             "plan": plan,
+            "global_tags_written": global_tags,
             "command": cmd,
         })
 

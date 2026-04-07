@@ -80,6 +80,8 @@ class DefaultSettings:
         main_vpy="",
         fast_vpy="",
         proxy_vpy="",
+        attach_encode_info=False,
+        note="",
     ):
         self.params = params or ""
         self.last_params = last_params or ""
@@ -107,6 +109,8 @@ class DefaultSettings:
         self.main_vpy = main_vpy or ""
         self.fast_vpy = fast_vpy or ""
         self.proxy_vpy = proxy_vpy or ""
+        self.attach_encode_info = parse_bool_value(attach_encode_info, default=False)
+        self.note = note or ""
 
 
 def normalize_type(value):
@@ -321,6 +325,8 @@ def build_results(files, tracks_by_file, settings, defaults):
     default_main_vpy = defaults.main_vpy
     default_fast_vpy = defaults.fast_vpy
     default_proxy_vpy = defaults.proxy_vpy
+    default_attach_encode_info = defaults.attach_encode_info
+    default_note = defaults.note
 
     for file_index, file_path in enumerate(files, start=1):
         lines.append(f"[{file_index}] {os.path.basename(file_path)}")
@@ -462,6 +468,9 @@ def build_results(files, tracks_by_file, settings, defaults):
                 track_mux["mainVpy"] = default_main_vpy
                 track_mux["fastVpy"] = default_fast_vpy
                 track_mux["proxyVpy"] = default_proxy_vpy
+                track_mux["attachEncodeInfo"] = "true" if default_attach_encode_info else "false"
+                if default_note:
+                    track_mux["note"] = default_note
             elif track_type in ("audio", "sub"):
                 if final_name:
                     track_mux["name"] = final_name
@@ -548,6 +557,8 @@ class TrackConfigGui:
             main_vpy=defaults_raw.get("mainVpy") or defaults_raw.get("main_vpy") or "",
             fast_vpy=defaults_raw.get("fastVpy") or defaults_raw.get("fast_vpy") or "",
             proxy_vpy=defaults_raw.get("proxyVpy") or defaults_raw.get("proxy_vpy") or "",
+            attach_encode_info=defaults_raw["attachEncodeInfo"] if "attachEncodeInfo" in defaults_raw else defaults_raw.get("attach_encode_info", False),
+            note=defaults_raw.get("note") or "",
         )
 
         self.match_tracks = []
@@ -655,6 +666,8 @@ class TrackConfigGui:
         self.main_vpy_var = tk.StringVar(value=self.defaults.main_vpy)
         self.fast_vpy_var = tk.StringVar(value=self.defaults.fast_vpy)
         self.proxy_vpy_var = tk.StringVar(value=self.defaults.proxy_vpy)
+        self.attach_encode_info_var = tk.BooleanVar(value=bool(self.defaults.attach_encode_info))
+        self.note_var = tk.StringVar(value=self.defaults.note)
 
         row = 0
         ttk.Label(frame, text="params").grid(row=row, column=0, sticky=tk.NW, padx=(0, 6), pady=2)
@@ -763,6 +776,15 @@ class TrackConfigGui:
 
         ttk.Label(frame, text="proxy-vpy").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
         ttk.Entry(frame, textvariable=self.proxy_vpy_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
+        row += 1
+
+        ttk.Checkbutton(frame, text="Attach Encode Info", variable=self.attach_encode_info_var).grid(
+            row=row, column=1, sticky=tk.W, pady=2
+        )
+        row += 1
+
+        ttk.Label(frame, text="Note").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Entry(frame, textvariable=self.note_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
 
         self.default_fastpass_var.trace_add("write", self.on_defaults_change)
         self.default_mainpass_var.trace_add("write", self.on_defaults_change)
@@ -780,6 +802,8 @@ class TrackConfigGui:
         self.main_vpy_var.trace_add("write", self.on_defaults_change)
         self.fast_vpy_var.trace_add("write", self.on_defaults_change)
         self.proxy_vpy_var.trace_add("write", self.on_defaults_change)
+        self.attach_encode_info_var.trace_add("write", self.on_defaults_change)
+        self.note_var.trace_add("write", self.on_defaults_change)
 
         self.ab_multiplier_var.trace_add("write", self.on_ab_multiplier_change)
         self.ab_pos_multiplier_var.trace_add("write", self.on_ab_pos_multiplier_change)
@@ -997,6 +1021,8 @@ class TrackConfigGui:
             main_vpy=self._get_var_value("main_vpy_var"),
             fast_vpy=self._get_var_value("fast_vpy_var"),
             proxy_vpy=self._get_var_value("proxy_vpy_var"),
+            attach_encode_info=bool(getattr(self, "attach_encode_info_var", tk.BooleanVar(value=False)).get()),
+            note=self._get_var_value("note_var"),
         )
 
     def _apply_setting_to_form(self, setting):

@@ -280,7 +280,9 @@ private fun buildGuiDefaults(): GuiDefaults {
         abNegMultiplier = "",
         mainVpy = "",
         fastVpy = "",
-        proxyVpy = ""
+        proxyVpy = "",
+        attachEncodeInfo = false,
+        note = ""
     )
 }
 
@@ -374,6 +376,7 @@ private fun buildGuiDefaultsFromPerFileBat(batFile: File): GuiDefaults {
 
     val workdir = envValue(env, "WORKDIR")?.takeIf { it.isNotBlank() }
     val zoning = readZoneEdit(workdir, batFile)
+    val savedVideoMux = readVideoTrackMux(workdir, batFile)
 
     val sceneDetection = envValue(env, "SCENE_DETECTION")
         ?: extractFlagValue(lines, "--sdm")?.takeIf { !it.contains("%") }
@@ -405,7 +408,11 @@ private fun buildGuiDefaultsFromPerFileBat(batFile: File): GuiDefaults {
         abNegMultiplier = envValue(env, "AB_NEG_MULT") ?: base.abNegMultiplier,
         mainVpy = envValue(env, "MAIN_VPY") ?: base.mainVpy,
         fastVpy = envValue(env, "FAST_VPY") ?: base.fastVpy,
-        proxyVpy = envValue(env, "PROXY_VPY") ?: base.proxyVpy
+        proxyVpy = envValue(env, "PROXY_VPY") ?: base.proxyVpy,
+        attachEncodeInfo = parseBooleanValue(envValue(env, "ATTACH_ENCODE_INFO"))
+            ?: parseBooleanValue(savedVideoMux["attachEncodeInfo"])
+            ?: base.attachEncodeInfo,
+        note = savedVideoMux["note"] ?: envValue(env, "NOTE") ?: base.note
     )
 }
 
@@ -530,6 +537,41 @@ private fun readZoneEdit(workdir: String?, batFile: File): String? {
         }
     }
     return null
+}
+
+private fun readVideoTrackMux(workdir: String?, batFile: File): Map<String, String> {
+    val candidates = mutableListOf<File>()
+    if (!workdir.isNullOrBlank()) {
+        candidates.add(File(workdir, "tracks.json"))
+    }
+    val fallbackDir = File(batFile.parentFile, batFile.nameWithoutExtension)
+    candidates.add(File(fallbackDir, "tracks.json"))
+
+    for (candidate in candidates) {
+        if (!candidate.exists() || !candidate.isFile) {
+            continue
+        }
+        val parsed = runCatching {
+            gson.fromJson(candidate.readText(Charsets.UTF_8), StoredTracksPlan::class.java)
+        }.getOrNull() ?: continue
+        val videoTrack = parsed.tracks.orEmpty().firstOrNull { normalizeStoredTrackType(it.type) == "video" }
+        val trackMux = videoTrack?.trackMux
+        if (!trackMux.isNullOrEmpty()) {
+            return trackMux
+        }
+    }
+
+    return emptyMap()
+}
+
+private fun normalizeStoredTrackType(value: String?): String {
+    val normalized = value?.trim()?.lowercase() ?: return ""
+    return when {
+        normalized.startsWith("vid") -> "video"
+        normalized.startsWith("aud") -> "audio"
+        normalized.startsWith("sub") -> "sub"
+        else -> normalized
+    }
 }
 
 enum class TrackStatus {
@@ -726,7 +768,9 @@ private data class GuiDefaults(
     val abNegMultiplier: String,
     val mainVpy: String,
     val fastVpy: String,
-    val proxyVpy: String
+    val proxyVpy: String,
+    val attachEncodeInfo: Boolean,
+    val note: String
 )
 
 private data class GuiInput(
@@ -748,5 +792,14 @@ private data class GuiTrackEntry(
     val origLang: String?,
     val trackStatus: String,
     val trackParam: Map<String, String>?,
+    val trackMux: Map<String, String>?
+)
+
+private data class StoredTracksPlan(
+    val tracks: List<StoredTrackPlanEntry>?
+)
+
+private data class StoredTrackPlanEntry(
+    val type: String?,
     val trackMux: Map<String, String>?
 )
