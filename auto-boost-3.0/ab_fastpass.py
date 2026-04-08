@@ -63,6 +63,7 @@ def query_fastpass_hdr10_payload(*, input_file: Path, hdr_patch_script: Path) ->
 
 def run_fastpass_av1an(
     *,
+    av1an_exe: str,
     input_file: Path,
     fastpass_vpy: Optional[Path],
     fastpass_proxy: Optional[Path],
@@ -84,6 +85,9 @@ def run_fastpass_av1an(
     log_level: Optional[str],
     fastpass_hdr: bool = False,
     hdr_patch_script: Optional[Path] = None,
+    chunk_order: str = "",
+    encoder_path: str = "",
+    fast_interrupt: bool = False,
 ) -> None:
     """Build and execute the av1an fast-pass command (or sc-only)."""
     encoder = normalize_encoder(encoder)
@@ -93,7 +97,7 @@ def run_fastpass_av1an(
 
     av1an_input = fastpass_vpy if fastpass_vpy is not None else input_file
     cmd: List[str] = [
-        "av1an",
+        str(av1an_exe or "av1an"),
         "-i", str(av1an_input),
         "--temp", str(av1an_temp),
         "-y",
@@ -127,6 +131,13 @@ def run_fastpass_av1an(
     # Muxing defaults from old scripts
     cmd.extend(["-m", "lsmash", "-c", "mkvmerge"])
     cmd.extend(["--chunk-order", "random"])
+    # Prepared for the fork-only chunk-order option, but fastpass stays on random for now.
+    # if str(chunk_order).strip():
+    #     cmd.extend(["--chunk-order", str(chunk_order).strip()])
+    if str(encoder_path).strip():
+        cmd.extend(["--encoder-path", str(encoder_path).strip()])
+    if fast_interrupt:
+        cmd.append("--fast-interrupt")
     cmd.extend(["--cache-mode", "temp"])
 
     # Encoder & encode settings (fast pass)

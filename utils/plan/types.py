@@ -13,6 +13,14 @@ PLAN_SUFFIX = ".plan"
 DEFAULT_VIDEO_ENCODER = "svt-av1"
 DEFAULT_SCENE_DETECTION = "av1an"
 DEFAULT_QUALITY = 30.0
+DEFAULT_CHUNK_ORDER = "long-biased-random"
+CHUNK_ORDER_OPTIONS = (
+    "long-biased-random",
+    "random",
+    "sequential",
+    "short-to-long",
+    "long-to-short",
+)
 WIN_BAD = '<>:"/\\|?*'
 
 DEFAULT_FASTPASS_PARAMS: Dict[str, Any] = {
@@ -71,6 +79,8 @@ class VideoPrimary:
     encoder: str = DEFAULT_VIDEO_ENCODER
     scene_detection: str = DEFAULT_SCENE_DETECTION
     quality: float = DEFAULT_QUALITY
+    chunk_order: str = DEFAULT_CHUNK_ORDER
+    encoder_path: str = ""
     fastpass_preset: str = ""
     preset: str = ""
     fastpass_workers: int = 8
@@ -218,6 +228,8 @@ class ResolvedFilePlan:
         details = video.details
         video_config = {
             "quality": format_value(primary.quality),
+            "chunk_order": str(primary.chunk_order or ""),
+            "encoder_path": str(primary.encoder_path or ""),
             "fastpass_preset": str(primary.fastpass_preset or ""),
             "preset": str(primary.preset or ""),
             "fastpass_params": {key: format_value(value) for key, value in video.fastpass_params.items()},
@@ -227,6 +239,8 @@ class ResolvedFilePlan:
         track_mux = {
             "encoder": primary.encoder,
             "sceneDetection": primary.scene_detection,
+            "chunkOrder": str(primary.chunk_order or ""),
+            "encoderPath": str(primary.encoder_path or ""),
             "noFastpass": bool_text(primary.no_fastpass),
             "fastpassHdr": bool_text(primary.fastpass_hdr),
             "strictSdr8bit": bool_text(primary.strict_sdr_8bit),
@@ -364,6 +378,13 @@ def normalize_encoder(value: Any) -> str:
     if raw in ("x265", "libx265"):
         return "libx265"
     return DEFAULT_VIDEO_ENCODER
+
+
+def normalize_chunk_order(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in CHUNK_ORDER_OPTIONS:
+        return raw
+    return DEFAULT_CHUNK_ORDER
 
 
 def bool_text(value: bool) -> str:
@@ -517,6 +538,8 @@ __all__ = [
     "DEFAULT_VIDEO_ENCODER",
     "DEFAULT_SCENE_DETECTION",
     "DEFAULT_QUALITY",
+    "DEFAULT_CHUNK_ORDER",
+    "CHUNK_ORDER_OPTIONS",
     "DEFAULT_FASTPASS_PARAMS",
     "DEFAULT_MAINPASS_PARAMS",
     "SourceTrack",
@@ -537,6 +560,7 @@ __all__ = [
     "default_video_details",
     "normalize_track_type",
     "normalize_encoder",
+    "normalize_chunk_order",
     "bool_text",
     "parse_bool_value",
     "to_float",

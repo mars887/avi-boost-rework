@@ -94,6 +94,8 @@ def main() -> int:
                         help="Optional .vpy path for fast-pass input (used for av1an -i). Adds --vspipe-args src=<input>.")
     parser.add_argument("--fastpass-proxy", default=None,
                         help="Optional av1an --proxy path for fast-pass. Adds --proxy and --vspipe-args src=<input>.")
+    parser.add_argument("--av1an", default="av1an",
+                        help="Path to av1an executable for fork-aware fast-pass invocation.")
     parser.add_argument("--encoder", default="svt-av1",
                         help="Encoder for fast-pass and scene overrides: svt-av1 (default), libx265/x265.")
     parser.add_argument("--workers", type=int, default=8,
@@ -121,6 +123,12 @@ def main() -> int:
                         help="av1an --log-file path. 'auto' => <project>/av1an.log, 'none' => disable.")
     parser.add_argument("--av1an-log-level", default="info",
                         help="av1an --log-level (e.g. info, debug, warn).")
+    parser.add_argument("--chunk-order", default=None,
+                        help="Fork-only av1an chunk order. Accepted but currently not applied to fast-pass.")
+    parser.add_argument("--encoder-path", default="",
+                        help="Fork-only av1an encoder executable override.")
+    parser.add_argument("--fast-interrupt", action="store_true",
+                        help="Fork-only av1an flag for faster interruption handling.")
 
     # Rules
     rules_group = parser.add_mutually_exclusive_group()
@@ -265,8 +273,8 @@ def main() -> int:
         ensure_dir(av1an_temp)
 
     # Tool sanity checks (warnings only)
-    if not which_or_none("av1an"):
-        eprint("[warn] 'av1an' not found in PATH. Stages 2+ will fail unless you add it to PATH.")
+    if not which_or_none(str(args.av1an)):
+        eprint(f"[warn] av1an executable not found: {args.av1an}")
     # -----------------
     # Stage 1: PSD (scene detection)
     # -----------------
@@ -311,6 +319,7 @@ def main() -> int:
                     if fastpass_proxy is not None:
                         ensure_exists(fastpass_proxy, "Fast-pass proxy")
                     run_fastpass_av1an(
+                        av1an_exe=str(args.av1an),
                         input_file=input_file,
                         fastpass_vpy=fastpass_vpy,
                         fastpass_proxy=fastpass_proxy,
@@ -335,6 +344,9 @@ def main() -> int:
                         ),
                         fastpass_hdr=bool(args.fastpass_hdr),
                         hdr_patch_script=hdr_patch_script,
+                        chunk_order=str(args.chunk_order or ""),
+                        encoder_path=str(args.encoder_path or ""),
+                        fast_interrupt=bool(args.fast_interrupt),
                     )
                     touch(marks["fastpass"])
             else:
@@ -346,6 +358,7 @@ def main() -> int:
                     if fastpass_proxy is not None:
                         ensure_exists(fastpass_proxy, "Fast-pass proxy")
                     run_fastpass_av1an(
+                        av1an_exe=str(args.av1an),
                         input_file=input_file,
                         fastpass_vpy=fastpass_vpy,
                         fastpass_proxy=fastpass_proxy,
@@ -370,6 +383,9 @@ def main() -> int:
                         ),
                         fastpass_hdr=bool(args.fastpass_hdr),
                         hdr_patch_script=hdr_patch_script,
+                        chunk_order=str(args.chunk_order or ""),
+                        encoder_path=str(args.encoder_path or ""),
+                        fast_interrupt=bool(args.fast_interrupt),
                     )
                     touch(marks["fastpass"])
 

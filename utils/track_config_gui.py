@@ -12,6 +12,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.plan_model import (
+    CHUNK_ORDER_OPTIONS,
+    DEFAULT_CHUNK_ORDER,
     build_summary_rows,
     create_default_file_plan,
     file_plan_from_gui_result,
@@ -23,6 +25,7 @@ from utils.plan_model import (
     resolve_paths,
     save_plan,
 )
+from utils.pipeline_runtime import is_mars_av1an_fork, list_portable_encoder_binaries, load_toolchain
 
 
 TYPE_OPTIONS = ["auto", "video", "audio", "sub"]
@@ -82,6 +85,8 @@ class DefaultSettings:
         fastpass="",
         mainpass="",
         scene_detection="",
+        chunk_order=DEFAULT_CHUNK_ORDER,
+        encoder_path="",
         no_fastpass=False,
         fastpass_hdr=True,
         strict_sdr_8bit=False,
@@ -111,6 +116,10 @@ class DefaultSettings:
         if sd not in ("psd", "av1an"):
             sd = "av1an"
         self.scene_detection = sd
+        self.chunk_order = str(chunk_order or DEFAULT_CHUNK_ORDER).strip() or DEFAULT_CHUNK_ORDER
+        if self.chunk_order not in CHUNK_ORDER_OPTIONS:
+            self.chunk_order = DEFAULT_CHUNK_ORDER
+        self.encoder_path = str(encoder_path or "").strip()
         self.no_fastpass = parse_bool_value(no_fastpass, default=False)
         self.fastpass_hdr = parse_bool_value(fastpass_hdr, default=True)
         self.strict_sdr_8bit = parse_bool_value(strict_sdr_8bit, default=False)
@@ -555,6 +564,8 @@ def build_default_defaults_dict():
         "fastpass": "",
         "mainpass": "",
         "scene_detection": "av1an",
+        "chunk_order": DEFAULT_CHUNK_ORDER,
+        "encoder_path": "",
         "no_fastpass": False,
         "fastpass_hdr": True,
         "strict_sdr_8bit": False,
@@ -635,6 +646,8 @@ class TrackConfigGui:
             fastpass=defaults_raw.get("fastpass") or "",
             mainpass=defaults_raw.get("mainpass") or "",
             scene_detection=defaults_raw.get("sceneDetection") or defaults_raw.get("scene_detection") or "",
+            chunk_order=defaults_raw.get("chunkOrder") or defaults_raw.get("chunk_order") or DEFAULT_CHUNK_ORDER,
+            encoder_path=defaults_raw.get("encoderPath") or defaults_raw.get("encoder_path") or "",
             no_fastpass=defaults_raw.get("noFastpass") or defaults_raw.get("no_fastpass") or False,
             fastpass_hdr=defaults_raw["fastpassHdr"] if "fastpassHdr" in defaults_raw else defaults_raw.get("fastpass_hdr", True),
             strict_sdr_8bit=defaults_raw.get("strictSdr8bit") if "strictSdr8bit" in defaults_raw else defaults_raw.get("strict_sdr_8bit", False),
@@ -658,6 +671,9 @@ class TrackConfigGui:
         self.plan_paths = data.get("planPaths") or {}
         self.output_mode = data.get("outputMode") or "plans"
         self.settings = list(data.get("settings") or [])
+        toolchain = load_toolchain()
+        self.av1an_exe = toolchain.av1an_exe
+        self.av1an_fork_enabled = is_mars_av1an_fork(self.av1an_exe)
 
         self.match_tracks = []
         for row in self.summary:
@@ -749,6 +765,8 @@ class TrackConfigGui:
         self.default_mainpass_var = tk.StringVar(value=self.defaults.mainpass)
         self.scene_detection_var = tk.StringVar(value=self.defaults.scene_detection or "av1an")
         self.encoder_var = tk.StringVar(value=self.defaults.encoder or DEFAULT_VIDEO_ENCODER)
+        self.chunk_order_var = tk.StringVar(value=self.defaults.chunk_order or DEFAULT_CHUNK_ORDER)
+        self.encoder_path_var = tk.StringVar(value=self.defaults.encoder_path)
         self.no_fastpass_var = tk.BooleanVar(value=bool(self.defaults.no_fastpass))
         self.fastpass_hdr_var = tk.BooleanVar(value=bool(self.defaults.fastpass_hdr))
         self.strict_sdr_8bit_var = tk.BooleanVar(value=bool(self.defaults.strict_sdr_8bit))
@@ -812,6 +830,19 @@ class TrackConfigGui:
             row=row, column=1, sticky=tk.W, pady=2
         )
         row += 1
+
+        if self.av1an_fork_enabled:
+            ttk.Label(frame, text="chunk order").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+            ttk.Combobox(frame, textvariable=self.chunk_order_var, values=CHUNK_ORDER_OPTIONS, width=57, state="readonly").grid(
+                row=row, column=1, sticky=tk.W, pady=2
+            )
+            row += 1
+
+            ttk.Label(frame, text="encoder path").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+            self.encoder_path_combo = ttk.Combobox(frame, textvariable=self.encoder_path_var, width=57, state="readonly")
+            self.encoder_path_combo.grid(row=row, column=1, sticky=tk.EW, pady=2)
+            self._refresh_encoder_path_options(preserve_missing=True)
+            row += 1
 
         ttk.Checkbutton(frame, text="no fastpass", variable=self.no_fastpass_var).grid(
             row=row, column=1, sticky=tk.W, pady=2
@@ -888,7 +919,10 @@ class TrackConfigGui:
         self.default_fastpass_var.trace_add("write", self.on_defaults_change)
         self.default_mainpass_var.trace_add("write", self.on_defaults_change)
         self.scene_detection_var.trace_add("write", self.on_defaults_change)
-        self.encoder_var.trace_add("write", self.on_defaults_change)
+        self.encoder_var.trace_add("write", self.on_encoder_change)
+        if self.av1an_fork_enabled:
+            self.chunk_order_var.trace_add("write", self.on_defaults_change)
+            self.encoder_path_var.trace_add("write", self.on_defaults_change)
         self.no_fastpass_var.trace_add("write", self.on_defaults_change)
         self.fastpass_hdr_var.trace_add("write", self.on_defaults_change)
         self.strict_sdr_8bit_var.trace_add("write", self.on_defaults_change)
@@ -1096,6 +1130,10 @@ class TrackConfigGui:
         zoning_value = ""
         if hasattr(self, "default_zoning_text"):
             zoning_value = self.default_zoning_text.get("1.0", tk.END).rstrip("\n")
+        chunk_order_var = getattr(self, "chunk_order_var", None)
+        encoder_path_var = getattr(self, "encoder_path_var", None)
+        chunk_order_value = chunk_order_var.get().strip() if chunk_order_var is not None else self.defaults.chunk_order
+        encoder_path_value = encoder_path_var.get().strip() if encoder_path_var is not None else self.defaults.encoder_path
         return DefaultSettings(
             params=self._get_single_line_text(getattr(self, "default_params_text", None)),
             last_params=self._get_single_line_text(getattr(self, "default_last_params_text", None)),
@@ -1104,6 +1142,8 @@ class TrackConfigGui:
             mainpass=self._get_var_value("default_mainpass_var"),
             scene_detection=self._get_var_value("scene_detection_var"),
             encoder=self._get_var_value("encoder_var"),
+            chunk_order=chunk_order_value,
+            encoder_path=encoder_path_value,
             no_fastpass=bool(getattr(self, "no_fastpass_var", tk.BooleanVar(value=False)).get()),
             fastpass_hdr=bool(getattr(self, "fastpass_hdr_var", tk.BooleanVar(value=True)).get()),
             strict_sdr_8bit=bool(getattr(self, "strict_sdr_8bit_var", tk.BooleanVar(value=False)).get()),
@@ -1251,6 +1291,10 @@ class TrackConfigGui:
     def on_mode_change(self, *_args):
         self._refresh_field_states()
 
+    def on_encoder_change(self, *_args):
+        self._refresh_encoder_path_options(preserve_missing=False)
+        self.on_defaults_change()
+
     def on_ab_multiplier_change(self, *_args):
         if getattr(self, "_ab_syncing", False):
             return
@@ -1303,6 +1347,19 @@ class TrackConfigGui:
     def on_defaults_change(self, *_args):
         self.defaults = self._current_defaults()
         self._refresh_results()
+
+    def _refresh_encoder_path_options(self, *, preserve_missing):
+        combo = getattr(self, "encoder_path_combo", None)
+        if combo is None:
+            return
+        current = self._get_var_value("encoder_path_var")
+        options = ["", *list_portable_encoder_binaries(self._get_var_value("encoder_var"))]
+        if preserve_missing and current and current not in options:
+            options.append(current)
+        combo.configure(values=options)
+        if current in options:
+            return
+        self.encoder_path_var.set("")
 
     def on_zoning_change(self, _event=None):
         if not hasattr(self, "default_zoning_text"):
@@ -1423,6 +1480,8 @@ class TrackConfigGui:
             "fastpass_filter": self.defaults.fastpass,
             "mainpass_filter": self.defaults.mainpass,
             "scene_detection": self.defaults.scene_detection,
+            "chunk_order": self.defaults.chunk_order,
+            "encoder_path": self.defaults.encoder_path,
             "no_fastpass": self.defaults.no_fastpass,
             "fastpass_hdr": self.defaults.fastpass_hdr,
             "strict_sdr_8bit": self.defaults.strict_sdr_8bit,

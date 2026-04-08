@@ -11,8 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, List, Optional
 
-from utils.pipeline_runtime import AUTOBOOST_DIR, ROOT_DIR, UTILS_DIR, ensure_dir, load_toolchain
+from utils.pipeline_runtime import AUTOBOOST_DIR, ROOT_DIR, UTILS_DIR, ensure_dir, is_mars_av1an_fork, load_toolchain
 from utils.plan_model import BatchPlan, FilePlan, ResolvedFilePlan, RunnerEvent, load_plan, resolve_file_plan
+
+FAST_INTERRUPT = False
 
 
 @dataclass(frozen=True)
@@ -93,6 +95,7 @@ class SessionController:
         exit_when_idle: bool,
     ) -> None:
         self.toolchain = load_toolchain()
+        self.av1an_fork_enabled = is_mars_av1an_fork(self.toolchain.av1an_exe)
         self.queue: Deque[QueueItem] = deque(items)
         self.failed: List[QueueItem] = []
         self.completed: List[QueueItem] = []
@@ -304,6 +307,8 @@ class SessionController:
             auto_boost_cmd = [
                 self.toolchain.vs_python_exe,
                 str(AUTOBOOST_DIR / "auto_boost.py"),
+                "--av1an",
+                self.toolchain.av1an_exe,
                 "--input",
                 str(paths.source),
                 "--out-scenes",
@@ -331,6 +336,12 @@ class SessionController:
                 "--keep",
                 "--verbose",
             ]
+            if self.av1an_fork_enabled:
+                auto_boost_cmd.extend(["--chunk-order", str(primary.chunk_order or "")])
+                if str(primary.encoder_path or "").strip():
+                    auto_boost_cmd.extend(["--encoder-path", str(primary.encoder_path)])
+                if FAST_INTERRUPT:
+                    auto_boost_cmd.append("--fast-interrupt")
             if str(primary.scene_detection or "").strip().lower() == "psd":
                 auto_boost_cmd.extend(["--psd-script", self.toolchain.psd_script])
             if primary.no_fastpass:
@@ -437,6 +448,13 @@ class SessionController:
                     "--no-defaults",
                     "-a=-an -sn",
                 ]
+                if self.av1an_fork_enabled:
+                    if str(primary.chunk_order or "").strip():
+                        mainpass_cmd.extend(["--chunk-order", str(primary.chunk_order)])
+                    if str(primary.encoder_path or "").strip():
+                        mainpass_cmd.extend(["--encoder-path", str(primary.encoder_path)])
+                    if FAST_INTERRUPT:
+                        mainpass_cmd.append("--fast-interrupt")
                 if proxy_vpy:
                     mainpass_cmd.extend(["--proxy", proxy_vpy])
                 if main_vpy or proxy_vpy:
