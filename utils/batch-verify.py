@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.plan_model import normalize_track_type, resolve_file_plan
+from utils.plan_model import format_value, normalize_track_type, resolve_file_plan
 
 
 NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
@@ -34,8 +34,10 @@ class PipelineConfig:
     ab_pos_dev: Optional[float]
     ab_neg_dev: Optional[float]
     quality: Optional[float]
+    fastpass_preset: str
     fastpass: str
     mainpass: str
+    encode: str
     fastpass_vf: str
     mainpass_vf: str
 
@@ -85,8 +87,10 @@ def build_plan_cfg(resolved_plan: Any) -> PipelineConfig:
         ab_pos_dev=float(primary.ab_pos_dev),
         ab_neg_dev=float(primary.ab_neg_dev),
         quality=float(primary.quality),
+        fastpass_preset=str(primary.fastpass_preset or ""),
         fastpass=resolved_plan.build_fastpass_params_text(),
         mainpass=resolved_plan.build_mainpass_params_text(),
+        encode=str(resolved_plan.build_encode_params_text() or ""),
         fastpass_vf=str(details.fastpass_filter or ""),
         mainpass_vf=str(details.mainpass_filter or ""),
     )
@@ -337,7 +341,10 @@ def main(argv: List[str]) -> int:
 
     if args.check_params and source.exists():
         fast_tokens = parse_param_tokens(plan_cfg.fastpass)
-        main_tokens = parse_param_tokens(plan_cfg.mainpass)
+        if plan_cfg.quality is not None:
+            fast_tokens.extend(["--crf", format_value(plan_cfg.quality)])
+        if plan_cfg.fastpass_preset.strip():
+            fast_tokens.extend(["--preset", plan_cfg.fastpass_preset.strip()])
 
         ok, msg = run_param_check(source, fast_tokens)
         if not ok:
@@ -345,7 +352,10 @@ def main(argv: List[str]) -> int:
         elif msg != "ok":
             warnings.append(f"FASTPASS params: {msg}")
 
-        combined = apply_override(list(fast_tokens), main_tokens)
+        combined = parse_param_tokens(plan_cfg.encode)
+        if not combined:
+            main_tokens = parse_param_tokens(plan_cfg.mainpass)
+            combined = apply_override(list(fast_tokens), main_tokens)
         ok, msg = run_param_check(source, combined)
         if not ok:
             errors.append(f"MAINPASS overlay params: {msg}")

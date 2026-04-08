@@ -71,21 +71,14 @@ def gui_defaults_from_file_plan(plan: FilePlan) -> Dict[str, Any]:
 def gui_settings_from_file_plan(plan: FilePlan) -> List[Dict[str, Any]]:
     settings: List[Dict[str, Any]] = []
     video = plan.video
-    fastpass_tokens = params_map_to_tokens(video.fastpass_params)
-    mainpass_tokens = params_map_to_tokens(video.mainpass_params)
-    fastpass_tokens.extend(["--crf", format_value(video.primary.quality)])
-    mainpass_tokens.extend(["--crf", format_value(video.primary.quality)])
-    if video.primary.fastpass_preset:
-        fastpass_tokens.extend(["--preset", str(video.primary.fastpass_preset)])
-    if video.primary.preset:
-        mainpass_tokens.extend(["--preset", str(video.primary.preset)])
     settings.append(
         {
             "id": str(video.track_id),
             "type": "video",
             "mode": video.action.upper(),
-            "params": subprocess.list2cmdline([str(x) for x in fastpass_tokens]),
-            "last_params": subprocess.list2cmdline([str(x) for x in mainpass_tokens]),
+            # Video params are edited through the global Video tab, not via per-track rules.
+            "params": "",
+            "last_params": "",
             "bitrate": "",
             "channels": "",
             "name": "",

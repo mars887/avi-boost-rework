@@ -187,6 +187,10 @@ class SessionController:
         with self.lock:
             self.stop_requested = True
             self.exit_when_idle = True
+            self.paused = False
+            self.pause_after_current = False
+            self.rerun_after_current = False
+            self.queue.clear()
         self.wake_event.set()
 
     def _write_item_state(self, item: QueueItem, event: RunnerEvent) -> None:

@@ -237,19 +237,19 @@ def collect_sources(args: Iterable[str]) -> Tuple[List[SourceGroup], List[str]]:
                 else:
                     unknown.append(raw)
                 continue
+            found = False
             full_batch_plan = p / "full-batch.plan"
             if full_batch_plan.exists():
                 if add_from_plan(full_batch_plan):
-                    continue
+                    found = True
             plans = collect_file_plan_paths(p)
             if plans:
                 for plan_path in plans:
                     try:
                         add_source(resolve_paths(load_file_plan(plan_path), plan_path).source)
+                        found = True
                     except Exception:
                         unknown.append(str(plan_path))
-                continue
-            found = False
             for ext in VIDEO_EXTS:
                 for f in p.glob(f"*{ext}"):
                     if not is_result_name(f.name):

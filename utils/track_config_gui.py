@@ -437,14 +437,10 @@ def build_results(files, tracks_by_file, settings, defaults):
             video_config = None
             params_display = ""
             if track_type == "video" and mode == "EDIT":
+                # Video params are global for the current GUI flow and come from the Video tab.
+                # Per-track video param overrides are no longer part of the active contract.
                 param_map = dict(default_params_map)
                 last_param_map = dict(default_last_params_map)
-                track_param_map = parse_params_string(entry["params"])
-                track_last_param_map = parse_params_string(entry["last_params"])
-                if track_param_map:
-                    param_map.update(track_param_map)
-                if track_last_param_map:
-                    last_param_map.update(track_last_param_map)
                 if default_strict_sdr_8bit:
                     last_param_map = apply_strict_sdr_8bit_params(last_param_map, default_encoder)
                 fastpass_crf = get_param_value(param_map, "--crf")
@@ -460,10 +456,6 @@ def build_results(files, tracks_by_file, settings, defaults):
                 }
                 param_parts = []
                 param_parts.append(f"encoder={default_encoder}")
-                if entry["params"]:
-                    param_parts.append(f"params={entry['params']}")
-                if entry["last_params"]:
-                    param_parts.append(f"last={entry['last_params']}")
                 params_display = ", ".join(param_parts)
             elif track_type == "audio" and mode == "EDIT":
                 bitrate = parse_int_value(entry["bitrate"], 2)
