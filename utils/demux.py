@@ -209,20 +209,10 @@ def run_cmd(cmd: List[str]) -> None:
         raise RuntimeError(f"Command failed with code {rc}")
 
 
-def load_json(p: Path) -> Any:
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def write_json(p: Path, obj: Any) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-def resolve_tracks_path(workdir: Path, tracks_data_arg: str) -> Path:
-    td = Path(tracks_data_arg)
-    return td if td.is_absolute() else (workdir / td)
 
 
 @dataclass
@@ -523,8 +513,7 @@ def extract_chapters(mkvextract: str, source: Path, chapters_dir: Path, overwrit
 
 
 
-def parse_tracks_json(tracks_json: Dict[str, Any]) -> List[TrackEntry]:
-    tracks = tracks_json.get("tracks", []) or []
+def parse_tracks(tracks: List[Dict[str, Any]]) -> List[TrackEntry]:
     parsed: List[TrackEntry] = []
     for t in tracks:
         try:
@@ -540,33 +529,17 @@ def parse_tracks_json(tracks_json: Dict[str, Any]) -> List[TrackEntry]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Demux subtitles, attachments, chapters to WORKDIR")
-    ap.add_argument("--plan", default="", help="Path to file .plan")
-    ap.add_argument("--source", default="", help="Input source MKV")
-    ap.add_argument("--workdir", default="", help="Per-file workdir")
-    ap.add_argument("--tracksData", default="", help="Legacy tracks.json path (relative to workdir is allowed)")
+    ap.add_argument("--plan", required=True, help="Path to file .plan")
     ap.add_argument("--mkvmerge", default="mkvmerge", help="Path to mkvmerge")
     ap.add_argument("--mkvextract", default="mkvextract", help="Path to mkvextract")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing extracted files")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
     args = ap.parse_args()
 
-    if args.plan:
-        resolved_plan = resolve_file_plan(Path(args.plan))
-        source = resolved_plan.paths.source
-        workdir = resolved_plan.paths.workdir
-        entries = parse_tracks_json({"tracks": resolved_plan.legacy_tracks()})
-        tracks_path = resolved_plan.paths.plan_path
-    else:
-        if not args.source or not args.workdir or not args.tracksData:
-            eprint("[demux] Either --plan or (--source, --workdir, --tracksData) is required.")
-            return 2
-        source = Path(args.source)
-        workdir = Path(args.workdir)
-        tracks_path = resolve_tracks_path(workdir, args.tracksData)
-        if not tracks_path.exists():
-            eprint(f"[demux] tracksData not found: {tracks_path}")
-            return 3
-        entries = parse_tracks_json(load_json(tracks_path))
+    resolved_plan = resolve_file_plan(Path(args.plan))
+    source = resolved_plan.paths.source
+    workdir = resolved_plan.paths.workdir
+    entries = parse_tracks(resolved_plan.runtime_tracks())
 
     setup_logging(args.log, workdir)
     marker = marker_path(workdir)

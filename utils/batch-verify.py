@@ -23,12 +23,11 @@ from utils.plan_model import normalize_track_type, resolve_file_plan
 
 
 NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
-CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
 VIDEO_EXTS = (".mkv", ".mp4")
 
 
 @dataclass
-class BatConfig:
+class PipelineConfig:
     fastpass_workers: Optional[int]
     mainpass_workers: Optional[int]
     ab_multiplier: Optional[float]
@@ -59,187 +58,6 @@ def load_json(path: Path) -> Dict[str, Any]:
         raise RuntimeError(f"invalid_json:{path}: {exc}")
 
 
-def merge_bat_lines(lines: List[str]) -> List[str]:
-    out: List[str] = []
-    buf = ""
-    for raw in lines:
-        line = raw.rstrip()
-        if line.endswith("^"):
-            buf += line[:-1].strip() + " "
-            continue
-        if buf:
-            line = buf + line.strip()
-            buf = ""
-        out.append(line)
-    if buf:
-        out.append(buf)
-    return out
-
-
-def parse_bat_vars(lines: List[str]) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    for raw in lines:
-        s = raw.strip()
-        if not s.lower().startswith("set "):
-            continue
-        rest = s[4:].strip()
-        if rest.startswith('"'):
-            rest = rest[1:]
-            if rest.endswith('"'):
-                rest = rest[:-1]
-        if "=" not in rest:
-            continue
-        key, val = rest.split("=", 1)
-        out[key.strip()] = val
-    return out
-
-
-def extract_quality_from_lines(lines: List[str]) -> Optional[str]:
-    for line in merge_bat_lines(lines):
-        if "--quality" not in line:
-            continue
-        try:
-            tokens = shlex.split(line, posix=False)
-        except Exception:
-            continue
-        for i, tok in enumerate(tokens):
-            if tok.lower() == "--quality" and i + 1 < len(tokens):
-                return tokens[i + 1].strip("\"")
-    return None
-
-
-def parse_int(value: Optional[str]) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(str(value).strip())
-    except Exception:
-        return None
-
-
-def parse_float(value: Optional[str]) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        return float(str(value).strip())
-    except Exception:
-        return None
-
-
-def is_multiple_of(value: float, step: float) -> bool:
-    if step <= 0:
-        return False
-    return abs(round(value / step) * step - value) <= 1e-6
-
-
-def validate_bat(path: Path) -> Tuple[Optional[BatConfig], List[str], List[str]]:
-    errors: List[str] = []
-    warnings: List[str] = []
-
-    if not path.exists():
-        errors.append(f"per-file bat missing: {path}")
-        return None, errors, warnings
-
-    text = read_text_guess(path)
-    if CYRILLIC_RE.search(text):
-        errors.append("per-file bat contains cyrillic characters")
-
-    lines = text.splitlines()
-    vars_map = parse_bat_vars(lines)
-
-    workers_fallback = parse_int(vars_map.get("WORKERS"))
-    fastpass_workers = parse_int(vars_map.get("FASTPASS_WORKERS")) or workers_fallback
-    mainpass_workers = parse_int(vars_map.get("MAINPASS_WORKERS")) or workers_fallback
-    cores = os.cpu_count() or 1
-    if fastpass_workers is None:
-        errors.append("FASTPASS_WORKERS missing or invalid")
-    elif fastpass_workers < 1 or fastpass_workers > cores:
-        errors.append(f"FASTPASS_WORKERS out of range: {fastpass_workers} (1..{cores})")
-    if mainpass_workers is None:
-        errors.append("MAINPASS_WORKERS missing or invalid")
-    elif mainpass_workers < 1 or mainpass_workers > cores:
-        errors.append(f"MAINPASS_WORKERS out of range: {mainpass_workers} (1..{cores})")
-
-    ab_multiplier = parse_float(vars_map.get("AB_MULTIPIER"))
-    if ab_multiplier is not None:
-        if not (0.0 < ab_multiplier <= 5.0):
-            errors.append(f"AB_MULTIPIER out of range: {ab_multiplier} (0..5]")
-
-    ab_pos = parse_float(vars_map.get("AB_POS_DEV"))
-    if ab_pos is None:
-        errors.append("AB_POS_DEV missing or invalid")
-    elif not (0.0 <= ab_pos <= 20.0) or not is_multiple_of(ab_pos, 0.25):
-        errors.append(f"AB_POS_DEV out of range or not multiple of 0.25: {ab_pos}")
-
-    ab_neg = parse_float(vars_map.get("AB_NEG_DEV"))
-    if ab_neg is None:
-        errors.append("AB_NEG_DEV missing or invalid")
-    elif not (0.0 <= ab_neg <= 20.0) or not is_multiple_of(ab_neg, 0.25):
-        errors.append(f"AB_NEG_DEV out of range or not multiple of 0.25: {ab_neg}")
-
-    ab_pos_mult = parse_float(vars_map.get("AB_POS_MULT"))
-    ab_neg_mult = parse_float(vars_map.get("AB_NEG_MULT"))
-    if ab_multiplier is None:
-        if (ab_pos_mult is None) != (ab_neg_mult is None):
-            errors.append("AB_POS_MULT/AB_NEG_MULT must be set together when AB_MULTIPIER is empty")
-        else:
-            if ab_pos_mult is not None and ab_pos_mult <= 0:
-                errors.append(f"AB_POS_MULT out of range: {ab_pos_mult} (must be > 0)")
-            if ab_neg_mult is not None and ab_neg_mult <= 0:
-                errors.append(f"AB_NEG_MULT out of range: {ab_neg_mult} (must be > 0)")
-    else:
-        if ab_pos_mult is not None and ab_neg_mult is not None:
-            if ab_pos_mult <= 0:
-                errors.append(f"AB_POS_MULT out of range: {ab_pos_mult} (must be > 0)")
-            if ab_neg_mult <= 0:
-                errors.append(f"AB_NEG_MULT out of range: {ab_neg_mult} (must be > 0)")
-
-    quality_str = vars_map.get("QUALITY") or extract_quality_from_lines(lines)
-    quality = parse_float(quality_str)
-    if quality is None:
-        errors.append("QUALITY missing or invalid (not found in bat)")
-    elif not (1.0 <= quality <= 70.0) or not is_multiple_of(quality, 0.25):
-        errors.append(f"QUALITY out of range or not multiple of 0.25: {quality}")
-
-    fastpass = vars_map.get("FASTPASS", "")
-    mainpass = vars_map.get("MAINPASS", "")
-    fastpass_vf = vars_map.get("FASTPASS_VF", "")
-    mainpass_vf = vars_map.get("MAINPASS_VF", "")
-
-    cfg = BatConfig(
-        fastpass_workers=fastpass_workers,
-        mainpass_workers=mainpass_workers,
-        ab_multiplier=ab_multiplier,
-        ab_pos_dev=ab_pos,
-        ab_neg_dev=ab_neg,
-        quality=quality,
-        fastpass=fastpass,
-        mainpass=mainpass,
-        fastpass_vf=fastpass_vf,
-        mainpass_vf=mainpass_vf,
-    )
-    return cfg, errors, warnings
-
-
-def validate_tracks_json(obj: Dict[str, Any]) -> List[str]:
-    errors: List[str] = []
-    tracks = obj.get("tracks")
-    if not isinstance(tracks, list):
-        errors.append("tracks.json: missing or invalid 'tracks' list")
-        return errors
-    for i, t in enumerate(tracks):
-        if not isinstance(t, dict):
-            errors.append(f"tracks.json: track[{i}] not an object")
-            continue
-        if "trackId" not in t:
-            errors.append(f"tracks.json: track[{i}] missing trackId")
-        if "type" not in t:
-            errors.append(f"tracks.json: track[{i}] missing type")
-        if "trackStatus" not in t:
-            errors.append(f"tracks.json: track[{i}] missing trackStatus")
-    return errors
-
-
 def validate_resolved_plan_tracks(tracks: List[Dict[str, Any]]) -> List[str]:
     errors: List[str] = []
     if not isinstance(tracks, list):
@@ -257,10 +75,10 @@ def validate_resolved_plan_tracks(tracks: List[Dict[str, Any]]) -> List[str]:
     return errors
 
 
-def build_plan_cfg(resolved_plan: Any) -> BatConfig:
+def build_plan_cfg(resolved_plan: Any) -> PipelineConfig:
     primary = resolved_plan.plan.video.primary
     details = resolved_plan.plan.video.details
-    return BatConfig(
+    return PipelineConfig(
         fastpass_workers=int(primary.fastpass_workers),
         mainpass_workers=int(primary.mainpass_workers),
         ab_multiplier=float(primary.ab_multiplier),
@@ -471,10 +289,7 @@ def run_param_check(source: Path, params: List[str]) -> Tuple[bool, str]:
 
 def main(argv: List[str]) -> int:
     ap = argparse.ArgumentParser(description="Batch config verifier")
-    ap.add_argument("--plan", default="")
-    ap.add_argument("--source", default="")
-    ap.add_argument("--workdir", default="")
-    ap.add_argument("--per-file-bat", default="")
+    ap.add_argument("--plan", required=True)
     ap.add_argument("--result-mkv", default="")
     ap.add_argument("--result-mp4", default="")
     ap.add_argument("--check-filters", action="store_true")
@@ -484,95 +299,72 @@ def main(argv: List[str]) -> int:
     errors: List[str] = []
     warnings: List[str] = []
 
-    resolved_plan = None
-    if args.plan:
-        resolved_plan = resolve_file_plan(Path(args.plan))
-        source = resolved_plan.paths.source
-        workdir = resolved_plan.paths.workdir
-        bat_cfg = build_plan_cfg(resolved_plan)
-        errors.extend(validate_resolved_plan_tracks(resolved_plan.legacy_tracks()))
-        zone_path = resolved_plan.paths.zone_file
-    else:
-        source = Path(args.source)
-        workdir = Path(args.workdir) if args.workdir else Path()
-        zone_path = workdir / "zone_edit_command.txt" if args.workdir else Path()
-        bat_cfg = None
+    resolved_plan = resolve_file_plan(Path(args.plan))
+    source = resolved_plan.paths.source
+    workdir = resolved_plan.paths.workdir
+    plan_cfg = build_plan_cfg(resolved_plan)
+    errors.extend(validate_resolved_plan_tracks(resolved_plan.runtime_tracks()))
+    zone_path = resolved_plan.paths.zone_file
 
     if not source.exists():
         errors.append(f"source missing: {source}")
 
-    if args.per_file_bat and resolved_plan is None:
-        bat_cfg, errs, warns = validate_bat(Path(args.per_file_bat))
-        errors.extend(errs)
-        warnings.extend(warns)
+    if not workdir.exists():
+        warnings.append(f"workdir missing: {workdir}")
 
-    if args.workdir or resolved_plan is not None:
-        if not workdir.exists():
-            warnings.append(f"workdir missing: {workdir}")
-        if resolved_plan is None:
-            tracks_path = workdir / "tracks.json"
-            if tracks_path.exists():
+    if source.exists():
+        z_errs, z_warns = check_zone_syntax(zone_path, source)
+        errors.extend(z_errs)
+        warnings.extend(z_warns)
+    elif zone_path.exists():
+        warnings.append("zone syntax skipped: source missing")
+
+    if args.check_filters and source.exists():
+        if plan_cfg.fastpass_vf.strip():
+            msg = check_filter(source, plan_cfg.fastpass_vf)
+            if msg:
+                if "skipped" in msg:
+                    warnings.append(f"FASTPASS_VF: {msg}")
+                else:
+                    errors.append(f"FASTPASS_VF: {msg}")
+        if plan_cfg.mainpass_vf.strip():
+            msg = check_filter(source, plan_cfg.mainpass_vf)
+            if msg:
+                if "skipped" in msg:
+                    warnings.append(f"MAINPASS_VF: {msg}")
+                else:
+                    errors.append(f"MAINPASS_VF: {msg}")
+
+    if args.check_params and source.exists():
+        fast_tokens = parse_param_tokens(plan_cfg.fastpass)
+        main_tokens = parse_param_tokens(plan_cfg.mainpass)
+
+        ok, msg = run_param_check(source, fast_tokens)
+        if not ok:
+            errors.append(f"FASTPASS params: {msg}")
+        elif msg != "ok":
+            warnings.append(f"FASTPASS params: {msg}")
+
+        combined = apply_override(list(fast_tokens), main_tokens)
+        ok, msg = run_param_check(source, combined)
+        if not ok:
+            errors.append(f"MAINPASS overlay params: {msg}")
+        elif msg != "ok":
+            warnings.append(f"MAINPASS overlay params: {msg}")
+
+        if zone_path.exists():
+            for line in load_zone_lines(zone_path):
                 try:
-                    obj = load_json(tracks_path)
-                    errors.extend(validate_tracks_json(obj))
+                    zone_tokens = parse_zone_actions(line)
                 except Exception as exc:
-                    errors.append(str(exc))
-            else:
-                warnings.append(f"tracks.json missing: {tracks_path}")
-
-        if source.exists():
-            z_errs, z_warns = check_zone_syntax(zone_path, source)
-            errors.extend(z_errs)
-            warnings.extend(z_warns)
-        elif zone_path.exists():
-            warnings.append("zone syntax skipped: source missing")
-
-        if args.check_filters and source.exists() and bat_cfg is not None:
-            if bat_cfg.fastpass_vf.strip():
-                msg = check_filter(source, bat_cfg.fastpass_vf)
-                if msg:
-                    if "skipped" in msg:
-                        warnings.append(f"FASTPASS_VF: {msg}")
-                    else:
-                        errors.append(f"FASTPASS_VF: {msg}")
-            if bat_cfg.mainpass_vf.strip():
-                msg = check_filter(source, bat_cfg.mainpass_vf)
-                if msg:
-                    if "skipped" in msg:
-                        warnings.append(f"MAINPASS_VF: {msg}")
-                    else:
-                        errors.append(f"MAINPASS_VF: {msg}")
-
-        if args.check_params and source.exists() and bat_cfg is not None:
-            fast_tokens = parse_param_tokens(bat_cfg.fastpass)
-            main_tokens = parse_param_tokens(bat_cfg.mainpass)
-
-            ok, msg = run_param_check(source, fast_tokens)
-            if not ok:
-                errors.append(f"FASTPASS params: {msg}")
-            elif msg != "ok":
-                warnings.append(f"FASTPASS params: {msg}")
-
-            combined = apply_override(list(fast_tokens), main_tokens)
-            ok, msg = run_param_check(source, combined)
-            if not ok:
-                errors.append(f"MAINPASS overlay params: {msg}")
-            elif msg != "ok":
-                warnings.append(f"MAINPASS overlay params: {msg}")
-
-            if zone_path.exists():
-                for line in load_zone_lines(zone_path):
-                    try:
-                        zone_tokens = parse_zone_actions(line)
-                    except Exception as exc:
-                        errors.append(f"zone line parse failed: {line}: {exc}")
-                        continue
-                    merged = apply_override(list(combined), zone_tokens)
-                    ok, msg = run_param_check(source, merged)
-                    if not ok:
-                        errors.append(f"zone params failed: {line}: {msg}")
-                    elif msg != "ok":
-                        warnings.append(f"zone params skipped: {line}: {msg}")
+                    errors.append(f"zone line parse failed: {line}: {exc}")
+                    continue
+                merged = apply_override(list(combined), zone_tokens)
+                ok, msg = run_param_check(source, merged)
+                if not ok:
+                    errors.append(f"zone params failed: {line}: {msg}")
+                elif msg != "ok":
+                    warnings.append(f"zone params skipped: {line}: {msg}")
 
     if warnings:
         print("[verify] warnings:")

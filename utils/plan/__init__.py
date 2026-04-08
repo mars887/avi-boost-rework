@@ -1,9 +1,7 @@
 from utils.plan.adapters import (
     file_plan_from_gui_result,
-    file_plan_from_legacy_tracks_data,
     gui_defaults_from_file_plan,
     gui_settings_from_file_plan,
-    load_legacy_tracks_json,
 )
 from utils.plan.io import (
     create_default_file_plan,
@@ -119,6 +117,4 @@ __all__ = [
     "gui_defaults_from_file_plan",
     "gui_settings_from_file_plan",
     "file_plan_from_gui_result",
-    "file_plan_from_legacy_tracks_data",
-    "load_legacy_tracks_json",
 ]

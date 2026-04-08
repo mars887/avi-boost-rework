@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # audio-tool.py
 #
-# Audio processing utility for a single source MKV based on tracks.json.
+# Audio processing utility for a single source MKV based on file .plan.
 #
 # Key behaviors (updated per January 2026 clarifications):
 # - Source is always MKV.
@@ -424,7 +424,7 @@ def parse_profile(track: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 @dataclass
 class OutputEntry:
     srcTrackId: int
-    status: str              # COPY | EDIT (from tracks.json)
+    status: str              # COPY | EDIT
     role: str                # primary | fallback_original (optional)
     outPath: str             # relative to workdir
     container: str
@@ -634,10 +634,7 @@ def encode_opus_with_opusenc(
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog=TOOL_NAME)
-    ap.add_argument("--plan", default="", help="Path to file .plan")
-    ap.add_argument("--source", default="", help="Path to source MKV")
-    ap.add_argument("--workdir", default="", help="Episode workdir")
-    ap.add_argument("--tracksData", default="", help="Path to tracks.json (relative is relative to --workdir)")
+    ap.add_argument("--plan", required=True, help="Path to file .plan")
 
     ap.add_argument("--ffmpeg", default="ffmpeg")
     ap.add_argument("--ffprobe", default="ffprobe")
@@ -655,19 +652,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = ap.parse_args(argv)
 
-    resolved_plan = None
-    if args.plan:
-        resolved_plan = resolve_file_plan(Path(args.plan))
-        source = resolved_plan.paths.source
-        workdir = resolved_plan.paths.workdir
-    else:
-        if not args.source or not args.workdir or not args.tracksData:
-            eprint(f"[{TOOL_NAME}] ERROR: Either --plan or (--source, --workdir, --tracksData) is required.")
-            return 2
-        source = Path(args.source)
-        workdir = Path(args.workdir)
+    resolved_plan = resolve_file_plan(Path(args.plan))
+    source = resolved_plan.paths.source
+    workdir = resolved_plan.paths.workdir
     setup_logging(args.log, workdir)
-    tracks_data = Path(args.tracksData) if args.tracksData else Path()
     marker = marker_path(workdir)
     if marker.exists() and not args.overwrite:
         print(f"[{TOOL_NAME}] skip: marker exists: {marker}")
@@ -715,17 +703,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         machine_log["events"].append({"t": time.time(), **ev})
 
     try:
-        if resolved_plan is not None:
-            tracks = resolved_plan.legacy_tracks()
-        else:
-            if not tracks_data.is_absolute():
-                tracks_data = workdir / tracks_data
-            if not tracks_data.exists():
-                raise AudioToolError("audio_missing_tracksjson", f"tracks.json not found: {tracks_data}")
-            data = read_json(tracks_data)
-            tracks = data.get("tracks") if isinstance(data, dict) else None
-            if not isinstance(tracks, list):
-                raise AudioToolError("invalid_tracksjson", "tracks.json has no 'tracks' array")
+        tracks = resolved_plan.runtime_tracks()
 
         outputs: List[OutputEntry] = []
 
@@ -980,3 +958,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

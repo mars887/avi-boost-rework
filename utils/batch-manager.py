@@ -186,8 +186,7 @@ def resolve_source_from_path(p: Path) -> Optional[Path]:
                 resolved = resolve_batch_plan(full)
                 if len(resolved) == 1:
                     return resolved[0].paths.source
-        base = stem
-        return choose_source_path(p.parent, base)
+        return None
 
     if name in ("zone_edit_command.txt",):
         workdir = p.parent

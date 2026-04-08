@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -47,7 +46,6 @@ def gui_defaults_from_file_plan(plan: FilePlan) -> Dict[str, Any]:
         "quality": primary.quality,
         "fastpass_preset": primary.fastpass_preset,
         "preset": primary.preset,
-        "mainpass_preset": primary.preset,
         "fastpass_workers": str(primary.fastpass_workers),
         "mainpass_workers": str(primary.mainpass_workers),
         "no_fastpass": primary.no_fastpass,
@@ -128,6 +126,21 @@ def gui_settings_from_file_plan(plan: FilePlan) -> List[Dict[str, Any]]:
     return settings
 
 
+def _parse_video_config(raw_config: Dict[str, Any], default_quality: float) -> tuple[float, str, str, Dict[str, Any], Dict[str, Any]]:
+    fastpass_raw = dict(raw_config.get("fastpass_params") or {})
+    mainpass_raw = dict(raw_config.get("mainpass_params") or {})
+
+    fastpass_quality = fastpass_raw.pop("--crf", None)
+    mainpass_quality = mainpass_raw.pop("--crf", None)
+    fastpass_preset = str(raw_config.get("fastpass_preset") or fastpass_raw.pop("--preset", "") or "")
+    preset = str(raw_config.get("preset") or mainpass_raw.pop("--preset", "") or "")
+    quality = to_float(raw_config.get("quality") or mainpass_quality or fastpass_quality, default_quality)
+
+    fastpass_params = {str(key): coerce_scalar(value) for key, value in fastpass_raw.items() if str(key).startswith("--")}
+    mainpass_params = {str(key): coerce_scalar(value) for key, value in mainpass_raw.items() if str(key).startswith("--")}
+    return quality, fastpass_preset, preset, fastpass_params, mainpass_params
+
+
 def file_plan_from_gui_result(
     *,
     source: Path,
@@ -148,7 +161,7 @@ def file_plan_from_gui_result(
         scene_detection=str(defaults.get("scene_detection") or DEFAULT_SCENE_DETECTION),
         quality=float(defaults.get("quality") or DEFAULT_QUALITY),
         fastpass_preset=str(defaults.get("fastpass_preset") or ""),
-        preset=str(defaults.get("preset") or defaults.get("mainpass_preset") or ""),
+        preset=str(defaults.get("preset") or ""),
         fastpass_workers=int(defaults.get("fastpass_workers") or 8),
         mainpass_workers=int(defaults.get("mainpass_workers") or 8),
         no_fastpass=bool(defaults.get("no_fastpass")),
@@ -172,30 +185,11 @@ def file_plan_from_gui_result(
         note=str(defaults.get("note") or ""),
     )
 
-    track_param = dict(video_result.get("trackParam") or {})
-    fastpass_params: Dict[str, Any] = {}
-    mainpass_params: Dict[str, Any] = {}
-    quality = video_primary.quality
-    fastpass_preset = video_primary.fastpass_preset
-    preset = video_primary.preset
-    for key, value in track_param.items():
-        key_text = str(key)
-        if key_text == "--crf":
-            quality = to_float(value, DEFAULT_QUALITY)
-            continue
-        if key_text == "^^crf":
-            quality = to_float(value, quality)
-            continue
-        if key_text == "--preset":
-            fastpass_preset = str(value or "")
-            continue
-        if key_text == "^^preset":
-            preset = str(value or "")
-            continue
-        if key_text.startswith("^^"):
-            mainpass_params[key_text.replace("^^", "--", 1)] = coerce_scalar(value)
-        elif key_text.startswith("--"):
-            fastpass_params[key_text] = coerce_scalar(value)
+    video_config = dict(video_result.get("videoConfig") or {})
+    quality, fastpass_preset, preset, fastpass_params, mainpass_params = _parse_video_config(
+        video_config,
+        video_primary.quality,
+    )
     video_primary.quality = quality
     video_primary.fastpass_preset = fastpass_preset
     video_primary.preset = preset
@@ -259,150 +253,6 @@ def file_plan_from_gui_result(
     )
 
 
-def file_plan_from_legacy_tracks_data(
-    data: Dict[str, Any],
-    *,
-    plan_path: Optional[Path] = None,
-    zone_file: Optional[Path] = None,
-) -> FilePlan:
-    source = Path(str(data.get("source") or "")).expanduser()
-    if not source:
-        raise RuntimeError("Legacy tracks data has no source path")
-    if not source.is_absolute():
-        source = source.absolute()
-
-    workdir_raw = str(data.get("workdir") or "")
-    workdir = Path(workdir_raw).expanduser() if workdir_raw else (source.parent / source.stem)
-    if not workdir.is_absolute():
-        workdir = workdir.absolute()
-
-    plan_file = Path(plan_path).absolute() if plan_path is not None else plan_path_for_source(source).absolute()
-    _ = zone_file
-    tracks = [item for item in (data.get("tracks") or []) if isinstance(item, dict)]
-    video_track = next(
-        (
-            item
-            for item in tracks
-            if normalize_track_type(item.get("type")) == "video"
-            and str(item.get("trackStatus") or "").strip().lower() in ("edit", "copy")
-        ),
-        None,
-    )
-    if video_track is None:
-        raise RuntimeError("Legacy tracks data has no usable video track")
-
-    video_mux = dict(video_track.get("trackMux") or {})
-    video_param = dict(video_track.get("trackParam") or {})
-    fastpass_params: Dict[str, Any] = {}
-    mainpass_params: Dict[str, Any] = {}
-    quality = DEFAULT_QUALITY
-    fastpass_preset = ""
-    preset = ""
-
-    for key, value in video_param.items():
-        key_text = str(key)
-        if key_text == "--crf":
-            quality = to_float(value, DEFAULT_QUALITY)
-            continue
-        if key_text == "^^crf":
-            quality = to_float(value, quality)
-            continue
-        if key_text == "--preset":
-            fastpass_preset = str(value or "")
-            continue
-        if key_text == "^^preset":
-            preset = str(value or "")
-            continue
-        if key_text.startswith("^^"):
-            mainpass_params[key_text.replace("^^", "--", 1)] = coerce_scalar(value)
-        elif key_text.startswith("--"):
-            fastpass_params[key_text] = coerce_scalar(value)
-
-    workers_text = str(video_mux.get("workers") or "8")
-    video_plan = VideoPlan(
-        track_id=int(video_track.get("trackId") or 0),
-        source_name=str(video_track.get("origName") or ""),
-        source_lang=str(video_track.get("origLang") or ""),
-        action=str(video_track.get("trackStatus") or "EDIT").strip().lower(),
-        primary=VideoPrimary(
-            encoder=normalize_encoder(video_mux.get("encoder")),
-            scene_detection=str(video_mux.get("sceneDetection") or DEFAULT_SCENE_DETECTION),
-            quality=quality,
-            fastpass_preset=fastpass_preset,
-            preset=preset,
-            fastpass_workers=int(video_mux.get("fastpassWorkers") or workers_text or 8),
-            mainpass_workers=int(video_mux.get("mainpassWorkers") or workers_text or 8),
-            no_fastpass=parse_bool_value(video_mux.get("noFastpass"), False),
-            fastpass_hdr=parse_bool_value(video_mux.get("fastpassHdr"), True),
-            strict_sdr_8bit=parse_bool_value(video_mux.get("strictSdr8bit"), False),
-            no_dolby_vision=parse_bool_value(video_mux.get("noDolbyVision"), False),
-            no_hdr10plus=parse_bool_value(video_mux.get("noHdr10Plus"), False),
-            attach_encode_info=parse_bool_value(video_mux.get("attachEncodeInfo"), False),
-            ab_multiplier=to_float(video_mux.get("abMultiplier"), 0.7),
-            ab_pos_dev=to_float(video_mux.get("abPosDev"), 5.0),
-            ab_neg_dev=to_float(video_mux.get("abNegDev"), 4.0),
-            ab_pos_multiplier=str(video_mux.get("abPosMultiplier") or ""),
-            ab_neg_multiplier=str(video_mux.get("abNegMultiplier") or ""),
-        ),
-        details=VideoDetails(
-            fastpass_filter=str(video_mux.get("fastpass") or ""),
-            mainpass_filter=str(video_mux.get("mainpass") or ""),
-            main_vpy=str(video_mux.get("mainVpy") or ""),
-            fast_vpy=str(video_mux.get("fastVpy") or ""),
-            proxy_vpy=str(video_mux.get("proxyVpy") or ""),
-            note=str(video_mux.get("note") or ""),
-        ),
-        fastpass_params=fastpass_params,
-        mainpass_params=mainpass_params,
-    )
-
-    audio_plans: List[AudioPlan] = []
-    sub_plans: List[SubPlan] = []
-    for item in tracks:
-        track_type = normalize_track_type(item.get("type"))
-        if track_type == "video":
-            continue
-        mux = dict(item.get("trackMux") or {})
-        param = dict(item.get("trackParam") or {})
-        if track_type == "audio":
-            audio_plans.append(
-                AudioPlan(
-                    track_id=int(item.get("trackId") or 0),
-                    source_name=str(item.get("origName") or ""),
-                    source_lang=str(item.get("origLang") or ""),
-                    action=str(item.get("trackStatus") or "COPY").strip().lower(),
-                    name=str(mux.get("name") or ""),
-                    lang=str(mux.get("lang") or item.get("origLang") or ""),
-                    default=parse_bool_value(mux.get("default"), False),
-                    forced=parse_bool_value(mux.get("forced"), False),
-                    bitrate_kbps=int(param.get("bitrate") or 128),
-                    channels=int(param.get("channels") or 2),
-                )
-            )
-        elif track_type == "sub":
-            sub_plans.append(
-                SubPlan(
-                    track_id=int(item.get("trackId") or 0),
-                    source_name=str(item.get("origName") or ""),
-                    source_lang=str(item.get("origLang") or ""),
-                    action=str(item.get("trackStatus") or "COPY").strip().lower(),
-                    name=str(mux.get("name") or ""),
-                    lang=str(mux.get("lang") or item.get("origLang") or ""),
-                    default=parse_bool_value(mux.get("default"), False),
-                    forced=parse_bool_value(mux.get("forced"), False),
-                )
-            )
-
-    meta_name = workdir.name or source.stem
-    return FilePlan(
-        meta=PlanMeta(name=meta_name, created_by="legacy-tracks.json"),
-        paths=PlanPaths(source=_relative_source_for_plan(source, plan_file)),
-        video=video_plan,
-        audio=audio_plans,
-        sub=sub_plans,
-    )
-
-
 def _relative_source_for_plan(source: Path, plan_file: Path) -> str:
     try:
         return str(source.absolute().relative_to(plan_file.parent.absolute()))
@@ -410,17 +260,8 @@ def _relative_source_for_plan(source: Path, plan_file: Path) -> str:
         return str(source.absolute())
 
 
-def load_legacy_tracks_json(path: Path, *, plan_path: Optional[Path] = None) -> FilePlan:
-    tracks_path = Path(path).absolute()
-    with tracks_path.open("r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    return file_plan_from_legacy_tracks_data(data, plan_path=plan_path, zone_file=tracks_path.parent / "zone_edit_command.txt")
-
-
 __all__ = [
     "gui_defaults_from_file_plan",
     "gui_settings_from_file_plan",
     "file_plan_from_gui_result",
-    "file_plan_from_legacy_tracks_data",
-    "load_legacy_tracks_json",
 ]

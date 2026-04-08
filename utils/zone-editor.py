@@ -892,6 +892,73 @@ def selector_matches(scene_idx: int, scene_start: int, scene_end: int, cmd: Comm
     return matches
 
 
+def format_scene_group(values: Sequence[int]) -> str:
+    ordered: List[int] = []
+    for value in values:
+        ivalue = int(value)
+        if ordered and ordered[-1] == ivalue:
+            continue
+        ordered.append(ivalue)
+
+    if not ordered:
+        return "-"
+
+    parts: List[str] = []
+    start = end = ordered[0]
+    for value in ordered[1:]:
+        if value == end + 1:
+            end = value
+            continue
+        parts.append(str(start) if start == end else f"{start}..{end}")
+        start = end = value
+    parts.append(str(start) if start == end else f"{start}..{end}")
+    return ",".join(parts)
+
+
+def format_frame_group(ranges: Sequence[Tuple[int, int]]) -> str:
+    normalized: List[Tuple[int, int]] = []
+    for start, end in ranges:
+        s0 = int(start)
+        s1 = int(end)
+        if not normalized:
+            normalized.append((s0, s1))
+            continue
+        prev_start, prev_end = normalized[-1]
+        if s0 <= prev_end:
+            normalized[-1] = (prev_start, max(prev_end, s1))
+            continue
+        normalized.append((s0, s1))
+    return ",".join(f"{start}-{end}" for start, end in normalized) if normalized else "-"
+
+
+def render_command_actions(cmd: Command) -> str:
+    try:
+        _selectors_part, _sep, action_tokens = split_command_tokens(cmd.raw_line)
+    except ValueError:
+        parts: List[str] = []
+        for action in cmd.actions:
+            parts.append(action.key)
+            parts.append(action.raw_value)
+        return " ".join(parts).strip()
+    return " ".join(action_tokens).strip()
+
+
+def render_command_context(cmd: Command, matches: Sequence[Dict[str, Any]]) -> str:
+    matched_raws = {str(item.get("raw") or "") for item in matches if item.get("raw")}
+    selector_parts: List[str] = []
+    for selector in cmd.selectors:
+        raw = selector.raw
+        if raw in matched_raws:
+            selector_parts.append(f"[ {raw} ]")
+        else:
+            selector_parts.append(raw)
+    selectors_text = ",".join(selector_parts)
+    actions_text = render_command_actions(cmd)
+    if actions_text:
+        return f"{selectors_text} {cmd.sep} {actions_text}"
+    return selectors_text
+
+
 # ------------------------- main apply -------------------------
 
 def apply_commands_to_scenes(
@@ -904,6 +971,8 @@ def apply_commands_to_scenes(
     scenes = scenes_data.get("scenes") or []
     if not isinstance(scenes, list):
         raise RuntimeError("Invalid scenes.json: top-level 'scenes' must be a list.")
+
+    log_groups: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
     for idx, sc in enumerate(scenes):
         try:
@@ -966,9 +1035,6 @@ def apply_commands_to_scenes(
 
             if changes:
                 zo["video_params"] = build_video_params(pairs)
-                print(f"[scene {idx:4d}  {s0}-{s1})  cmd#{cmd_i}: {cmd.raw_line}")
-                for c in changes:
-                    print(f"  - {c}")
                 meta = ensure_scene_meta(sc, idx, s0, s1, video.fps)
                 ze = meta.get("zone_editor")
                 if not isinstance(ze, dict):
@@ -978,15 +1044,38 @@ def apply_commands_to_scenes(
                 if not isinstance(applied, list):
                     applied = []
                     ze["applied_commands"] = applied
+                match_info = selector_matches(idx, s0, s1, cmd)
                 applied.append({
                     "cmd_index": cmd_i,
                     "cmd_line": cmd.raw_line,
                     "selectors": [sel.raw for sel in cmd.selectors],
                     "sep": cmd.sep,
-                    "matches": selector_matches(idx, s0, s1, cmd),
+                    "matches": match_info,
                     "changes": changes_detail,
                 })
                 ze["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                command_context = render_command_context(cmd, match_info)
+                group_key = (cmd_i, command_context, tuple(changes))
+                group = log_groups.get(group_key)
+                if group is None:
+                    group = {
+                        "cmd_index": cmd_i,
+                        "command_context": command_context,
+                        "changes": tuple(changes),
+                        "scene_indexes": [],
+                        "frame_ranges": [],
+                    }
+                    log_groups[group_key] = group
+                group["scene_indexes"].append(idx)
+                group["frame_ranges"].append((s0, s1))
+
+    for group in log_groups.values():
+        scene_text = format_scene_group(group["scene_indexes"])
+        frame_text = format_frame_group(group["frame_ranges"])
+        print(f"[scene {scene_text:>8}  {frame_text}]  - cmd#{group['cmd_index']} - {group['command_context']}")
+        for change in group["changes"]:
+            print(f"  {change}")
 
     scenes_data["split_scenes"] = copy.deepcopy(scenes)
 

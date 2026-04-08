@@ -12,7 +12,7 @@ from typing import Optional, TextIO
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 PROGRESS_RE = re.compile(
-    r"^(progress|processed)\s*[:\-]?\s*\d+%\s*$|^frame\s+\d+\s*/.*fps$|^creating lwi index file\s+\d+%\s*$",
+    r"^(progress|processed)\s*[:\-]?\s*\d+%\s*$|^frame\s+\d+\s*/.*fps$|^creating lwi index file\s+\d+%\s*$|^scene\s+\[\d+:\d+\]\s*/\s*creating scenes\s*$",
     re.IGNORECASE,
 )
 

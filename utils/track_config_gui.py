@@ -434,6 +434,7 @@ def build_results(files, tracks_by_file, settings, defaults):
                 default_display = "true" if default_value else "false"
 
             track_param = {}
+            video_config = None
             params_display = ""
             if track_type == "video" and mode == "EDIT":
                 param_map = dict(default_params_map)
@@ -446,10 +447,17 @@ def build_results(files, tracks_by_file, settings, defaults):
                     last_param_map.update(track_last_param_map)
                 if default_strict_sdr_8bit:
                     last_param_map = apply_strict_sdr_8bit_params(last_param_map, default_encoder)
-                if param_map:
-                    track_param.update(param_map)
-                if last_param_map:
-                    track_param.update({key.replace("-", "^"): value for key, value in last_param_map.items()})
+                fastpass_crf = get_param_value(param_map, "--crf")
+                mainpass_crf = get_param_value(last_param_map, "--crf")
+                video_config = {
+                    "quality": mainpass_crf or fastpass_crf or "",
+                    "fastpass_crf": fastpass_crf,
+                    "mainpass_crf": mainpass_crf,
+                    "fastpass_preset": get_param_value(param_map, "--preset"),
+                    "preset": get_param_value(last_param_map, "--preset"),
+                    "fastpass_params": dict(param_map),
+                    "mainpass_params": dict(last_param_map),
+                }
                 param_parts = []
                 param_parts.append(f"encoder={default_encoder}")
                 if entry["params"]:
@@ -512,6 +520,7 @@ def build_results(files, tracks_by_file, settings, defaults):
                     "origLang": orig_lang,
                     "trackStatus": mode,
                     "trackParam": track_param,
+                    "videoConfig": video_config,
                     "trackMux": track_mux,
                 }
             )
@@ -548,7 +557,7 @@ def build_results(files, tracks_by_file, settings, defaults):
 
 def build_default_defaults_dict():
     return {
-        "params": "--variance-boost-strength 2 --variance-octile 6 --variance-boost-curve 3 --tune 0 --qm-min 7 --chroma-qm-min 10 --scm 0 --enable-dlf 2 --sharp-tx 1 --enable-restoration 0 --color-primaries 9 --transfer-characteristics 16 --matrix-coefficients 9 --lp 3 --sharpness 1 --hbd-mds 1 --ac-bias 2.00 --crf 30",
+        "params": "--variance-boost-strength 2 --variance-octile 6 --variance-boost-curve 3 --tune 0 --qm-min 7 --chroma-qm-min 10 --scm 0 --enable-dlf 2 --sharp-tx 1 --enable-restoration 0 --lp 3 --sharpness 1 --hbd-mds 1 --ac-bias 2.00 --crf 30",
         "last_params": "--film-grain 14 --complex-hvs 1 --crf 30",
         "zoning": "",
         "fastpass": "",
@@ -820,8 +829,9 @@ class TrackConfigGui:
         ttk.Checkbutton(frame, text="fastpass HDR", variable=self.fastpass_hdr_var).grid(
             row=row, column=1, sticky=tk.W, pady=2
         )
+        row += 1
         ttk.Checkbutton(frame, text="Strict SDR 8bit", variable=self.strict_sdr_8bit_var).grid(
-            row=row, column=2, sticky=tk.W, padx=(12, 0), pady=2
+            row=row, column=1, sticky=tk.W, pady=2
         )
         row += 1
 
@@ -1362,9 +1372,11 @@ class TrackConfigGui:
                     continue
                 if str(t.get("trackStatus") or "").upper() != "EDIT":
                     continue
-                track_param = t.get("trackParam") or {}
-                fast_crf = get_param_value(track_param, "--crf")
-                main_crf = get_param_value(track_param, "^^crf")
+                video_config = t.get("videoConfig") or {}
+                fastpass_params = dict(video_config.get("fastpass_params") or {})
+                mainpass_params = dict(video_config.get("mainpass_params") or {})
+                fast_crf = str(video_config.get("fastpass_crf") or "").strip()
+                main_crf = str(video_config.get("mainpass_crf") or "").strip()
                 if not fast_crf and not main_crf:
                     missing.append(f"{os.path.basename(file_path)} (trackId={t.get('trackId')})")
                 if fast_crf and main_crf:
@@ -1375,7 +1387,12 @@ class TrackConfigGui:
                     if not same:
                         mismatch.append(f"{os.path.basename(file_path)} (trackId={t.get('trackId')})")
                 encoder = normalize_encoder((t.get("trackMux") or {}).get("encoder"))
-                conflicts = find_encoder_param_conflicts(encoder, track_param)
+                conflicts = sorted(
+                    {
+                        *find_encoder_param_conflicts(encoder, fastpass_params),
+                        *find_encoder_param_conflicts(encoder, mainpass_params),
+                    }
+                )
                 if conflicts:
                     encoder_conflicts.append(
                         f"{os.path.basename(file_path)} (trackId={t.get('trackId')}): " + ", ".join(conflicts)

@@ -361,8 +361,6 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
     preset_value = data.get("preset")
     if preset_value is None:
         preset_value = video_primary_data.get("preset")
-    if preset_value in (None, ""):
-        preset_value = video_primary_data.get("mainpass_preset")
 
     return FilePlan(
         format_version=format_version,

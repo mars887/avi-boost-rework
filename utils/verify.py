@@ -303,17 +303,6 @@ def check_file_exists(p: Path, min_bytes: int, err_id: str) -> None:
         raise RuntimeError(err_id)
 
 
-def parse_tracks(tracks_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-    tracks = tracks_json.get("tracks")
-    if not isinstance(tracks, list):
-        raise RuntimeError("invalid_tracksjson_no_tracks")
-    out: List[Dict[str, Any]] = []
-    for t in tracks:
-        if isinstance(t, dict):
-            out.append(t)
-    return out
-
-
 def norm_type(t: str) -> str:
     v = (t or "").strip().lower()
     if v.startswith("sub") or v == "subtitle":
@@ -515,28 +504,15 @@ def verify_duration_consistency(
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="verify")
-    ap.add_argument("--plan", default="")
-    ap.add_argument("--source", default="")
-    ap.add_argument("--workdir", default="")
-    ap.add_argument("--tracksData", default="", help="Relative is relative to --workdir")
+    ap.add_argument("--plan", required=True)
     ap.add_argument("--ffprobe", default="ffprobe", help="Optional; used if available")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
     args = ap.parse_args(argv)
 
-    if args.plan:
-        resolved_plan = resolve_file_plan(Path(args.plan))
-        source = resolved_plan.paths.source
-        workdir = resolved_plan.paths.workdir
-        tracks = resolved_plan.legacy_tracks()
-        tracks_path = resolved_plan.paths.plan_path
-    else:
-        if not args.source or not args.workdir or not args.tracksData:
-            eprint("[verify] ERROR: Either --plan or (--source, --workdir, --tracksData) is required.")
-            return 2
-        source = Path(args.source)
-        workdir = Path(args.workdir)
-        tracks_path = resolve_rel_to_workdir(workdir, args.tracksData)
-        tracks = []
+    resolved_plan = resolve_file_plan(Path(args.plan))
+    source = resolved_plan.paths.source
+    workdir = resolved_plan.paths.workdir
+    tracks = resolved_plan.runtime_tracks()
 
     setup_logging(args.log, workdir)
     marker = marker_path(workdir)
@@ -557,20 +533,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             write_verify_error(workdir, "missing_workdir")
             eprint("[verify] ERROR: workdir missing")
             return 2
-        if not tracks_path.exists():
-            write_verify_error(workdir, "missing_tracksjson")
-            eprint(f"[verify] ERROR: tracks.json missing: {tracks_path}")
-            return 2
 
         ffprobe = which_or(args.ffprobe)
         if ffprobe:
             print(f"[verify] ffprobe: {ffprobe}")
         else:
             print("[verify] ffprobe: not found => media-structure checks will be skipped")
-
-        if not args.plan:
-            tracks_json = read_json(tracks_path)
-            tracks = parse_tracks(tracks_json)
 
         # 1) demux artifacts if manifest exists
         verify_demux_outputs(workdir, source, ffprobe)

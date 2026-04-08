@@ -87,14 +87,6 @@ class VideoPrimary:
     ab_pos_multiplier: str = ""
     ab_neg_multiplier: str = ""
 
-    @property
-    def mainpass_preset(self) -> str:
-        return self.preset
-
-    @mainpass_preset.setter
-    def mainpass_preset(self, value: Any) -> None:
-        self.preset = str(value or "")
-
 
 @dataclass
 class VideoDetails:
@@ -187,11 +179,11 @@ class ResolvedFilePlan:
     def has_video_copy(self) -> bool:
         return self.plan.video.action.strip().lower() == "copy"
 
-    def legacy_tracks(self) -> List[Dict[str, Any]]:
+    def runtime_tracks(self) -> List[Dict[str, Any]]:
         tracks: List[Dict[str, Any]] = []
-        tracks.append(self._video_legacy_track())
-        tracks.extend(self._audio_legacy_tracks())
-        tracks.extend(self._sub_legacy_tracks())
+        tracks.append(self._video_runtime_track())
+        tracks.extend(self._audio_runtime_tracks())
+        tracks.extend(self._sub_runtime_tracks())
         return tracks
 
     def build_encode_params_text(self) -> Optional[str]:
@@ -220,24 +212,17 @@ class ResolvedFilePlan:
             return ""
         return subprocess.list2cmdline([str(x) for x in tokens])
 
-    def _video_legacy_track(self) -> Dict[str, Any]:
+    def _video_runtime_track(self) -> Dict[str, Any]:
         video = self.plan.video
         primary = video.primary
         details = video.details
-
-        fastpass_params = {key: format_value(value) for key, value in video.fastpass_params.items()}
-        fastpass_params["--crf"] = format_value(primary.quality)
-        if primary.fastpass_preset:
-            fastpass_params["--preset"] = str(primary.fastpass_preset)
-
-        mainpass_params = {key.replace("--", "^^", 1): format_value(value) for key, value in video.mainpass_params.items()}
-        mainpass_params["^^crf"] = format_value(primary.quality)
-        if primary.preset:
-            mainpass_params["^^preset"] = str(primary.preset)
-
-        track_param: Dict[str, str] = {}
-        track_param.update(fastpass_params)
-        track_param.update(mainpass_params)
+        video_config = {
+            "quality": format_value(primary.quality),
+            "fastpass_preset": str(primary.fastpass_preset or ""),
+            "preset": str(primary.preset or ""),
+            "fastpass_params": {key: format_value(value) for key, value in video.fastpass_params.items()},
+            "mainpass_params": {key: format_value(value) for key, value in video.mainpass_params.items()},
+        }
 
         track_mux = {
             "encoder": primary.encoder,
@@ -271,7 +256,7 @@ class ResolvedFilePlan:
             "trackStatus": video.action.upper(),
             "origName": video.source_name,
             "origLang": video.source_lang,
-            "trackParam": track_param,
+            "videoConfig": video_config,
             "trackMux": track_mux,
             "fileBase": build_file_base(
                 track_id=video.track_id,
@@ -281,7 +266,7 @@ class ResolvedFilePlan:
             ),
         }
 
-    def _audio_legacy_tracks(self) -> List[Dict[str, Any]]:
+    def _audio_runtime_tracks(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for track in self.plan.audio:
             track_mux = {
@@ -313,7 +298,7 @@ class ResolvedFilePlan:
             )
         return out
 
-    def _sub_legacy_tracks(self) -> List[Dict[str, Any]]:
+    def _sub_runtime_tracks(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for track in self.plan.sub:
             track_mux = {
