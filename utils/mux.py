@@ -30,6 +30,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -50,6 +51,8 @@ from utils.plan_model import resolve_file_plan
 STATE_DIR_NAME = ".state"
 MUX_MARKER = "MUX_DONE"
 CRF_METADATA_STEP = 1.0
+SOURCE_BITRATE_TIMEOUT_SEC = 30.0
+SOURCE_BITRATE_TIMEOUT_CHECK_EVERY = 2048
 
 class TeeStream:
     def __init__(self, stream, log_file) -> None:
@@ -242,7 +245,7 @@ def get_stream_fps(source: Path) -> Optional[float]:
                 return fps
     return None
 
-def iter_frame_sizes(source: Path) -> Iterator[Tuple[int, Optional[float]]]:
+def iter_frame_sizes(source: Path, *, timeout_sec: Optional[float] = None) -> Iterator[Tuple[int, Optional[float]]]:
     cmd = [
         "ffprobe",
         "-v", "error",
@@ -261,26 +264,56 @@ def iter_frame_sizes(source: Path) -> Iterator[Tuple[int, Optional[float]]]:
         errors="replace",
     )
     assert p.stdout is not None
-    for raw in p.stdout:
-        line = raw.strip()
-        if not line:
-            continue
-        parts = line.split(",")
-        try:
-            size = int(parts[0]) if parts[0] else 0
-        except Exception:
-            continue
-        dur: Optional[float] = None
-        if len(parts) > 1 and parts[1]:
+    started = time.monotonic()
+    line_count = 0
+    try:
+        for raw in p.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            parts = line.split(",")
             try:
-                dur = float(parts[1])
+                size = int(parts[0]) if parts[0] else 0
             except Exception:
-                dur = None
-        yield size, dur
-    p.stdout.close()
-    p.wait()
+                continue
+            dur: Optional[float] = None
+            if len(parts) > 1 and parts[1]:
+                try:
+                    dur = float(parts[1])
+                except Exception:
+                    dur = None
+            line_count += 1
+            if (
+                timeout_sec is not None
+                and timeout_sec > 0
+                and line_count % SOURCE_BITRATE_TIMEOUT_CHECK_EVERY == 0
+                and (time.monotonic() - started) > timeout_sec
+            ):
+                p.kill()
+                raise TimeoutError(
+                    f"source bitrate ffprobe scan timed out after {time.monotonic() - started:.1f}s"
+                )
+            yield size, dur
+    finally:
+        try:
+            p.stdout.close()
+        except Exception:
+            pass
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
 
-def compute_source_bitrates(scenes: List[Dict[str, Any]], source: Path) -> List[Optional[float]]:
+    if p.returncode != 0:
+        raise RuntimeError(f"source bitrate ffprobe scan failed rc={p.returncode}")
+
+def compute_source_bitrates(
+    scenes: List[Dict[str, Any]],
+    source: Path,
+    *,
+    timeout_sec: Optional[float] = SOURCE_BITRATE_TIMEOUT_SEC,
+) -> List[Optional[float]]:
     count = len(scenes)
     if count == 0:
         return []
@@ -303,17 +336,30 @@ def compute_source_bitrates(scenes: List[Dict[str, Any]], source: Path) -> List[
 
     scene_idx = 0
     frame_idx = 0
-    for size, dur in iter_frame_sizes(source):
-        while scene_idx < count and frame_idx >= ranges[scene_idx][1]:
-            scene_idx += 1
-        if scene_idx >= count:
-            break
-        if frame_idx >= ranges[scene_idx][0]:
-            sizes[scene_idx] += int(size)
-            if dur is not None and dur > 0:
-                durations[scene_idx] += float(dur)
-            frames[scene_idx] += 1
-        frame_idx += 1
+    started = time.monotonic()
+    if timeout_sec is None or timeout_sec <= 0:
+        print(f"[info] source bitrate scan: {source.name} (timeout=disabled)")
+    else:
+        print(f"[info] source bitrate scan: {source.name} (timeout={timeout_sec:.1f}s)")
+    try:
+        for size, dur in iter_frame_sizes(source, timeout_sec=timeout_sec):
+            while scene_idx < count and frame_idx >= ranges[scene_idx][1]:
+                scene_idx += 1
+            if scene_idx >= count:
+                break
+            if frame_idx >= ranges[scene_idx][0]:
+                sizes[scene_idx] += int(size)
+                if dur is not None and dur > 0:
+                    durations[scene_idx] += float(dur)
+                frames[scene_idx] += 1
+            frame_idx += 1
+    except TimeoutError as ex:
+        print(f"[warn] {ex}; source_kbps skipped.")
+        return [None] * count
+    except Exception as ex:
+        print(f"[warn] source bitrate scan failed: {ex}; source_kbps skipped.")
+        return [None] * count
+    print(f"[info] source bitrate scan done: frames={frame_idx} elapsed={time.monotonic() - started:.1f}s")
 
     fps: Optional[float] = None
     if any(d <= 0 and f > 0 for d, f in zip(durations, frames)):
@@ -404,7 +450,34 @@ def apply_bitrates(scene_list: List[Dict[str, Any]], values: List[Optional[float
             changed = True
     return changed
 
-def update_scene_bitrates(workdir: Path, source: Path, *, include_source: bool = True) -> None:
+def scene_bitrate_complete(scene_list: List[Dict[str, Any]], key: str) -> bool:
+    if not scene_list:
+        return False
+    for scene in scene_list:
+        if not isinstance(scene, dict):
+            return False
+        meta = scene.get("pb_meta")
+        if not isinstance(meta, dict):
+            return False
+        bitrate = meta.get("bitrate")
+        if not isinstance(bitrate, dict):
+            return False
+        value = bitrate.get(key)
+        if value in (None, ""):
+            return False
+        try:
+            float(value)
+        except Exception:
+            return False
+    return True
+
+def update_scene_bitrates(
+    workdir: Path,
+    source: Path,
+    *,
+    include_source: bool = True,
+    source_timeout_sec: Optional[float] = SOURCE_BITRATE_TIMEOUT_SEC,
+) -> None:
     video_dir = workdir / "video"
     scenes_path = None
     for name in ("scenes-final.json", "scenes-hdr.json", "scenes.json"):
@@ -432,7 +505,21 @@ def update_scene_bitrates(workdir: Path, source: Path, *, include_source: bool =
     count = len(base_list)
     fast_list = compute_chunk_bitrates(video_dir / "fastpass", count)
     main_list = compute_chunk_bitrates(video_dir / "mainpass", count)
-    source_list = compute_source_bitrates(base_list, source) if include_source else [None] * count
+    need_source_scan = bool(include_source)
+    if need_source_scan:
+        source_already_present = True
+        if scenes is not None and len(scenes) == count:
+            source_already_present = source_already_present and scene_bitrate_complete(scenes, "source_kbps")
+        if split_scenes is not None and len(split_scenes) == count:
+            source_already_present = source_already_present and scene_bitrate_complete(split_scenes, "source_kbps")
+        if source_already_present:
+            print("[info] source bitrate already present in scenes json; source scan skipped.")
+            need_source_scan = False
+    source_list = (
+        compute_source_bitrates(base_list, source, timeout_sec=source_timeout_sec)
+        if need_source_scan
+        else [None] * count
+    )
 
     changed = False
     if scenes is not None and len(scenes) == count:
@@ -1092,6 +1179,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--mkvmerge", default="mkvmerge", help="Path to mkvmerge (MKVToolNix)")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
     ap.add_argument("--no-source-bitrate", action="store_true", help="Skip per-scene source bitrate calculation.")
+    ap.add_argument(
+        "--source-bitrate-timeout",
+        type=float,
+        default=SOURCE_BITRATE_TIMEOUT_SEC,
+        help="Abort per-scene source bitrate scan after N seconds (0 disables timeout).",
+    )
     args = ap.parse_args(argv)
 
     resolved_plan = resolve_file_plan(Path(args.plan))
@@ -1115,7 +1208,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not (Path(mkvmerge).exists() or shutil.which(mkvmerge)):
             raise RuntimeError("missing_mkvmerge")
 
-        update_scene_bitrates(workdir, source, include_source=(not args.no_source_bitrate))
+        source_timeout_sec = args.source_bitrate_timeout
+        if source_timeout_sec is not None and source_timeout_sec <= 0:
+            source_timeout_sec = None
+
+        update_scene_bitrates(
+            workdir,
+            source,
+            include_source=(not args.no_source_bitrate),
+            source_timeout_sec=source_timeout_sec,
+        )
 
         tracks = resolved_plan.runtime_tracks()
         global_tags_path, global_tags = prepare_global_tags(

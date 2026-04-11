@@ -433,6 +433,7 @@ class OutputEntry:
     sample_rate: Optional[int]
     bitrate_kbps: Optional[int]
     duration_ms: int
+    source_duration_ms: int = 0
     source_start_time_ms: int = 0
     mux_delay_ms: int = 0
     notes: str = ""
@@ -743,6 +744,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             # Probe source track info from tmp_in
             src_info = ffprobe_audio_info(ffprobe, tmp_in)
+            source_duration_ms = int(src_info.get("duration_ms") or 0)
             source_start_time_ms = int(src_info.get("start_time_ms") or 0)
 
             if status == "COPY":
@@ -776,6 +778,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         sample_rate=info.get("sample_rate"),
                         bitrate_kbps=info.get("bitrate_kbps"),
                         duration_ms=int(info.get("duration_ms") or 0),
+                        source_duration_ms=source_duration_ms,
                         source_start_time_ms=source_start_time_ms,
                         mux_delay_ms=0,
                         notes="skip_exists",
@@ -803,6 +806,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     sample_rate=info.get("sample_rate"),
                     bitrate_kbps=info.get("bitrate_kbps"),
                     duration_ms=int(info.get("duration_ms") or 0),
+                    source_duration_ms=source_duration_ms,
                     source_start_time_ms=source_start_time_ms,
                     mux_delay_ms=0,
                 ))
@@ -838,6 +842,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         sample_rate=info_o.get("sample_rate"),
                         bitrate_kbps=info_o.get("bitrate_kbps"),
                         duration_ms=int(info_o.get("duration_ms") or 0),
+                        source_duration_ms=source_duration_ms,
                         source_start_time_ms=source_start_time_ms,
                         mux_delay_ms=0,
                         notes="preserve_special_original_bitstream",
@@ -857,6 +862,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     sample_rate=info.get("sample_rate"),
                     bitrate_kbps=info.get("bitrate_kbps") or bitrate_kbps,
                     duration_ms=int(info.get("duration_ms") or 0),
+                    source_duration_ms=source_duration_ms,
                     source_start_time_ms=source_start_time_ms,
                     mux_delay_ms=source_start_time_ms,
                     notes="skip_exists",
@@ -894,6 +900,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sample_rate=info.get("sample_rate"),
                 bitrate_kbps=info.get("bitrate_kbps") or bitrate_kbps,
                 duration_ms=int(info.get("duration_ms") or 0),
+                source_duration_ms=source_duration_ms,
                 source_start_time_ms=source_start_time_ms,
                 mux_delay_ms=source_start_time_ms,
             ))

@@ -31,6 +31,7 @@ MIN_BYTES_SUB = 0          # subtitles can be tiny
 MIN_BYTES_ATTACHMENT = 16
 MIN_BYTES_AUDIO = 1024
 MIN_BYTES_VIDEO = 1024 * 256  # 256 KiB; adjust if you want stricter
+DURATION_TOLERANCE_MS = 5000
 STATE_DIR_NAME = ".state"
 VERIFY_MARKER = "VERIFY_DONE"
 
@@ -263,6 +264,60 @@ def ffprobe_duration_ms(js: Dict[str, Any]) -> int:
         return 0
 
 
+def parse_int_ms(value: Any) -> int:
+    try:
+        if value in (None, "", "N/A"):
+            return 0
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return 0
+
+
+def resolve_source_audio_duration_ms(
+    workdir: Path,
+    track: Dict[str, Any],
+    output_entry: Dict[str, Any],
+    ffprobe: Optional[str],
+) -> Tuple[int, Optional[Path], str]:
+    manifest_duration_ms = parse_int_ms(output_entry.get("source_duration_ms"))
+    if manifest_duration_ms > 0:
+        return manifest_duration_ms, None, "manifest"
+
+    if not ffprobe:
+        return 0, None, ""
+
+    file_base = str(track.get("fileBase") or "").strip()
+    if not file_base:
+        return 0, None, ""
+
+    src_path = workdir / "audio" / "tmp" / f"{file_base}.src.mka"
+    if not src_path.exists():
+        return 0, None, ""
+
+    js = run_ffprobe_json(ffprobe, src_path)
+    if not ffprobe_has_stream(js, "audio"):
+        raise RuntimeError(f"audio_source_tmp_no_audio_stream_track_{int(track.get('trackId') or 0)}")
+    return ffprobe_duration_ms(js), src_path, "tmp_src_mka"
+
+
+def duration_matches_reference(
+    output_duration_ms: int,
+    reference_duration_ms: int,
+    mux_delay_ms: int,
+    tolerance_ms: int,
+) -> bool:
+    if output_duration_ms <= 0 or reference_duration_ms <= 0:
+        return True
+
+    candidates = [output_duration_ms]
+    if mux_delay_ms != 0:
+        candidates.append(output_duration_ms + mux_delay_ms)
+    return min(abs(candidate - reference_duration_ms) for candidate in candidates) <= tolerance_ms
+
+
 def source_has_chapters(source: Path, ffprobe: Optional[str]) -> Optional[bool]:
     if not ffprobe:
         return None
@@ -407,6 +462,26 @@ def verify_audio(workdir: Path, tracks: List[Dict[str, Any]], ffprobe: Optional[
                 dms = ffprobe_duration_ms(js)
                 if dms <= 0:
                     raise RuntimeError(f"audio_bad_duration_track_{tid}")
+
+                manifest_dms = parse_int_ms(o.get("duration_ms"))
+                if manifest_dms > 0 and abs(dms - manifest_dms) > DURATION_TOLERANCE_MS:
+                    raise RuntimeError(f"audio_duration_mismatch_manifest_track_{tid}")
+
+                mux_delay_ms = parse_int_ms(o.get("mux_delay_ms"))
+                source_dms, source_ref_path, source_ref_kind = resolve_source_audio_duration_ms(workdir, t, o, ffprobe)
+                if source_dms > 0:
+                    if not duration_matches_reference(dms, source_dms, mux_delay_ms, DURATION_TOLERANCE_MS):
+                        raise RuntimeError(f"audio_duration_mismatch_source_track_{tid}")
+                    raw_delta = abs(dms - source_dms)
+                    muxed_delta = abs((dms + mux_delay_ms) - source_dms)
+                    matched_as = "muxed" if mux_delay_ms != 0 and muxed_delta < raw_delta else "raw"
+                    ref_note = source_ref_kind
+                    if source_ref_path is not None:
+                        ref_note = f"{source_ref_kind}:{source_ref_path.name}"
+                    print(
+                        f"[verify] audio: trackId={tid} duration ok "
+                        f"out={dms}ms muxed={dms + mux_delay_ms}ms source={source_dms}ms ref={ref_note} match={matched_as}"
+                    )
             results.append((p, dms))
 
     return results
@@ -486,22 +561,6 @@ def verify_demux_outputs(workdir: Path, source: Path, ffprobe: Optional[str]) ->
             raise RuntimeError("chapters_missing_or_too_small")
 
 
-def verify_duration_consistency(
-    video_dms: int,
-    audio_list: List[Tuple[Path, int]],
-    tolerance_ms: int = 5000,
-) -> None:
-    if video_dms <= 0:
-        return
-    audio_durations = [d for (_, d) in audio_list if d > 0]
-    if not audio_durations:
-        return
-    amin, amax = min(audio_durations), max(audio_durations)
-    # compare against video
-    if abs(video_dms - amin) > tolerance_ms or abs(video_dms - amax) > tolerance_ms:
-        raise RuntimeError("duration_mismatch_audio_vs_video")
-
-
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="verify")
     ap.add_argument("--plan", required=True)
@@ -544,14 +603,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         verify_demux_outputs(workdir, source, ffprobe)
 
         # 2) video
-        vpath, v_dms = verify_video(workdir, tracks, ffprobe)
+        verify_video(workdir, tracks, ffprobe)
 
         # 3) audio
-        audio_list = verify_audio(workdir, tracks, ffprobe)
-
-        # 4) optional duration consistency
-        if ffprobe and v_dms > 0 and audio_list:
-            verify_duration_consistency(v_dms, audio_list, tolerance_ms=5000)
+        verify_audio(workdir, tracks, ffprobe)
 
         # If we got here => OK
         # Clean previous verify_error.txt if present (optional)

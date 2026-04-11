@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import sys
 import tkinter as tk
@@ -37,6 +38,26 @@ DEFAULT_OPTIONS = ["auto", "true", "false"]
 VIDEO_ENCODER_OPTIONS = ["svt-av1", "libx265"]
 TYPE_ORDER = {"video": 0, "audio": 1, "sub": 2}
 DEFAULT_VIDEO_ENCODER = "svt-av1"
+APP_BG = "#07111a"
+APP_SURFACE = "#0d1a29"
+APP_SURFACE_ALT = "#122334"
+APP_CARD = "#0f2232"
+APP_INPUT = "#081722"
+APP_BORDER = "#21405a"
+APP_TEXT = "#f0fbff"
+APP_MUTED = "#89a9bf"
+APP_ACCENT = "#35f2ff"
+APP_ACCENT_SOFT = "#193e4f"
+APP_ACCENT_ALT = "#ff5fd2"
+APP_SUCCESS = "#73ffbe"
+APP_WARNING = "#ffc66d"
+APP_MONO_FONT = ("Consolas", 11)
+APP_BODY_FONT = ("Segoe UI", 11)
+APP_TITLE_FONT = ("Segoe UI Semibold", 24)
+APP_SUBTITLE_FONT = ("Segoe UI", 11)
+APP_SECTION_FONT = ("Segoe UI Semibold", 12)
+APP_LABEL_FONT = ("Segoe UI Semibold", 11)
+APP_BUTTON_FONT = ("Segoe UI Semibold", 11)
 STRICT_SDR_8BIT_PARAMS = {
     "svt-av1": {
         "--matrix-coefficients": "1",
@@ -325,6 +346,40 @@ def build_result_line(track, mode, name_display, lang_display, default_display, 
     if overlap_note:
         parts.append(overlap_note)
     return " | ".join(parts)
+
+
+def align_pipe_table(lines):
+    parsed = []
+    widths = []
+    for line in lines:
+        raw = str(line or "")
+        indent_length = len(raw) - len(raw.lstrip(" "))
+        indent = raw[:indent_length]
+        body = raw[indent_length:]
+        if " | " not in body:
+            parsed.append((raw, None, None))
+            continue
+        parts = body.split(" | ")
+        for idx, part in enumerate(parts):
+            if idx >= len(widths):
+                widths.append(len(part))
+            else:
+                widths[idx] = max(widths[idx], len(part))
+        parsed.append((indent, parts, body))
+
+    out = []
+    for first, parts, _body in parsed:
+        if parts is None:
+            out.append(first)
+            continue
+        padded = []
+        for idx, part in enumerate(parts):
+            if idx == len(parts) - 1:
+                padded.append(part)
+            else:
+                padded.append(part.ljust(widths[idx]))
+        out.append(first + " | ".join(padded))
+    return out
 
 
 def build_results(files, tracks_by_file, settings, defaults):
@@ -702,64 +757,285 @@ class TrackConfigGui:
         self.root = tk.Tk()
         self.root.title("Track Config")
         self.root.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        self._int_vcmd = (self.root.register(self._validate_number_entry), "%P", "int")
+        self._float_vcmd = (self.root.register(self._validate_number_entry), "%P", "float")
+        self._configure_theme()
 
         self._build_ui()
         self._refresh_summary()
         self._refresh_settings()
         self._refresh_results()
 
+    def _configure_theme(self):
+        self.root.configure(bg=APP_BG)
+        try:
+            self.root.tk.call("tk", "scaling", 1.10)
+        except Exception:
+            pass
+        self.root.option_add("*Font", APP_BODY_FONT)
+        self.root.option_add("*TCombobox*Listbox*Background", APP_INPUT)
+        self.root.option_add("*TCombobox*Listbox*Foreground", APP_TEXT)
+        self.root.option_add("*TCombobox*Listbox*selectBackground", APP_ACCENT_SOFT)
+        self.root.option_add("*TCombobox*Listbox*selectForeground", APP_TEXT)
+
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure(".", background=APP_BG, foreground=APP_TEXT, fieldbackground=APP_INPUT)
+        style.configure("App.TFrame", background=APP_BG)
+        style.configure("Surface.TFrame", background=APP_SURFACE)
+        style.configure("Card.TFrame", background=APP_CARD, relief="flat")
+        style.configure("CardHeader.TFrame", background=APP_CARD)
+        style.configure("Toolbar.TFrame", background=APP_SURFACE_ALT)
+        style.configure("Inline.TFrame", background=APP_CARD)
+        style.configure("TLabel", background=APP_BG, foreground=APP_TEXT, font=APP_BODY_FONT)
+        style.configure("Surface.TLabel", background=APP_SURFACE, foreground=APP_TEXT, font=APP_BODY_FONT)
+        style.configure("Card.TLabel", background=APP_CARD, foreground=APP_TEXT, font=APP_BODY_FONT)
+        style.configure("Title.TLabel", background=APP_BG, foreground=APP_TEXT, font=APP_TITLE_FONT)
+        style.configure("Subtitle.TLabel", background=APP_BG, foreground=APP_MUTED, font=APP_SUBTITLE_FONT)
+        style.configure("CardTitle.TLabel", background=APP_CARD, foreground=APP_TEXT, font=APP_SECTION_FONT)
+        style.configure("CardSubtitle.TLabel", background=APP_CARD, foreground=APP_MUTED, font=APP_SUBTITLE_FONT)
+        style.configure("Toolbar.TLabel", background=APP_SURFACE_ALT, foreground=APP_MUTED, font=APP_SUBTITLE_FONT)
+        style.configure("SectionLabel.TLabel", background=APP_CARD, foreground=APP_ACCENT, font=APP_LABEL_FONT)
+        style.configure("Hint.TLabel", background=APP_CARD, foreground=APP_MUTED, font=APP_SUBTITLE_FONT)
+        style.configure("Chip.TLabel", background=APP_ACCENT_SOFT, foreground=APP_ACCENT, font=("Segoe UI Semibold", 10), padding=(10, 5))
+        style.configure("GoodChip.TLabel", background="#133426", foreground=APP_SUCCESS, font=("Segoe UI Semibold", 10), padding=(10, 5))
+        style.configure("WarnChip.TLabel", background="#3a2a12", foreground=APP_WARNING, font=("Segoe UI Semibold", 10), padding=(10, 5))
+        style.configure("TEntry", fieldbackground=APP_INPUT, foreground=APP_TEXT, insertcolor=APP_TEXT, bordercolor=APP_BORDER, lightcolor=APP_BORDER, darkcolor=APP_BORDER, padding=6)
+        style.configure("TCombobox", fieldbackground=APP_INPUT, foreground=APP_TEXT, background=APP_INPUT, arrowcolor=APP_ACCENT, bordercolor=APP_BORDER, lightcolor=APP_BORDER, darkcolor=APP_BORDER, padding=4)
+        style.map("TCombobox", fieldbackground=[("readonly", APP_INPUT)], foreground=[("readonly", APP_TEXT)], selectbackground=[("readonly", APP_INPUT)])
+        style.configure("TCheckbutton", background=APP_CARD, foreground=APP_TEXT, font=APP_BODY_FONT)
+        style.map("TCheckbutton", background=[("active", APP_CARD)], foreground=[("active", APP_ACCENT)])
+        style.configure("TNotebook", background=APP_SURFACE, borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook.Tab", background=APP_SURFACE_ALT, foreground=APP_MUTED, padding=(18, 10), font=("Segoe UI Semibold", 11))
+        style.map("TNotebook.Tab", background=[("selected", APP_CARD), ("active", APP_SURFACE_ALT)], foreground=[("selected", APP_TEXT), ("active", APP_TEXT)])
+        style.configure("Treeview", background=APP_INPUT, fieldbackground=APP_INPUT, foreground=APP_TEXT, bordercolor=APP_BORDER, lightcolor=APP_BORDER, darkcolor=APP_BORDER, rowheight=30)
+        style.map("Treeview", background=[("selected", APP_ACCENT_SOFT)], foreground=[("selected", APP_TEXT)])
+        style.configure("Treeview.Heading", background=APP_SURFACE_ALT, foreground=APP_ACCENT, relief="flat", font=("Segoe UI Semibold", 10))
+        style.map("Treeview.Heading", background=[("active", APP_SURFACE_ALT)])
+        style.configure("TScrollbar", background=APP_SURFACE_ALT, troughcolor=APP_BG, bordercolor=APP_BG, arrowcolor=APP_ACCENT)
+        style.configure("Accent.TButton", background=APP_ACCENT_SOFT, foreground=APP_ACCENT, bordercolor=APP_ACCENT, lightcolor=APP_ACCENT_SOFT, darkcolor=APP_ACCENT_SOFT, font=APP_BUTTON_FONT, padding=(14, 8))
+        style.map("Accent.TButton", background=[("active", "#255469"), ("pressed", "#21495c")], foreground=[("disabled", APP_MUTED)])
+        style.configure("Secondary.TButton", background=APP_SURFACE_ALT, foreground=APP_TEXT, bordercolor=APP_BORDER, lightcolor=APP_SURFACE_ALT, darkcolor=APP_SURFACE_ALT, font=APP_BUTTON_FONT, padding=(12, 8))
+        style.map("Secondary.TButton", background=[("active", "#1b344c"), ("pressed", "#162c40")])
+        style.configure("Ghost.TButton", background=APP_CARD, foreground=APP_MUTED, bordercolor=APP_BORDER, lightcolor=APP_CARD, darkcolor=APP_CARD, font=APP_BUTTON_FONT, padding=(10, 8))
+        style.map("Ghost.TButton", foreground=[("active", APP_ACCENT)], background=[("active", APP_SURFACE_ALT)])
+        style.configure("Danger.TButton", background="#3a1832", foreground=APP_ACCENT_ALT, bordercolor=APP_ACCENT_ALT, lightcolor="#3a1832", darkcolor="#3a1832", font=APP_BUTTON_FONT, padding=(10, 8))
+        style.map("Danger.TButton", background=[("active", "#512147")])
+        style.configure("Section.TLabelframe", background=APP_CARD, bordercolor=APP_BORDER, lightcolor=APP_BORDER, darkcolor=APP_BORDER, relief="solid", borderwidth=1)
+        style.configure("Section.TLabelframe.Label", background=APP_CARD, foreground=APP_ACCENT, font=APP_LABEL_FONT)
+        style.configure("TPanedwindow", background=APP_BG, sashthickness=8)
+
+    def _style_text_widget(self, widget, *, monospace=False):
+        widget.configure(
+            bg=APP_INPUT,
+            fg=APP_TEXT,
+            insertbackground=APP_ACCENT,
+            selectbackground=APP_ACCENT_SOFT,
+            selectforeground=APP_TEXT,
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=APP_BORDER,
+            highlightcolor=APP_ACCENT,
+            padx=10,
+            pady=10,
+            font=APP_MONO_FONT if monospace else APP_BODY_FONT,
+        )
+
+    def _make_card(self, parent, *, title, subtitle="", style="Card.TFrame", padding=14):
+        card = ttk.Frame(parent, style=style, padding=padding)
+        header = ttk.Frame(card, style="CardHeader.TFrame")
+        header.pack(fill=tk.X)
+        ttk.Label(header, text=title, style="CardTitle.TLabel").pack(anchor=tk.W)
+        body = ttk.Frame(card, style=style)
+        body.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+        return card, body
+
+    def _add_stat_chip(self, parent, label, value, *, style="Chip.TLabel"):
+        text = f"{label}: {value}"
+        ttk.Label(parent, text=text, style=style).pack(side=tk.LEFT, padx=(0, 8))
+
+    def _create_scrolled_text_panel(self, parent, *, title, subtitle="", monospace=True):
+        card, body = self._make_card(parent, title=title, subtitle=subtitle)
+        card.pack(fill=tk.BOTH, expand=True)
+        text_wrap = ttk.Frame(body, style="Card.TFrame")
+        text_wrap.pack(fill=tk.BOTH, expand=True)
+        text = tk.Text(text_wrap, height=10, wrap="none")
+        self._style_text_widget(text, monospace=monospace)
+        text.configure(state="disabled")
+        text.grid(row=0, column=0, sticky="nsew")
+        text_wrap.columnconfigure(0, weight=1)
+        text_wrap.rowconfigure(0, weight=1)
+        self._bind_vertical_scroll(text)
+        return card, text
+
+    def _build_section(self, parent, *, title, description="", columns=2):
+        section = ttk.LabelFrame(parent, text=title, style="Section.TLabelframe", padding=14)
+        start_row = 0
+        for col in range(columns):
+            section.columnconfigure(col * 2 + 1, weight=1)
+        return section, start_row
+
+    def _build_labeled_entry(self, parent, row, column, label, variable, *, width=28, numeric=None):
+        ttk.Label(parent, text=label, style="SectionLabel.TLabel").grid(row=row, column=column * 2, sticky=tk.W, padx=(0, 8), pady=6)
+        entry_options = {"textvariable": variable, "width": width}
+        if numeric == "int":
+            entry_options["validate"] = "key"
+            entry_options["validatecommand"] = self._int_vcmd
+        elif numeric == "float":
+            entry_options["validate"] = "key"
+            entry_options["validatecommand"] = self._float_vcmd
+        entry = ttk.Entry(parent, **entry_options)
+        entry.grid(row=row, column=column * 2 + 1, sticky=tk.EW, pady=6)
+        return entry
+
+    def _build_labeled_combo(self, parent, row, column, label, variable, values, *, width=26, state="readonly"):
+        ttk.Label(parent, text=label, style="SectionLabel.TLabel").grid(row=row, column=column * 2, sticky=tk.W, padx=(0, 8), pady=6)
+        combo = ttk.Combobox(parent, textvariable=variable, values=values, width=width, state=state)
+        combo.grid(row=row, column=column * 2 + 1, sticky=tk.EW, pady=6)
+        return combo
+
+    def _build_labeled_text(self, parent, row, title, widget, *, description="", height=4):
+        header = ttk.Frame(parent, style="Card.TFrame")
+        header.grid(row=row, column=0, columnspan=4, sticky=tk.EW, pady=(0, 6))
+        ttk.Label(header, text=title, style="SectionLabel.TLabel").pack(anchor=tk.W)
+        widget.configure(height=height)
+        self._style_text_widget(widget, monospace=True)
+        widget.grid(row=row + 1, column=0, columnspan=4, sticky=tk.EW, pady=(0, 12))
+
+    def _build_stacked_entry(self, parent, row, label, variable, *, width=36):
+        ttk.Label(parent, text=label, style="SectionLabel.TLabel").grid(row=row, column=0, sticky=tk.W, pady=(0, 4))
+        entry = ttk.Entry(parent, textvariable=variable, width=width)
+        entry.grid(row=row + 1, column=0, sticky=tk.EW, pady=(0, 10))
+        return entry
+
+    def _bind_vertical_scroll(self, widget, *, target=None):
+        scroll_target = target or widget
+
+        def _on_mousewheel(event):
+            try:
+                first, last = scroll_target.yview()
+            except Exception:
+                return None
+            if first <= 0.0 and last >= 1.0:
+                return "break"
+            delta = -1 if event.delta > 0 else 1
+            scroll_target.yview_scroll(delta, "units")
+            return "break"
+
+        widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+
+    def _validate_number_entry(self, proposed, mode):
+        if proposed == "":
+            return True
+        if mode == "int":
+            return proposed.isdigit()
+        if mode == "float":
+            return bool(re.fullmatch(r"\d*(?:\.\d*)?", proposed))
+        return True
+
+    def _create_scrollable_area(self, parent):
+        wrap = ttk.Frame(parent, style="Surface.TFrame")
+        wrap.pack(fill=tk.BOTH, expand=True)
+        canvas = tk.Canvas(wrap, background=APP_SURFACE, highlightthickness=0, borderwidth=0)
+        inner = ttk.Frame(canvas, style="Surface.TFrame")
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync_inner(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfigure(window_id, width=canvas.winfo_width())
+
+        inner.bind("<Configure>", _sync_inner)
+        canvas.bind("<Configure>", _sync_inner)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        def _on_mousewheel(event):
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return "break"
+            content_height = bbox[3] - bbox[1]
+            if content_height <= canvas.winfo_height() + 2:
+                return "break"
+            delta = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(delta, "units")
+            return "break"
+
+        for widget in (wrap, canvas, inner):
+            widget.bind("<MouseWheel>", _on_mousewheel, add="+")
+        return inner
+
     def _build_ui(self):
-        self.root.geometry("1200x700")
-        self.root.minsize(1100, 600)
+        self.root.geometry("1560x920")
+        self.root.minsize(1320, 760)
 
-        pane = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
-        pane.pack(fill=tk.BOTH, expand=True)
+        shell = ttk.Frame(self.root, style="App.TFrame", padding=(18, 16, 18, 18))
+        shell.pack(fill=tk.BOTH, expand=True)
+        shell.rowconfigure(0, weight=1)
+        shell.columnconfigure(0, weight=1)
 
-        left_frame = ttk.Frame(pane)
-        center_frame = ttk.Frame(pane)
-        right_frame = ttk.Frame(pane)
+        body = ttk.Panedwindow(shell, orient=tk.HORIZONTAL, style="TPanedwindow")
+        body.grid(row=0, column=0, sticky="nsew")
 
-        pane.add(left_frame, weight=1)
-        pane.add(center_frame, weight=2)
-        pane.add(right_frame, weight=1)
+        left_frame = ttk.Frame(body, style="App.TFrame")
+        center_frame = ttk.Frame(body, style="App.TFrame")
+        right_frame = ttk.Frame(body, style="App.TFrame")
+        body.add(left_frame, weight=24)
+        body.add(center_frame, weight=52)
+        body.add(right_frame, weight=24)
 
-        summary_label = ttk.Label(left_frame, text="Tracks summary")
-        summary_label.pack(anchor=tk.W, padx=6, pady=(6, 0))
-        self.summary_text = tk.Text(left_frame, height=10, width=40, wrap="none")
-        summary_scroll = ttk.Scrollbar(left_frame, command=self.summary_text.yview)
-        self.summary_text.configure(yscrollcommand=summary_scroll.set, state="disabled")
-        self.summary_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=6)
-        summary_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 6), pady=6)
-
-        result_label = ttk.Label(right_frame, text="Result preview")
-        result_label.pack(anchor=tk.W, padx=6, pady=(6, 0))
-        self.result_text = tk.Text(right_frame, height=10, width=40, wrap="none")
-        result_scroll = ttk.Scrollbar(right_frame, command=self.result_text.yview)
-        self.result_text.configure(yscrollcommand=result_scroll.set, state="disabled")
-        self.result_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0), pady=6)
-        result_scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 6), pady=6)
-
+        summary_card, self.summary_text = self._create_scrolled_text_panel(
+            left_frame,
+            title="Tracks Summary",
+            subtitle="Discovered tracks across selected sources. Use this as the routing map for your rules.",
+            monospace=True,
+        )
+        summary_meta = ttk.Frame(left_frame, style="App.TFrame")
+        summary_meta.pack(fill=tk.X, pady=(10, 0))
+        self._add_stat_chip(summary_meta, "Files", len(self.files))
+        self._add_stat_chip(summary_meta, "Rules", len(self.settings))
+        fork_style = "GoodChip.TLabel" if self.av1an_fork_enabled else "WarnChip.TLabel"
+        fork_value = "mars887 fork" if self.av1an_fork_enabled else "standard av1an"
+        self._add_stat_chip(summary_meta, "av1an", fork_value, style=fork_style)
         self._build_center(center_frame)
+        _result_card, self.result_text = self._create_scrolled_text_panel(
+            right_frame,
+            title="Result Preview",
+            subtitle="Live preview of the normalized output contract that will be written into .plan files.",
+            monospace=True,
+        )
 
     def _build_center(self, frame):
-        notebook = ttk.Notebook(frame)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        card, body = self._make_card(
+            frame,
+            title="Pipeline Editor",
+            subtitle="Split by intent: detailed routing in Track Rules, global encode behavior in Video Pipeline.",
+            style="Surface.TFrame",
+            padding=16,
+        )
+        card.pack(fill=tk.BOTH, expand=True)
 
-        tracks_tab = ttk.Frame(notebook)
-        video_tab = ttk.Frame(notebook)
+        notebook = ttk.Notebook(body)
+        notebook.pack(fill=tk.BOTH, expand=True)
 
-        notebook.add(tracks_tab, text="Tracks")
-        notebook.add(video_tab, text="Video")
+        video_tab = ttk.Frame(notebook, style="Surface.TFrame")
+        tracks_tab = ttk.Frame(notebook, style="Surface.TFrame")
 
-        self._build_tracks_tab(tracks_tab)
+        notebook.add(video_tab, text="Video Pipeline")
+        notebook.add(tracks_tab, text="Track Rules")
+
         self._build_video_tab(video_tab)
+        self._build_tracks_tab(tracks_tab)
 
     def _build_video_tab(self, frame):
-        frame.columnconfigure(1, weight=1)
-
-        self.default_params_text = tk.Text(frame, height=4, width=60, wrap="char")
-        self.default_last_params_text = tk.Text(frame, height=2, width=60, wrap="char")
-        self.default_zoning_text = tk.Text(frame, height=5, width=60, wrap="none")
+        content = self._create_scrollable_area(frame)
+        grid = ttk.Frame(content, style="Surface.TFrame", padding=(6, 6, 6, 16))
+        grid.pack(fill=tk.BOTH, expand=True)
+        grid.columnconfigure(0, weight=1)
+        grid.columnconfigure(1, weight=1)
 
         self.default_fastpass_var = tk.StringVar(value=self.defaults.fastpass)
         self.default_mainpass_var = tk.StringVar(value=self.defaults.mainpass)
@@ -785,136 +1061,118 @@ class TrackConfigGui:
         self.attach_encode_info_var = tk.BooleanVar(value=bool(self.defaults.attach_encode_info))
         self.note_var = tk.StringVar(value=self.defaults.note)
 
-        row = 0
-        ttk.Label(frame, text="params").grid(row=row, column=0, sticky=tk.NW, padx=(0, 6), pady=2)
-        self.default_params_text.grid(row=row, column=1, sticky=tk.EW, pady=2)
+        params_section, row = self._build_section(
+            grid,
+            title="Encoder Params",
+            columns=2,
+        )
+        params_section.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=6, pady=6)
+        self.default_params_text = tk.Text(params_section, height=4, width=60, wrap="char")
+        self.default_last_params_text = tk.Text(params_section, height=2, width=60, wrap="char")
+        self.default_zoning_text = tk.Text(params_section, height=5, width=60, wrap="none")
+        self._build_labeled_text(
+            params_section,
+            row,
+            "Fast-pass params",
+            self.default_params_text,
+            height=5,
+        )
         self.default_params_text.insert("1.0", self.defaults.params)
         self.default_params_text.edit_modified(False)
         self.default_params_text.bind("<Return>", lambda _event: "break")
         self.default_params_text.bind("<KP_Enter>", lambda _event: "break")
         self.default_params_text.bind("<<Modified>>", self.on_default_text_change)
-        row += 1
-
-        ttk.Label(frame, text="last params").grid(row=row, column=0, sticky=tk.NW, padx=(0, 6), pady=2)
-        self.default_last_params_text.grid(row=row, column=1, sticky=tk.EW, pady=2)
+        row += 2
+        self._build_labeled_text(
+            params_section,
+            row,
+            "Main-pass params",
+            self.default_last_params_text,
+            height=4,
+        )
         self.default_last_params_text.insert("1.0", self.defaults.last_params)
         self.default_last_params_text.edit_modified(False)
         self.default_last_params_text.bind("<Return>", lambda _event: "break")
         self.default_last_params_text.bind("<KP_Enter>", lambda _event: "break")
         self.default_last_params_text.bind("<<Modified>>", self.on_default_text_change)
-        row += 1
-
-        ttk.Label(frame, text="zoning").grid(row=row, column=0, sticky=tk.NW, padx=(0, 6), pady=2)
-        self.default_zoning_text.grid(row=row, column=1, sticky=tk.EW, pady=2)
+        row += 2
+        self._build_labeled_text(
+            params_section,
+            row,
+            "Zone commands",
+            self.default_zoning_text,
+            height=6,
+        )
         self.default_zoning_text.insert("1.0", self.defaults.zoning)
         self.default_zoning_text.edit_modified(False)
         self.default_zoning_text.bind("<<Modified>>", self.on_zoning_change)
-        row += 1
 
-        ttk.Label(frame, text="fastpass").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.default_fastpass_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="mainpass").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.default_mainpass_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="scene detection").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Combobox(frame, textvariable=self.scene_detection_var, values=["psd", "av1an"], width=57, state="readonly").grid(
-            row=row, column=1, sticky=tk.W, pady=2
+        core_section, row = self._build_section(
+            grid,
+            title="Pipeline Core",
+            columns=2,
         )
+        core_section.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        self._build_labeled_combo(core_section, row, 0, "Scene detection", self.scene_detection_var, ["psd", "av1an"], width=24)
+        self._build_labeled_combo(core_section, row, 1, "Encoder", self.encoder_var, VIDEO_ENCODER_OPTIONS, width=24)
         row += 1
-
-        ttk.Label(frame, text="encoder").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Combobox(frame, textvariable=self.encoder_var, values=VIDEO_ENCODER_OPTIONS, width=57, state="readonly").grid(
-            row=row, column=1, sticky=tk.W, pady=2
-        )
+        self._build_labeled_entry(core_section, row, 0, "Fast-pass workers", self.fastpass_workers_var, numeric="int")
+        self._build_labeled_entry(core_section, row, 1, "Main-pass workers", self.mainpass_workers_var, numeric="int")
         row += 1
-
+        self._build_labeled_entry(core_section, row, 0, "Fast-pass filter", self.default_fastpass_var)
+        self._build_labeled_entry(core_section, row, 1, "Main-pass filter", self.default_mainpass_var)
+        row += 1
         if self.av1an_fork_enabled:
-            ttk.Label(frame, text="chunk order").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-            ttk.Combobox(frame, textvariable=self.chunk_order_var, values=CHUNK_ORDER_OPTIONS, width=57, state="readonly").grid(
-                row=row, column=1, sticky=tk.W, pady=2
-            )
-            row += 1
-
-            ttk.Label(frame, text="encoder path").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-            self.encoder_path_combo = ttk.Combobox(frame, textvariable=self.encoder_path_var, width=57, state="readonly")
-            self.encoder_path_combo.grid(row=row, column=1, sticky=tk.EW, pady=2)
+            self._build_labeled_combo(core_section, row, 0, "Chunk order", self.chunk_order_var, CHUNK_ORDER_OPTIONS, width=24)
+            self.encoder_path_combo = self._build_labeled_combo(core_section, row, 1, "Encoder path", self.encoder_path_var, [""], width=24)
             self._refresh_encoder_path_options(preserve_missing=True)
-            row += 1
 
-        ttk.Checkbutton(frame, text="no fastpass", variable=self.no_fastpass_var).grid(
-            row=row, column=1, sticky=tk.W, pady=2
+        feature_section, row = self._build_section(
+            grid,
+            title="Feature Switches",
+            columns=1,
         )
+        feature_section.grid(row=1, column=1, sticky="nsew", padx=6, pady=6)
+        ttk.Checkbutton(feature_section, text="No fast-pass", variable=self.no_fastpass_var).grid(row=row, column=0, sticky=tk.W, pady=4)
         row += 1
+        ttk.Checkbutton(feature_section, text="Fast-pass HDR", variable=self.fastpass_hdr_var).grid(row=row, column=0, sticky=tk.W, pady=4)
+        row += 1
+        ttk.Checkbutton(feature_section, text="Strict SDR 8bit", variable=self.strict_sdr_8bit_var).grid(row=row, column=0, sticky=tk.W, pady=4)
+        row += 1
+        ttk.Checkbutton(feature_section, text="No Dolby Vision", variable=self.no_dolby_vision_var).grid(row=row, column=0, sticky=tk.W, pady=4)
+        row += 1
+        ttk.Checkbutton(feature_section, text="No HDR10+", variable=self.no_hdr10plus_var).grid(row=row, column=0, sticky=tk.W, pady=4)
+        row += 1
+        ttk.Checkbutton(feature_section, text="Attach Encode Info", variable=self.attach_encode_info_var).grid(row=row, column=0, sticky=tk.W, pady=4)
 
-        ttk.Checkbutton(frame, text="fastpass HDR", variable=self.fastpass_hdr_var).grid(
-            row=row, column=1, sticky=tk.W, pady=2
+        tuning_section, row = self._build_section(
+            grid,
+            title="Auto-Boost Tuning",
+            columns=2,
         )
+        tuning_section.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
+        self._build_labeled_entry(tuning_section, row, 0, "Max + dev", self.ab_pos_dev_var, numeric="int")
+        self._build_labeled_entry(tuning_section, row, 1, "Pos multiplier", self.ab_pos_multiplier_var, numeric="float")
         row += 1
-        ttk.Checkbutton(frame, text="Strict SDR 8bit", variable=self.strict_sdr_8bit_var).grid(
-            row=row, column=1, sticky=tk.W, pady=2
+        self._build_labeled_entry(tuning_section, row, 0, "Shared multiplier", self.ab_multiplier_var, numeric="float")
+        self._build_labeled_entry(tuning_section, row, 1, "Neg multiplier", self.ab_neg_multiplier_var, numeric="float")
+        row += 1
+        self._build_labeled_entry(tuning_section, row, 0, "Max - dev", self.ab_neg_dev_var, numeric="int")
+
+        script_section, row = self._build_section(
+            grid,
+            title="Script Paths",
+            columns=1,
         )
-        row += 1
-
-        ttk.Checkbutton(frame, text="no DolbyVision", variable=self.no_dolby_vision_var).grid(
-            row=row, column=1, sticky=tk.W, pady=2
-        )
-        row += 1
-
-        ttk.Checkbutton(frame, text="no HDR10+", variable=self.no_hdr10plus_var).grid(
-            row=row, column=1, sticky=tk.W, pady=2
-        )
-        row += 1
-
-        ttk.Label(frame, text="fastpass workers").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.fastpass_workers_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="mainpass workers").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.mainpass_workers_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="max-pos-dev").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.ab_pos_dev_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="pos-multiplier").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.ab_pos_multiplier_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="multiplier").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.ab_multiplier_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="neg-multiplier").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.ab_neg_multiplier_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="max-neg-dev").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.ab_neg_dev_var, width=60).grid(row=row, column=1, sticky=tk.W, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="main-vpy").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.main_vpy_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="fast-vpy").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.fast_vpy_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
-        row += 1
-
-        ttk.Label(frame, text="proxy-vpy").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.proxy_vpy_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
-        row += 1
-
-        ttk.Checkbutton(frame, text="Attach Encode Info", variable=self.attach_encode_info_var).grid(
-            row=row, column=1, sticky=tk.W, pady=2
-        )
-        row += 1
-
-        ttk.Label(frame, text="Note").grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        ttk.Entry(frame, textvariable=self.note_var, width=60).grid(row=row, column=1, sticky=tk.EW, pady=2)
+        script_section.grid(row=2, column=1, sticky="nsew", padx=6, pady=6)
+        script_section.columnconfigure(0, weight=1)
+        self._build_stacked_entry(script_section, row, "Main vpy", self.main_vpy_var, width=36)
+        row += 2
+        self._build_stacked_entry(script_section, row, "Fast vpy", self.fast_vpy_var, width=36)
+        row += 2
+        self._build_stacked_entry(script_section, row, "Proxy vpy", self.proxy_vpy_var, width=36)
+        row += 2
+        self._build_stacked_entry(script_section, row, "Note", self.note_var, width=36)
 
         self.default_fastpass_var.trace_add("write", self.on_defaults_change)
         self.default_mainpass_var.trace_add("write", self.on_defaults_change)
@@ -943,8 +1201,26 @@ class TrackConfigGui:
         self.ab_neg_multiplier_var.trace_add("write", self.on_ab_pos_multiplier_change)
 
     def _build_tracks_tab(self, frame):
-        top_frame = ttk.Frame(frame)
-        top_frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        frame.configure(padding=6)
+        workspace = ttk.Frame(frame, style="Surface.TFrame")
+        workspace.pack(fill=tk.BOTH, expand=True)
+        workspace.rowconfigure(0, weight=1)
+        workspace.columnconfigure(0, weight=1)
+
+        split = ttk.Panedwindow(workspace, orient=tk.HORIZONTAL, style="TPanedwindow")
+        split.grid(row=0, column=0, sticky="nsew")
+
+        left_host = ttk.Frame(split, style="Surface.TFrame")
+        right_host = ttk.Frame(split, style="Surface.TFrame")
+        split.add(left_host, weight=60)
+        split.add(right_host, weight=40)
+
+        table_card, table_body = self._make_card(
+            left_host,
+            title="Track Rules",
+            style="Card.TFrame",
+        )
+        table_card.pack(fill=tk.BOTH, expand=True, padx=(0, 8))
 
         columns = (
             "idx",
@@ -957,7 +1233,9 @@ class TrackConfigGui:
             "lang",
             "default",
         )
-        self.tree = ttk.Treeview(top_frame, columns=columns, show="headings", height=8)
+        tree_wrap = ttk.Frame(table_body, style="Card.TFrame")
+        tree_wrap.pack(fill=tk.BOTH, expand=True)
+        self.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", height=12)
         self.tree.heading("idx", text="#")
         self.tree.heading("id", text="id")
         self.tree.heading("type", text="type")
@@ -977,16 +1255,23 @@ class TrackConfigGui:
         self.tree.column("name", width=120)
         self.tree.column("lang", width=90)
         self.tree.column("default", width=70, anchor=tk.CENTER)
+        self.tree.tag_configure("video", background="#0a1b28")
+        self.tree.tag_configure("audio", background="#0e1f2f")
+        self.tree.tag_configure("sub", background="#102536")
 
-        tree_scroll = ttk.Scrollbar(top_frame, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=tree_scroll.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+        self._bind_vertical_scroll(self.tree)
 
         self.tree.bind("<<TreeviewSelect>>", self.on_select_setting)
 
-        form_frame = ttk.Frame(frame)
-        form_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
+        editor_card, editor_body = self._make_card(
+            right_host,
+            title="Rule Inspector",
+            style="Card.TFrame",
+        )
+        editor_card.pack(fill=tk.BOTH, expand=True, padx=(8, 0))
 
         self.id_var = tk.StringVar()
         self.type_var = tk.StringVar(value="auto")
@@ -1001,35 +1286,62 @@ class TrackConfigGui:
         self.type_var.trace_add("write", self.on_type_change)
         self.mode_var.trace_add("write", self.on_mode_change)
 
-        self._add_form_row(form_frame, 0, "id", self.id_var)
-        self._add_combo_row(form_frame, 1, "type", self.type_var, TYPE_OPTIONS)
-        self._add_combo_row(form_frame, 2, "mode", self.mode_var, MODE_OPTIONS)
-        self._add_form_row(form_frame, 3, "bitrate", self.bitrate_var)
-        self._add_form_row(form_frame, 4, "channels", self.channels_var)
-        self._add_form_row(form_frame, 5, "name", self.name_var)
-        self._add_form_row(form_frame, 6, "lang", self.lang_var)
-        self._add_combo_row(form_frame, 7, "default", self.default_var, DEFAULT_OPTIONS)
+        match_section, row = self._build_section(
+            editor_body,
+            title="Matcher",
+            columns=1,
+        )
+        match_section.pack(fill=tk.X)
+        self._add_form_row(match_section, row, "id", self.id_var)
+        row += 1
+        self._add_combo_row(match_section, row, "type", self.type_var, TYPE_OPTIONS)
+        row += 1
+        self._add_combo_row(match_section, row, "mode", self.mode_var, MODE_OPTIONS)
+        row += 1
+        self._add_combo_row(match_section, row, "default", self.default_var, DEFAULT_OPTIONS)
 
-        buttons = ttk.Frame(frame)
-        buttons.pack(fill=tk.X, padx=6, pady=(0, 6))
+        details_section, row = self._build_section(
+            editor_body,
+            title="Output Details",
+            columns=1,
+        )
+        details_section.pack(fill=tk.X, pady=(12, 0))
+        self._add_form_row(details_section, row, "bitrate", self.bitrate_var, numeric="int")
+        row += 1
+        self._add_form_row(details_section, row, "channels", self.channels_var, numeric="int")
+        row += 1
+        self._add_form_row(details_section, row, "name", self.name_var)
+        row += 1
+        self._add_form_row(details_section, row, "lang", self.lang_var)
 
-        ttk.Button(buttons, text="Add", command=self.on_add).pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Update", command=self.on_update).pack(side=tk.LEFT, padx=6)
-        ttk.Button(buttons, text="Remove", command=self.on_remove).pack(side=tk.LEFT)
-        ttk.Button(buttons, text="Up", command=self.on_move_up).pack(side=tk.LEFT, padx=6)
-        ttk.Button(buttons, text="Down", command=self.on_move_down).pack(side=tk.LEFT)
+        buttons = ttk.Frame(editor_body, style="Card.TFrame")
+        buttons.pack(fill=tk.X, pady=(14, 0))
+        ttk.Button(buttons, text="Add Rule", command=self.on_add, style="Accent.TButton").pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Update Rule", command=self.on_update, style="Secondary.TButton").pack(side=tk.LEFT, padx=8)
+        ttk.Button(buttons, text="Remove", command=self.on_remove, style="Danger.TButton").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="Move Up", command=self.on_move_up, style="Ghost.TButton").pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Move Down", command=self.on_move_down, style="Ghost.TButton").pack(side=tk.LEFT, padx=8)
 
-        actions = ttk.Frame(frame)
-        actions.pack(fill=tk.X, padx=6, pady=(0, 8))
-        ttk.Button(actions, text="Apply and Close", command=self.on_apply).pack(side=tk.RIGHT)
-        ttk.Button(actions, text="Cancel", command=self.on_cancel).pack(side=tk.RIGHT, padx=(0, 8))
+        footer = ttk.Frame(workspace, style="Toolbar.TFrame", padding=(14, 12))
+        footer.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        actions = ttk.Frame(footer, style="Toolbar.TFrame")
+        actions.pack(side=tk.RIGHT)
+        ttk.Button(actions, text="Cancel", command=self.on_cancel, style="Ghost.TButton").pack(side=tk.RIGHT)
+        ttk.Button(actions, text="Apply and Close", command=self.on_apply, style="Accent.TButton").pack(side=tk.RIGHT, padx=(0, 8))
 
         self._refresh_field_states()
 
-    def _add_form_row(self, frame, row, label, variable):
-        ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
-        entry = ttk.Entry(frame, textvariable=variable, width=40)
-        entry.grid(row=row, column=1, sticky=tk.W, pady=2)
+    def _add_form_row(self, frame, row, label, variable, *, numeric=None):
+        ttk.Label(frame, text=label, style="SectionLabel.TLabel").grid(row=row, column=0, sticky=tk.W, padx=(0, 8), pady=6)
+        entry_options = {"textvariable": variable, "width": 40}
+        if numeric == "int":
+            entry_options["validate"] = "key"
+            entry_options["validatecommand"] = self._int_vcmd
+        elif numeric == "float":
+            entry_options["validate"] = "key"
+            entry_options["validatecommand"] = self._float_vcmd
+        entry = ttk.Entry(frame, **entry_options)
+        entry.grid(row=row, column=1, sticky=tk.EW, pady=6)
         if label == "bitrate":
             self.bitrate_entry = entry
         elif label == "channels":
@@ -1040,16 +1352,16 @@ class TrackConfigGui:
             self.lang_entry = entry
 
     def _add_combo_row(self, frame, row, label, variable, values):
-        ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, padx=(0, 6), pady=2)
+        ttk.Label(frame, text=label, style="SectionLabel.TLabel").grid(row=row, column=0, sticky=tk.W, padx=(0, 8), pady=6)
         combo = ttk.Combobox(frame, textvariable=variable, values=values, width=37, state="readonly")
-        combo.grid(row=row, column=1, sticky=tk.W, pady=2)
+        combo.grid(row=row, column=1, sticky=tk.EW, pady=6)
         if label == "mode":
             self.mode_combo = combo
         elif label == "default":
             self.default_combo = combo
 
     def _refresh_summary(self):
-        lines = [row.get("line") or "" for row in self.summary]
+        lines = align_pipe_table([row.get("line") or "" for row in self.summary])
         self.summary_text.configure(state="normal")
         self.summary_text.delete("1.0", tk.END)
         self.summary_text.insert(tk.END, "\n".join(lines))
@@ -1075,15 +1387,19 @@ class TrackConfigGui:
                 setting.get("lang") or "",
                 default_display,
             )
-            self.tree.insert("", tk.END, values=values)
+            tag = normalize_type(setting.get("type") or "")
+            if tag not in ("video", "audio", "sub"):
+                tag = "audio" if idx % 2 == 0 else "sub"
+            self.tree.insert("", tk.END, values=values, tags=(tag,))
 
     def _refresh_results(self):
         self.defaults = self._current_defaults()
         result, lines = build_results(self.files, self.tracks_by_file, self.settings, self.defaults)
         self.latest_result = result
+        aligned_lines = align_pipe_table(lines)
         self.result_text.configure(state="normal")
         self.result_text.delete("1.0", tk.END)
-        self.result_text.insert(tk.END, "\n".join(lines))
+        self.result_text.insert(tk.END, "\n".join(aligned_lines))
         self.result_text.configure(state="disabled")
 
     def _current_setting(self):
@@ -1333,9 +1649,9 @@ class TrackConfigGui:
             return
         self._defaults_refreshing = True
         try:
-            cleaned = self._get_single_line_text(widget)
             current = widget.get("1.0", tk.END).rstrip("\n")
-            if cleaned != current:
+            if "\n" in current:
+                cleaned = " ".join(part.strip() for part in current.splitlines() if part.strip())
                 widget.delete("1.0", tk.END)
                 widget.insert("1.0", cleaned)
             self.defaults = self._current_defaults()
