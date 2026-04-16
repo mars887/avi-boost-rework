@@ -365,6 +365,14 @@ class RunnerEvent:
     status: str
     message: str = ""
     timestamp: float = 0.0
+    session_id: str = ""
+    plan_run_id: str = ""
+    source: str = ""
+    workdir: str = ""
+    progress: float = -1.0
+    started_at: float = 0.0
+    ended_at: float = 0.0
+    elapsed_seconds: float = 0.0
 
 
 def default_video_primary() -> VideoPrimary:

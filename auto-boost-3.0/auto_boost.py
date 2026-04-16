@@ -8,9 +8,11 @@ Entry-point CLI that wires the pipeline stages together.
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -71,6 +73,36 @@ def vspipe_args_to_dict(items: List[str]) -> Dict[str, str]:
         if key:
             out[key] = value
     return out
+
+
+def emit_runner_child_event(stage: str, status: str, *, message: str = "", source: Path | None = None, workdir: Path | None = None) -> None:
+    events_path = os.environ.get("PBBATCH_RUNNER_CHILD_EVENTS_JSONL", "").strip()
+    if not events_path:
+        return
+    event = {
+        "event": "runner_child",
+        "session_id": os.environ.get("PBBATCH_RUNNER_SESSION_ID", ""),
+        "plan_run_id": os.environ.get("PBBATCH_RUNNER_PLAN_RUN_ID", ""),
+        "plan": "",
+        "mode": "",
+        "stage": stage,
+        "status": status,
+        "message": message,
+        "timestamp": time.time(),
+        "source": str(source or ""),
+        "workdir": str(workdir or ""),
+        "progress": -1.0,
+        "started_at": 0.0,
+        "ended_at": 0.0,
+        "elapsed_seconds": 0.0,
+    }
+    try:
+        path = Path(events_path).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        return
 
 
 def main() -> int:
@@ -312,9 +344,11 @@ def main() -> int:
                 if not is_valid_base_scenes(base_scenes_path):
                     raise RuntimeError("--base-scenes provided but is not a valid scenes.json (or cannot be sanitized).")
                 touch(marks["psd"])
+                emit_runner_child_event("Auto-Boost: PSD Scene Detection", "completed", message="using_existing_base_scenes", source=input_file, workdir=project_dir)
             else:
                 if marks["psd"].exists() and is_valid_base_scenes(base_scenes_path):
                     print(f"[resume] PSD already completed: {base_scenes_path}")
+                    emit_runner_child_event("Auto-Boost: PSD Scene Detection", "completed", message="resume", source=input_file, workdir=project_dir)
                 else:
                     psd_script = Path(args.psd_script).expanduser()
                     if not psd_script.exists():
@@ -322,9 +356,15 @@ def main() -> int:
                         if cand.exists():
                             psd_script = cand
                     psd_python = Path(args.psd_python).expanduser() if args.psd_python else None
-                    run_psd(psd_script=psd_script, psd_python=psd_python, input_file=input_file,
-                            base_scenes_path=base_scenes_path, extra_args=args.psd_args)
+                    emit_runner_child_event("Auto-Boost: PSD Scene Detection", "started", source=input_file, workdir=project_dir)
+                    try:
+                        run_psd(psd_script=psd_script, psd_python=psd_python, input_file=input_file,
+                                base_scenes_path=base_scenes_path, extra_args=args.psd_args)
+                    except Exception as exc:
+                        emit_runner_child_event("Auto-Boost: PSD Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                        raise
                     touch(marks["psd"])
+                    emit_runner_child_event("Auto-Boost: PSD Scene Detection", "completed", source=input_file, workdir=project_dir)
 
     # -----------------
     # Stage 2: fast-pass
@@ -332,88 +372,111 @@ def main() -> int:
     if args.stage in (0, 2):
         if args.no_fastpass and args.sdm == "psd":
             print("[skip] no-fastpass enabled; fast-pass skipped for sdm=psd.")
+            emit_runner_child_event("Fastpass", "skipped", message="no_fastpass", source=input_file, workdir=project_dir)
         else:
             if args.no_fastpass and args.sdm == "av1an":
                 scenes_hint = av1an_temp / "scenes.json"
                 if marks["fastpass"].exists() and scenes_hint.exists():
                     print(f"[resume] scene-only already completed: {scenes_hint}")
+                    emit_runner_child_event("Auto-Boost: Scene Detection", "completed", message="resume", source=input_file, workdir=project_dir)
                 else:
                     if fastpass_vpy is not None:
                         ensure_exists(fastpass_vpy, "Fast-pass vpy")
                     if fastpass_proxy is not None:
                         ensure_exists(fastpass_proxy, "Fast-pass proxy")
-                    run_fastpass_av1an(
-                        av1an_exe=str(args.av1an),
-                        input_file=input_file,
-                        fastpass_vpy=fastpass_vpy,
-                        fastpass_proxy=fastpass_proxy,
-                        output_file=fastpass_out,
-                        scenes_path=base_scenes_path,
-                        av1an_temp=av1an_temp,
-                        sdm=str(args.sdm),
-                        workers=int(args.workers),
-                        lp=int(args.lp),
-                        fast_preset=fastpass_preset,
-                        fast_crf=float(args.quality),
-                        encoder=str(args.encoder),
-                        video_params=str(args.video_params),
-                        ffmpeg_arg=str(args.ffmpeg),
-                        verbose=bool(args.verbose),
-                        keep=bool(args.keep),
-                        sc_only=True,
-                        log_file=av1an_log_file,
-                        log_level=(
-                            None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
-                            else str(args.av1an_log_level).strip()
-                        ),
-                        fastpass_hdr=bool(args.fastpass_hdr),
-                        hdr_patch_script=hdr_patch_script,
-                        chunk_order=str(args.chunk_order or ""),
-                        encoder_path=str(args.encoder_path or ""),
-                        fast_interrupt=bool(args.fast_interrupt),
-                        vspipe_args=fastpass_vspipe_args,
-                    )
+                    emit_runner_child_event("Auto-Boost: Scene Detection", "started", source=input_file, workdir=project_dir)
+                    try:
+                        run_fastpass_av1an(
+                            av1an_exe=str(args.av1an),
+                            input_file=input_file,
+                            fastpass_vpy=fastpass_vpy,
+                            fastpass_proxy=fastpass_proxy,
+                            output_file=fastpass_out,
+                            scenes_path=base_scenes_path,
+                            av1an_temp=av1an_temp,
+                            sdm=str(args.sdm),
+                            workers=int(args.workers),
+                            lp=int(args.lp),
+                            fast_preset=fastpass_preset,
+                            fast_crf=float(args.quality),
+                            encoder=str(args.encoder),
+                            video_params=str(args.video_params),
+                            ffmpeg_arg=str(args.ffmpeg),
+                            verbose=bool(args.verbose),
+                            keep=bool(args.keep),
+                            sc_only=True,
+                            log_file=av1an_log_file,
+                            log_level=(
+                                None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
+                                else str(args.av1an_log_level).strip()
+                            ),
+                            fastpass_hdr=bool(args.fastpass_hdr),
+                            hdr_patch_script=hdr_patch_script,
+                            chunk_order=str(args.chunk_order or ""),
+                            encoder_path=str(args.encoder_path or ""),
+                            fast_interrupt=bool(args.fast_interrupt),
+                            vspipe_args=fastpass_vspipe_args,
+                        )
+                    except Exception as exc:
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                        raise
                     touch(marks["fastpass"])
+                    emit_runner_child_event("Auto-Boost: Scene Detection", "completed", source=input_file, workdir=project_dir)
             else:
                 if marks["fastpass"].exists() and fastpass_out.exists() and fastpass_out.stat().st_size > 0:
                     print(f"[resume] fast-pass already completed: {fastpass_out}")
+                    if args.sdm == "av1an":
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "completed", message="resume", source=input_file, workdir=project_dir)
+                    emit_runner_child_event("Fastpass", "completed", message="resume", source=input_file, workdir=project_dir)
                 else:
                     if fastpass_vpy is not None:
                         ensure_exists(fastpass_vpy, "Fast-pass vpy")
                     if fastpass_proxy is not None:
                         ensure_exists(fastpass_proxy, "Fast-pass proxy")
-                    run_fastpass_av1an(
-                        av1an_exe=str(args.av1an),
-                        input_file=input_file,
-                        fastpass_vpy=fastpass_vpy,
-                        fastpass_proxy=fastpass_proxy,
-                        output_file=fastpass_out,
-                        scenes_path=base_scenes_path,
-                        av1an_temp=av1an_temp,
-                        sdm=str(args.sdm),
-                        workers=int(args.workers),
-                        lp=int(args.lp),
-                        fast_preset=fastpass_preset,
-                        fast_crf=float(args.quality),
-                        encoder=str(args.encoder),
-                        video_params=str(args.video_params),
-                        ffmpeg_arg=str(args.ffmpeg),
-                        verbose=bool(args.verbose),
-                        keep=bool(args.keep),
-                        sc_only=False,
-                        log_file=av1an_log_file,
-                        log_level=(
-                            None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
-                            else str(args.av1an_log_level).strip()
-                        ),
-                        fastpass_hdr=bool(args.fastpass_hdr),
-                        hdr_patch_script=hdr_patch_script,
-                        chunk_order=str(args.chunk_order or ""),
-                        encoder_path=str(args.encoder_path or ""),
-                        fast_interrupt=bool(args.fast_interrupt),
-                        vspipe_args=fastpass_vspipe_args,
-                    )
+                    if args.sdm == "av1an":
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "started", source=input_file, workdir=project_dir)
+                    emit_runner_child_event("Fastpass", "started", source=input_file, workdir=project_dir)
+                    try:
+                        run_fastpass_av1an(
+                            av1an_exe=str(args.av1an),
+                            input_file=input_file,
+                            fastpass_vpy=fastpass_vpy,
+                            fastpass_proxy=fastpass_proxy,
+                            output_file=fastpass_out,
+                            scenes_path=base_scenes_path,
+                            av1an_temp=av1an_temp,
+                            sdm=str(args.sdm),
+                            workers=int(args.workers),
+                            lp=int(args.lp),
+                            fast_preset=fastpass_preset,
+                            fast_crf=float(args.quality),
+                            encoder=str(args.encoder),
+                            video_params=str(args.video_params),
+                            ffmpeg_arg=str(args.ffmpeg),
+                            verbose=bool(args.verbose),
+                            keep=bool(args.keep),
+                            sc_only=False,
+                            log_file=av1an_log_file,
+                            log_level=(
+                                None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
+                                else str(args.av1an_log_level).strip()
+                            ),
+                            fastpass_hdr=bool(args.fastpass_hdr),
+                            hdr_patch_script=hdr_patch_script,
+                            chunk_order=str(args.chunk_order or ""),
+                            encoder_path=str(args.encoder_path or ""),
+                            fast_interrupt=bool(args.fast_interrupt),
+                            vspipe_args=fastpass_vspipe_args,
+                        )
+                    except Exception as exc:
+                        if args.sdm == "av1an":
+                            emit_runner_child_event("Auto-Boost: Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                        emit_runner_child_event("Fastpass", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                        raise
                     touch(marks["fastpass"])
+                    if args.sdm == "av1an":
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "completed", source=input_file, workdir=project_dir)
+                    emit_runner_child_event("Fastpass", "completed", source=input_file, workdir=project_dir)
 
     frames_count = 0
     scene_ranges: List[Tuple[int, int]] = []
@@ -442,24 +505,32 @@ def main() -> int:
     if args.stage in (0, 3):
         if args.no_fastpass:
             print("[skip] no-fastpass enabled; metrics skipped.")
+            emit_runner_child_event("SSIMU2 Metrics", "skipped", message="no_fastpass", source=input_file, workdir=project_dir)
         else:
             ensure_exists(fastpass_out, "Fast-pass output")
 
             if marks["ssimu2"].exists() and is_valid_ssimu2_log(ssimu2_log):
                 print(f"[resume] SSIMU2 already completed: {ssimu2_log}")
+                emit_runner_child_event("SSIMU2 Metrics", "completed", message="resume", source=input_file, workdir=project_dir)
             else:
-                calculate_ssimu2(
-                    src_file=metrics_ref_src,
-                    enc_file=fastpass_out,
-                    out_path=ssimu2_log,
-                    frames_count=frames_count,
-                    skip=int(args.skip),
-                    backend=str(args.ssimu2_backend),
-                    vs_source=str(args.vs_source),
-                    vpy_src=metrics_ref_vpy_src,
-                    vpy_args=metrics_ref_vpy_args,
-                )
+                emit_runner_child_event("SSIMU2 Metrics", "started", source=input_file, workdir=project_dir)
+                try:
+                    calculate_ssimu2(
+                        src_file=metrics_ref_src,
+                        enc_file=fastpass_out,
+                        out_path=ssimu2_log,
+                        frames_count=frames_count,
+                        skip=int(args.skip),
+                        backend=str(args.ssimu2_backend),
+                        vs_source=str(args.vs_source),
+                        vpy_src=metrics_ref_vpy_src,
+                        vpy_args=metrics_ref_vpy_args,
+                    )
+                except Exception as exc:
+                    emit_runner_child_event("SSIMU2 Metrics", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                    raise
                 touch(marks["ssimu2"])
+                emit_runner_child_event("SSIMU2 Metrics", "completed", source=input_file, workdir=project_dir)
 
     # -----------------
     # Stage 4: base scenes

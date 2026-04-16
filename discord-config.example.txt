@@ -1,0 +1,19 @@
+# Copy this file to discord-config.txt and fill in real values.
+# discord-config.txt is ignored by git.
+
+PBBATCH_DISCORD_TOKEN=
+PBBATCH_DISCORD_GUILD_ID=
+PBBATCH_DISCORD_CATEGORY_ID=
+
+# Optional role gates. Leave empty or 0 to allow everyone who can use the bot.
+PBBATCH_DISCORD_ADMIN_ROLE_ID=0
+PBBATCH_DISCORD_OPERATOR_ROLE_ID=0
+
+# Optional local service settings.
+PBBATCH_DISCORD_SERVICE_URL=http://127.0.0.1:8794
+PBBATCH_DISCORD_HOST=127.0.0.1
+PBBATCH_DISCORD_PORT=8794
+PBBATCH_DISCORD_MAX_UPLOAD_MB=25
+
+# Optional SQLite state path. Leave empty to use %APPDATA%\PBBatchProcessUtil\discord\state.sqlite3.
+PBBATCH_DISCORD_STATE_DB=
