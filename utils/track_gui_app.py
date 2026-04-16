@@ -31,12 +31,14 @@ from utils.track_gui_shared import (
     AUDIO_MODE_OPTIONS,
     CHUNK_ORDER_OPTIONS,
     DEFAULT_CHUNK_ORDER,
+    DEFAULT_SOURCE_LOADER,
     DEFAULT_OPTIONS,
     DEFAULT_VIDEO_ENCODER,
     DefaultSettings,
     ENCODER_PATH_INFO_PREFIX,
     LEGACY_PORTABLE_DIR,
     MODE_OPTIONS,
+    SOURCE_LOADER_OPTIONS,
     SUB_MODE_OPTIONS,
     TYPE_OPTIONS,
     VIDEO_ENCODER_OPTIONS,
@@ -91,6 +93,10 @@ class TrackConfigGui:
             main_vpy=defaults_raw.get("mainVpy") or defaults_raw.get("main_vpy") or "",
             fast_vpy=defaults_raw.get("fastVpy") or defaults_raw.get("fast_vpy") or "",
             proxy_vpy=defaults_raw.get("proxyVpy") or defaults_raw.get("proxy_vpy") or "",
+            vpy_wrapper=defaults_raw.get("vpyWrapper") if "vpyWrapper" in defaults_raw else defaults_raw.get("vpy_wrapper", False),
+            source_loader=defaults_raw.get("sourceLoader") or defaults_raw.get("source_loader") or DEFAULT_SOURCE_LOADER,
+            crop_resize_enabled=defaults_raw.get("cropResizeEnabled") if "cropResizeEnabled" in defaults_raw else defaults_raw.get("crop_resize_enabled", False),
+            crop_resize_commands=defaults_raw.get("cropResizeCommands") or defaults_raw.get("crop_resize_commands") or "",
             attach_encode_info=defaults_raw["attachEncodeInfo"] if "attachEncodeInfo" in defaults_raw else defaults_raw.get("attach_encode_info", False),
             note=defaults_raw.get("note") or "",
         )
@@ -499,12 +505,15 @@ class TrackConfigGui:
         notebook.pack(fill=tk.BOTH, expand=True)
 
         video_tab = ttk.Frame(notebook, style="Surface.TFrame")
+        experimental_tab = ttk.Frame(notebook, style="Surface.TFrame")
         tracks_tab = ttk.Frame(notebook, style="Surface.TFrame")
 
         notebook.add(video_tab, text="Video Pipeline")
+        notebook.add(experimental_tab, text="Experimental")
         notebook.add(tracks_tab, text="Track Rules")
 
         self._build_video_tab(video_tab)
+        self._build_experimental_tab(experimental_tab)
         self._build_tracks_tab(tracks_tab)
 
     def _build_video_tab(self, frame):
@@ -701,6 +710,49 @@ class TrackConfigGui:
         self.ab_multiplier_var.trace_add("write", self.on_ab_multiplier_change)
         self.ab_pos_multiplier_var.trace_add("write", self.on_ab_pos_multiplier_change)
         self.ab_neg_multiplier_var.trace_add("write", self.on_ab_pos_multiplier_change)
+
+    def _build_experimental_tab(self, frame):
+        content = self._create_scrollable_area(frame)
+        grid = ttk.Frame(content, style="Surface.TFrame", padding=(6, 6, 6, 16))
+        grid.pack(fill=tk.BOTH, expand=True)
+        grid.columnconfigure(0, weight=1)
+
+        self.vpy_wrapper_var = tk.BooleanVar(value=bool(self.defaults.vpy_wrapper))
+        self.source_loader_var = tk.StringVar(value=self.defaults.source_loader or DEFAULT_SOURCE_LOADER)
+        self.crop_resize_enabled_var = tk.BooleanVar(value=bool(self.defaults.crop_resize_enabled))
+
+        global_section, row = self._build_section(grid, title="Global", columns=2)
+        global_section.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        ttk.Checkbutton(global_section, text="VPY Wrapper", variable=self.vpy_wrapper_var).grid(
+            row=row, column=0, columnspan=2, sticky=tk.W, pady=6, padx=(0, 12)
+        )
+        self._build_labeled_combo(
+            global_section,
+            row,
+            1,
+            "Default source loader",
+            self.source_loader_var,
+            SOURCE_LOADER_OPTIONS,
+            width=20,
+        )
+
+        crop_section, row = self._build_section(grid, title="Dynamic crop/resize", columns=1)
+        crop_section.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        crop_section.columnconfigure(0, weight=1)
+        ttk.Checkbutton(crop_section, text="Enable crop/resize", variable=self.crop_resize_enabled_var).grid(
+            row=row, column=0, sticky=tk.W, pady=(0, 8)
+        )
+        row += 1
+        self.crop_resize_text = tk.Text(crop_section, height=12, width=80, wrap="none")
+        self._build_labeled_text(crop_section, row, "Commands", self.crop_resize_text, height=14)
+        self.crop_resize_text.insert("1.0", self.defaults.crop_resize_commands)
+        self.crop_resize_text.edit_modified(False)
+        self.crop_resize_text.bind("<<Modified>>", self.on_crop_resize_change)
+
+        self.vpy_wrapper_var.trace_add("write", self.on_experimental_change)
+        self.source_loader_var.trace_add("write", self.on_defaults_change)
+        self.crop_resize_enabled_var.trace_add("write", self.on_crop_resize_enabled_change)
+        self._refresh_crop_resize_state()
 
     def _build_tracks_tab(self, frame):
         frame.configure(padding=6)
@@ -969,6 +1021,9 @@ class TrackConfigGui:
         zoning_value = ""
         if hasattr(self, "default_zoning_text"):
             zoning_value = self.default_zoning_text.get("1.0", tk.END).rstrip("\n")
+        crop_resize_value = ""
+        if hasattr(self, "crop_resize_text"):
+            crop_resize_value = self.crop_resize_text.get("1.0", tk.END).rstrip("\n")
         chunk_order_var = getattr(self, "chunk_order_var", None)
         encoder_path_var = getattr(self, "encoder_path_var", None)
         chunk_order_value = chunk_order_var.get().strip() if chunk_order_var is not None else self.defaults.chunk_order
@@ -1004,6 +1059,10 @@ class TrackConfigGui:
             main_vpy=self._get_var_value("main_vpy_var"),
             fast_vpy=self._get_var_value("fast_vpy_var"),
             proxy_vpy=self._get_var_value("proxy_vpy_var"),
+            vpy_wrapper=bool(getattr(self, "vpy_wrapper_var", tk.BooleanVar(value=False)).get()),
+            source_loader=self._get_var_value("source_loader_var") or DEFAULT_SOURCE_LOADER,
+            crop_resize_enabled=bool(getattr(self, "crop_resize_enabled_var", tk.BooleanVar(value=False)).get()),
+            crop_resize_commands=crop_resize_value,
             attach_encode_info=bool(getattr(self, "attach_encode_info_var", tk.BooleanVar(value=False)).get()),
             note=self._get_var_value("note_var"),
         )
@@ -1228,6 +1287,38 @@ class TrackConfigGui:
         self.defaults = self._current_defaults()
         self._refresh_results()
 
+    def _refresh_crop_resize_state(self):
+        enabled = bool(getattr(self, "crop_resize_enabled_var", tk.BooleanVar(value=False)).get())
+        text = getattr(self, "crop_resize_text", None)
+        if text is not None:
+            text.configure(state="normal" if enabled else "disabled")
+
+    def on_experimental_change(self, *_args):
+        wrapper_var = getattr(self, "vpy_wrapper_var", None)
+        crop_var = getattr(self, "crop_resize_enabled_var", None)
+        if crop_var is not None and crop_var.get() and wrapper_var is not None and not wrapper_var.get():
+            wrapper_var.set(True)
+            return
+        self.defaults = self._current_defaults()
+        self._refresh_crop_resize_state()
+        self._refresh_results()
+
+    def on_crop_resize_enabled_change(self, *_args):
+        if bool(getattr(self, "crop_resize_enabled_var", tk.BooleanVar(value=False)).get()):
+            wrapper_var = getattr(self, "vpy_wrapper_var", None)
+            if wrapper_var is not None and not wrapper_var.get():
+                wrapper_var.set(True)
+                return
+        self.on_experimental_change()
+
+    def on_crop_resize_change(self, _event=None):
+        text = getattr(self, "crop_resize_text", None)
+        if text is None or not text.edit_modified():
+            return
+        self.defaults = self._current_defaults()
+        self._refresh_results()
+        text.edit_modified(False)
+
     def _refresh_encoder_path_options(self, *, preserve_missing):
         combo = getattr(self, "encoder_path_combo", None)
         if combo is None:
@@ -1397,6 +1488,9 @@ class TrackConfigGui:
             "main_vpy": self.defaults.main_vpy,
             "fast_vpy": self.defaults.fast_vpy,
             "proxy_vpy": self.defaults.proxy_vpy,
+            "vpy_wrapper": self.defaults.vpy_wrapper,
+            "source_loader": self.defaults.source_loader,
+            "crop_resize_enabled": self.defaults.crop_resize_enabled,
             "attach_encode_info": self.defaults.attach_encode_info,
             "note": self.defaults.note,
         }
@@ -1414,6 +1508,8 @@ class TrackConfigGui:
             resolved = resolve_paths(plan, plan_path)
             resolved.zone_file.parent.mkdir(parents=True, exist_ok=True)
             resolved.zone_file.write_text(self.defaults.zoning or "", encoding="utf-8", newline="\n")
+            resolved.crop_resize_file.parent.mkdir(parents=True, exist_ok=True)
+            resolved.crop_resize_file.write_text(self.defaults.crop_resize_commands or "", encoding="utf-8", newline="\n")
             saved.append(str(plan_path))
         payload = {"status": "ok", "savedPlans": saved}
         sys.stdout.write(json.dumps(payload, ensure_ascii=False))

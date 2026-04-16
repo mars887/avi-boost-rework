@@ -10,6 +10,8 @@ if str(ROOT) not in sys.path:
 from utils.plan_model import (
     CHUNK_ORDER_OPTIONS,
     DEFAULT_CHUNK_ORDER,
+    DEFAULT_SOURCE_LOADER,
+    SOURCE_LOADER_OPTIONS,
     build_summary_rows,
     file_plan_from_gui_result,
     gui_defaults_from_file_plan,
@@ -128,6 +130,10 @@ class DefaultSettings:
         main_vpy="",
         fast_vpy="",
         proxy_vpy="",
+        vpy_wrapper=False,
+        source_loader=DEFAULT_SOURCE_LOADER,
+        crop_resize_enabled=False,
+        crop_resize_commands="",
         attach_encode_info=False,
         note="",
     ):
@@ -161,6 +167,19 @@ class DefaultSettings:
         self.main_vpy = main_vpy or ""
         self.fast_vpy = fast_vpy or ""
         self.proxy_vpy = proxy_vpy or ""
+        self.vpy_wrapper = parse_bool_value(vpy_wrapper, default=False)
+        source_loader_value = str(source_loader or DEFAULT_SOURCE_LOADER).strip().lower()
+        if source_loader_value in ("bestsource", "best-source"):
+            source_loader_value = "bs"
+        if source_loader_value in ("lsmash", "lwlibavsource"):
+            source_loader_value = "lsmas"
+        if source_loader_value not in SOURCE_LOADER_OPTIONS:
+            source_loader_value = DEFAULT_SOURCE_LOADER
+        self.source_loader = source_loader_value
+        self.crop_resize_enabled = parse_bool_value(crop_resize_enabled, default=False)
+        if self.crop_resize_enabled:
+            self.vpy_wrapper = True
+        self.crop_resize_commands = crop_resize_commands or ""
         self.attach_encode_info = parse_bool_value(attach_encode_info, default=False)
         self.note = note or ""
 
@@ -436,6 +455,9 @@ def build_results(files, tracks_by_file, settings, defaults):
     default_main_vpy = defaults.main_vpy
     default_fast_vpy = defaults.fast_vpy
     default_proxy_vpy = defaults.proxy_vpy
+    default_vpy_wrapper = defaults.vpy_wrapper
+    default_source_loader = defaults.source_loader
+    default_crop_resize_enabled = defaults.crop_resize_enabled
     default_attach_encode_info = defaults.attach_encode_info
     default_note = defaults.note
 
@@ -588,6 +610,9 @@ def build_results(files, tracks_by_file, settings, defaults):
                 track_mux["mainVpy"] = default_main_vpy
                 track_mux["fastVpy"] = default_fast_vpy
                 track_mux["proxyVpy"] = default_proxy_vpy
+                track_mux["vpyWrapper"] = "true" if default_vpy_wrapper else "false"
+                track_mux["sourceLoader"] = default_source_loader
+                track_mux["cropResizeEnabled"] = "true" if default_crop_resize_enabled else "false"
                 track_mux["attachEncodeInfo"] = "true" if default_attach_encode_info else "false"
                 if default_note:
                     track_mux["note"] = default_note
@@ -670,6 +695,10 @@ def build_default_defaults_dict():
         "main_vpy": "",
         "fast_vpy": "",
         "proxy_vpy": "",
+        "vpy_wrapper": False,
+        "source_loader": DEFAULT_SOURCE_LOADER,
+        "crop_resize_enabled": False,
+        "crop_resize_commands": "",
         "attach_encode_info": False,
         "note": "",
     }
@@ -689,9 +718,12 @@ def load_gui_data_from_paths(raw_paths):
     for index, path in enumerate(normalized_paths, start=1):
         if path.suffix.lower() == ".plan":
             plan = load_file_plan(path)
-            source = resolve_paths(plan, path).source
+            resolved = resolve_paths(plan, path)
+            source = resolved.source
             if len(normalized_paths) == 1:
                 defaults.update(gui_defaults_from_file_plan(plan))
+                if resolved.crop_resize_file.exists():
+                    defaults["crop_resize_commands"] = resolved.crop_resize_file.read_text(encoding="utf-8")
                 settings = gui_settings_from_file_plan(plan)
             plan_paths[str(source)] = str(path)
             files.append(str(source))
@@ -704,7 +736,10 @@ def load_gui_data_from_paths(raw_paths):
         existing_plan = plan_path_for_source(source)
         if existing_plan.exists() and len(normalized_paths) == 1:
             plan = load_file_plan(existing_plan)
+            resolved = resolve_paths(plan, existing_plan)
             defaults.update(gui_defaults_from_file_plan(plan))
+            if resolved.crop_resize_file.exists():
+                defaults["crop_resize_commands"] = resolved.crop_resize_file.read_text(encoding="utf-8")
             settings = gui_settings_from_file_plan(plan)
         files.append(str(source))
         plan_paths[str(source)] = str(existing_plan)
@@ -745,6 +780,7 @@ __all__ = [
     "AUDIO_MODE_OPTIONS",
     "CHUNK_ORDER_OPTIONS",
     "DEFAULT_CHUNK_ORDER",
+    "DEFAULT_SOURCE_LOADER",
     "DEFAULT_OPTIONS",
     "DEFAULT_VIDEO_ENCODER",
     "DefaultSettings",
@@ -753,6 +789,7 @@ __all__ = [
     "MODE_OPTIONS",
     "PARAM_GLUE",
     "STRICT_SDR_8BIT_PARAMS",
+    "SOURCE_LOADER_OPTIONS",
     "SUB_MODE_OPTIONS",
     "TYPE_OPTIONS",
     "TYPE_ORDER",

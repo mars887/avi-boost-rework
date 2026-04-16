@@ -14,6 +14,7 @@ from utils.track_config_gui import build_default_defaults_dict
 
 
 VIDEO_EXTS = {".mkv", ".mp4"}
+VIDEO_EXTRACT_EXTS = {".mkv", ".mp4", ".avi", ".mov"}
 
 
 def enter_numbers(raw: str, min_value: int, max_value: int) -> List[int]:
@@ -52,6 +53,9 @@ def enter_numbers(raw: str, min_value: int, max_value: int) -> List[int]:
 
 def is_supported_video_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in VIDEO_EXTS and not path.name.lower().endswith(("-av1.mkv", "-av1.mp4"))
+
+def is_supported_video_file_for_extract(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in VIDEO_EXTRACT_EXTS
 
 
 def prompt_for_path(prompt: str) -> Path:
@@ -116,7 +120,7 @@ def resolve_input_items(raw_paths: Sequence[str]) -> List[Tuple[Path, Path]]:
                 if isinstance(plan, FilePlan):
                     _add_input_item(items, seen, gui_path=plan_path, source_path=resolve_paths(plan, plan_path).source)
             continue
-        if not is_supported_video_file(path):
+        if not is_supported_video_file_for_extract(path):
             raise RuntimeError(f"Unsupported input path: {path}")
         _add_input_item(items, seen, gui_path=path, source_path=path)
     return items

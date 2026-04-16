@@ -14,6 +14,7 @@ DEFAULT_VIDEO_ENCODER = "svt-av1"
 DEFAULT_SCENE_DETECTION = "av1an"
 DEFAULT_QUALITY = 30.0
 DEFAULT_CHUNK_ORDER = "long-biased-random"
+DEFAULT_SOURCE_LOADER = "ffms2"
 CHUNK_ORDER_OPTIONS = (
     "long-biased-random",
     "random",
@@ -21,6 +22,7 @@ CHUNK_ORDER_OPTIONS = (
     "short-to-long",
     "long-to-short",
 )
+SOURCE_LOADER_OPTIONS = ("auto", "ffms2", "bs", "lsmas")
 WIN_BAD = '<>:"/\\|?*'
 
 DEFAULT_FASTPASS_PARAMS: Dict[str, Any] = {
@@ -109,6 +111,13 @@ class VideoDetails:
 
 
 @dataclass
+class VideoExperimental:
+    vpy_wrapper: bool = False
+    source_loader: str = DEFAULT_SOURCE_LOADER
+    crop_resize_enabled: bool = False
+
+
+@dataclass
 class VideoPlan:
     track_id: int
     source_name: str = ""
@@ -116,6 +125,7 @@ class VideoPlan:
     action: str = "edit"
     primary: VideoPrimary = field(default_factory=VideoPrimary)
     details: VideoDetails = field(default_factory=VideoDetails)
+    experimental: VideoExperimental = field(default_factory=VideoExperimental)
     fastpass_params: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_FASTPASS_PARAMS))
     mainpass_params: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_MAINPASS_PARAMS))
 
@@ -176,6 +186,7 @@ class ResolvedPaths:
     source: Path
     workdir: Path
     zone_file: Path
+    crop_resize_file: Path
 
 
 @dataclass
@@ -226,6 +237,7 @@ class ResolvedFilePlan:
         video = self.plan.video
         primary = video.primary
         details = video.details
+        experimental = video.experimental
         video_config = {
             "quality": format_value(primary.quality),
             "chunk_order": str(primary.chunk_order or ""),
@@ -260,6 +272,9 @@ class ResolvedFilePlan:
             "fastVpy": details.fast_vpy,
             "proxyVpy": details.proxy_vpy,
             "attachEncodeInfo": bool_text(primary.attach_encode_info),
+            "vpyWrapper": bool_text(experimental.vpy_wrapper),
+            "sourceLoader": str(experimental.source_loader or DEFAULT_SOURCE_LOADER),
+            "cropResizeEnabled": bool_text(experimental.crop_resize_enabled),
         }
         if details.note:
             track_mux["note"] = details.note
@@ -360,6 +375,10 @@ def default_video_details() -> VideoDetails:
     return VideoDetails()
 
 
+def default_video_experimental() -> VideoExperimental:
+    return VideoExperimental()
+
+
 def normalize_track_type(value: Any) -> str:
     raw = str(value or "").strip().lower()
     if raw.startswith("sub"):
@@ -385,6 +404,17 @@ def normalize_chunk_order(value: Any) -> str:
     if raw in CHUNK_ORDER_OPTIONS:
         return raw
     return DEFAULT_CHUNK_ORDER
+
+
+def normalize_source_loader(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in ("bestsource", "best-source"):
+        raw = "bs"
+    if raw in ("lsmash", "lwlibavsource"):
+        raw = "lsmas"
+    if raw in SOURCE_LOADER_OPTIONS:
+        return raw
+    return DEFAULT_SOURCE_LOADER
 
 
 def bool_text(value: bool) -> str:
@@ -539,7 +569,9 @@ __all__ = [
     "DEFAULT_SCENE_DETECTION",
     "DEFAULT_QUALITY",
     "DEFAULT_CHUNK_ORDER",
+    "DEFAULT_SOURCE_LOADER",
     "CHUNK_ORDER_OPTIONS",
+    "SOURCE_LOADER_OPTIONS",
     "DEFAULT_FASTPASS_PARAMS",
     "DEFAULT_MAINPASS_PARAMS",
     "SourceTrack",
@@ -547,6 +579,7 @@ __all__ = [
     "PlanPaths",
     "VideoPrimary",
     "VideoDetails",
+    "VideoExperimental",
     "VideoPlan",
     "AudioPlan",
     "SubPlan",
@@ -558,9 +591,11 @@ __all__ = [
     "RunnerEvent",
     "default_video_primary",
     "default_video_details",
+    "default_video_experimental",
     "normalize_track_type",
     "normalize_encoder",
     "normalize_chunk_order",
+    "normalize_source_loader",
     "bool_text",
     "parse_bool_value",
     "to_float",

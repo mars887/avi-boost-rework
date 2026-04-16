@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.plan_model import format_value, normalize_track_type, resolve_file_plan
+from utils.crop_resize import load_crop_resize_plan, validate_crop_resize_plan
 
 
 NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
@@ -120,6 +121,24 @@ def check_zone_syntax(zone_path: Path, source: Path) -> Tuple[List[str], List[st
     p = subprocess.run(cmd)
     if p.returncode != 0:
         errors.append(f"zone syntax check failed (code={p.returncode})")
+    return errors, warnings
+
+
+def check_crop_resize_syntax(crop_path: Path, source: Path, enabled: bool) -> Tuple[List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    if not crop_path.exists():
+        if enabled:
+            warnings.append(f"crop_resize_command.txt missing: {crop_path}")
+        return errors, warnings
+    text = read_text_guess(crop_path)
+    if not text.strip():
+        return errors, warnings
+    try:
+        plan = load_crop_resize_plan(crop_path)
+        validate_crop_resize_plan(plan, source=source if source.exists() else None)
+    except Exception as exc:
+        errors.append(f"crop/resize syntax failed: {exc}")
     return errors, warnings
 
 
@@ -309,6 +328,7 @@ def main(argv: List[str]) -> int:
     plan_cfg = build_plan_cfg(resolved_plan)
     errors.extend(validate_resolved_plan_tracks(resolved_plan.runtime_tracks()))
     zone_path = resolved_plan.paths.zone_file
+    crop_path = resolved_plan.paths.crop_resize_file
 
     if not source.exists():
         errors.append(f"source missing: {source}")
@@ -320,8 +340,18 @@ def main(argv: List[str]) -> int:
         z_errs, z_warns = check_zone_syntax(zone_path, source)
         errors.extend(z_errs)
         warnings.extend(z_warns)
-    elif zone_path.exists():
-        warnings.append("zone syntax skipped: source missing")
+        c_errs, c_warns = check_crop_resize_syntax(
+            crop_path,
+            source,
+            bool(resolved_plan.plan.video.experimental.crop_resize_enabled),
+        )
+        errors.extend(c_errs)
+        warnings.extend(c_warns)
+    else:
+        if zone_path.exists():
+            warnings.append("zone syntax skipped: source missing")
+        if crop_path.exists():
+            warnings.append("crop/resize syntax skipped: source missing")
 
     if args.check_filters and source.exists():
         if plan_cfg.fastpass_vf.strip():

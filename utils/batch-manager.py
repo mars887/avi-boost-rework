@@ -34,6 +34,7 @@ VIDEO_EXTS = (".mkv", ".mp4")
 ADDITIONAL_WORK_EXTS = ("ffindex", "lvi")
 KNOWN_WORKDIR_TOP_LEVEL = {
     "zone_edit_command.txt",
+    "crop_resize_command.txt",
     ".state",
     "00_meta",
     "00_logs",
@@ -63,6 +64,7 @@ class SourceGroup:
     workdir: Path
     plan_path: Path
     zone_file: Path
+    crop_resize_file: Path
     runner_bat: Path
     manager_bat: Path
     full_batch_plan: Path
@@ -102,7 +104,7 @@ def choose_source_path(source_dir: Path, base: str) -> Path:
 
 
 def is_workdir(p: Path) -> bool:
-    return (p / "zone_edit_command.txt").exists() or (p / "video").exists() or (p / "audio").exists()
+    return (p / "zone_edit_command.txt").exists() or (p / "crop_resize_command.txt").exists() or (p / "video").exists() or (p / "audio").exists()
 
 
 def build_group_from_source(source: Path) -> SourceGroup:
@@ -112,12 +114,14 @@ def build_group_from_source(source: Path) -> SourceGroup:
     plan_path = source_dir / f"{base}.plan"
     workdir = source_dir / base
     zone_file = workdir / "zone_edit_command.txt"
+    crop_resize_file = workdir / "crop_resize_command.txt"
     if plan_path.exists():
         try:
             plan = load_file_plan(plan_path)
             resolved = resolve_paths(plan, plan_path)
             workdir = resolved.workdir
             zone_file = resolved.zone_file
+            crop_resize_file = resolved.crop_resize_file
         except Exception:
             pass
     return SourceGroup(
@@ -127,6 +131,7 @@ def build_group_from_source(source: Path) -> SourceGroup:
         workdir=workdir,
         plan_path=plan_path,
         zone_file=zone_file,
+        crop_resize_file=crop_resize_file,
         runner_bat=source_dir / "runner.bat",
         manager_bat=source_dir / "Batch Manager.bat",
         full_batch_plan=source_dir / "full-batch.plan",
@@ -456,6 +461,8 @@ def clear_run(group: SourceGroup) -> None:
     keep = {"00_logs"}
     if group.zone_file.parent.resolve() == workdir.resolve():
         keep.add(group.zone_file.name)
+    if group.crop_resize_file.parent.resolve() == workdir.resolve():
+        keep.add(group.crop_resize_file.name)
     for entry in workdir.iterdir():
         if entry.name in keep:
             continue
@@ -570,6 +577,7 @@ def dump_configs_to_meta(groups: List[SourceGroup]) -> Dict[Path, List[SourceGro
         for g in items:
             move_if_exists(g.plan_path, meta / f"{g.base}.plan")
             move_if_exists(g.zone_file, meta / f"{g.base}-zoning.txt")
+            move_if_exists(g.crop_resize_file, meta / f"{g.base}-crop-resize.txt")
             for src, dst_name in (
                 (g.full_batch_plan, "full-batch.plan"),
                 (g.fastpass_batch_plan, "fastpass-batch.plan"),
@@ -668,6 +676,7 @@ def prompt_edit_target() -> Optional[str]:
     print("  2) full-batch.plan")
     print("  3) fastpass-batch.plan")
     print("  4) zone_edit_command.txt")
+    print("  5) crop_resize_command.txt")
     print("  B) Back")
     while True:
         choice = input("Select file to edit: ").strip().lower()
@@ -681,6 +690,8 @@ def prompt_edit_target() -> Optional[str]:
             return "fastpass-batch"
         if choice == "4":
             return "zone"
+        if choice == "5":
+            return "crop-resize"
         print("Unknown option.")
 
 
@@ -693,6 +704,8 @@ def edit_target_path(group: SourceGroup, target: str) -> Path:
         return group.fastpass_batch_plan
     if target == "zone":
         return group.zone_file
+    if target == "crop-resize":
+        return group.crop_resize_file
     raise ValueError(f"Unsupported edit target: {target}")
 
 
@@ -705,6 +718,8 @@ def edit_target_label(target: str) -> str:
         return "fastpass-batch.plan"
     if target == "zone":
         return "zone_edit_command.txt"
+    if target == "crop-resize":
+        return "crop_resize_command.txt"
     return target
 
 
@@ -853,18 +868,24 @@ def choose_template_group(candidates: List[SourceGroup], source_dir: Path) -> Op
 
 
 def copy_zone_command(template: SourceGroup, target: SourceGroup) -> bool:
-    src_zone = template.zone_file
-    dst_zone = target.zone_file
-    dst_zone.parent.mkdir(parents=True, exist_ok=True)
+    return copy_sidecar_config(template.zone_file, target.zone_file, "zoning command")
+
+
+def copy_crop_resize_command(template: SourceGroup, target: SourceGroup) -> bool:
+    return copy_sidecar_config(template.crop_resize_file, target.crop_resize_file, "crop/resize command")
+
+
+def copy_sidecar_config(src_path: Path, dst_path: Path, label: str) -> bool:
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        if src_zone.exists():
-            shutil.copy2(src_zone, dst_zone)
+        if src_path.exists():
+            shutil.copy2(src_path, dst_path)
         else:
-            dst_zone.write_text("", encoding="utf-8", newline="\n")
-        print(f"[write] {dst_zone}")
+            dst_path.write_text("", encoding="utf-8", newline="\n")
+        print(f"[write] {dst_path}")
         return True
     except Exception as e:
-        print(f"[err] failed to write zoning command {dst_zone}: {e}")
+        print(f"[err] failed to write {label} {dst_path}: {e}")
         return False
 
 
@@ -906,7 +927,8 @@ def clone_source_config(template: SourceGroup, target: SourceGroup) -> bool:
         return False
 
     ok_zone = copy_zone_command(template, target)
-    return ok_zone
+    ok_crop = copy_crop_resize_command(template, target)
+    return ok_zone and ok_crop
 
 
 def expand_configs_for_new_sources(groups: List[SourceGroup]) -> None:

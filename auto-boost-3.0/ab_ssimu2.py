@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 import tqdm
 
@@ -20,6 +20,7 @@ def calculate_ssimu2(
     backend: str,
     vs_source: str,
     vpy_src: Optional[Path] = None,
+    vpy_args: Optional[Dict[str, str]] = None,
 ) -> int:
     """Compute SSIMULACRA2 and write a log file.
 
@@ -60,7 +61,7 @@ def calculate_ssimu2(
         raise RuntimeError("vszip VapourSynth plugin is not loaded (core.vszip.SSIMULACRA2 not available).")
 
     # Always build the clips first (fixes UnboundLocalError in vship branch).
-    source_clip = load_vs_clip(src_file, vs_source, vpy_src=vpy_src)
+    source_clip = load_vs_clip(src_file, vs_source, vpy_src=vpy_src, vpy_args=vpy_args)
     encoded_clip = load_vs_clip(enc_file, vs_source, vpy_src=vpy_src)
 
     # Match geometry (SSIMU2 needs same dimensions).
