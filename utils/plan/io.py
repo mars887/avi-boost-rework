@@ -11,6 +11,7 @@ from utils.plan.types import (
     BATCH_PLAN_TYPE,
     DEFAULT_MAINPASS_PARAMS,
     DEFAULT_CHUNK_ORDER,
+    DEFAULT_SOURCE_LOADER,
     DEFAULT_QUALITY,
     DEFAULT_SCENE_DETECTION,
     DEFAULT_VIDEO_ENCODER,
@@ -29,12 +30,14 @@ from utils.plan.types import (
     SubPlan,
     SourceTrack,
     VideoDetails,
+    VideoExperimental,
     VideoPlan,
     VideoPrimary,
     coerce_scalar,
     format_value,
     normalize_encoder,
     normalize_chunk_order,
+    normalize_source_loader,
     parse_bool_value,
     sanitize_component,
     to_float,
@@ -123,11 +126,13 @@ def resolve_paths(plan: FilePlan, plan_path: Path) -> ResolvedPaths:
     source = _resolve_path(plan.paths.source, base_dir)
     workdir = (base_dir / _workdir_name(plan, source)).resolve()
     zone_file = (workdir / "zone_edit_command.txt").resolve()
+    crop_resize_file = (workdir / "crop_resize_command.txt").resolve()
     return ResolvedPaths(
         plan_path=plan_file,
         source=source,
         workdir=workdir,
         zone_file=zone_file,
+        crop_resize_file=crop_resize_file,
     )
 
 
@@ -206,6 +211,7 @@ def _reorder_file_plan_blocks(lines: List[str]) -> List[str]:
         "[video.pipeline]",
         "[video.color]",
         "[video.pipe]",
+        "[video.experimental]",
         "[video.fastpass.params]",
         "[video.mainpass.params]",
         "[mux]",
@@ -346,6 +352,7 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
     video_pipeline_data = dict(video_data.get("pipeline") or {})
     video_color_data = dict(video_data.get("color") or {})
     video_pipe_data = dict(video_data.get("pipe") or {})
+    video_experimental_data = dict(video_data.get("experimental") or {})
     video_details_data = dict(video_data.get("details") or {})
     video_fastpass_section = dict(video_data.get("fastpass") or {})
     video_mainpass_section = dict(video_data.get("mainpass") or {})
@@ -411,6 +418,11 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
                 fast_vpy=str(video_pipe_data.get("fast_vpy") or video_details_data.get("fast_vpy") or ""),
                 proxy_vpy=str(video_pipe_data.get("proxy_vpy") or video_details_data.get("proxy_vpy") or ""),
                 note=str(mux_data.get("note") or video_details_data.get("note") or ""),
+            ),
+            experimental=VideoExperimental(
+                vpy_wrapper=parse_bool_value(video_experimental_data.get("vpy_wrapper"), False),
+                source_loader=normalize_source_loader(video_experimental_data.get("source_loader") or DEFAULT_SOURCE_LOADER),
+                crop_resize_enabled=parse_bool_value(video_experimental_data.get("crop_resize_enabled"), False),
             ),
             fastpass_params=(
                 {
@@ -549,6 +561,11 @@ def _dump_file_plan(plan: FilePlan) -> str:
             f"main_vpy = {_toml_string(plan.video.details.main_vpy)}",
             f"fast_vpy = {_toml_string(plan.video.details.fast_vpy)}",
             f"proxy_vpy = {_toml_string(plan.video.details.proxy_vpy)}",
+            "",
+            "[video.experimental]",
+            f"vpy_wrapper = {_toml_scalar(plan.video.experimental.vpy_wrapper)}",
+            f"source_loader = {_toml_string(normalize_source_loader(plan.video.experimental.source_loader))}",
+            f"crop_resize_enabled = {_toml_scalar(plan.video.experimental.crop_resize_enabled)}",
             "",
             "[mux]",
             f"attach_encode_info = {_toml_scalar(plan.video.primary.attach_encode_info)}",

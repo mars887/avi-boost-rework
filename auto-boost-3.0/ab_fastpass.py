@@ -88,6 +88,7 @@ def run_fastpass_av1an(
     chunk_order: str = "",
     encoder_path: str = "",
     fast_interrupt: bool = False,
+    vspipe_args: Optional[List[str]] = None,
 ) -> None:
     """Build and execute the av1an fast-pass command (or sc-only)."""
     encoder = normalize_encoder(encoder)
@@ -114,8 +115,12 @@ def run_fastpass_av1an(
         cmd.extend(["--log-file", str(log_file)])
     if fastpass_proxy is not None:
         cmd.extend(["--proxy", str(fastpass_proxy)])
-    if fastpass_vpy is not None or fastpass_proxy is not None:
-        cmd.extend(["--vspipe-args", f"src={input_file}"])
+    vspipe_arg_list = [str(item) for item in (vspipe_args or []) if str(item).strip()]
+    if (fastpass_vpy is not None or fastpass_proxy is not None) and not any(item.startswith("src=") for item in vspipe_arg_list):
+        vspipe_arg_list.insert(0, f"src={input_file}")
+    if vspipe_arg_list:
+        cmd.append("--vspipe-args")
+        cmd.extend(vspipe_arg_list)
 
     # Provide scenes file (skip scene detection) or emit scenes when --sc-only
     if scenes_path is not None:
@@ -143,6 +148,7 @@ def run_fastpass_av1an(
     # Encoder & encode settings (fast pass)
     cmd.extend(["-e", encoder, "--force"])
     cmd.extend(["-a","-an -sn"])
+    cmd.extend(["--resume"]) # TODO - resume fastpass if params not changed
 
     enc_params = build_fastpass_params(
         encoder=encoder,

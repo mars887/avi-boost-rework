@@ -9,11 +9,13 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from utils.pipeline_runtime import ROOT_DIR, UTILS_DIR, load_toolchain
 from utils.plan_model import FilePlan, load_plan, resolve_batch_plan, resolve_paths
 from utils.plan_support import collect_file_plan_paths, refresh_support_for_plan_paths
+from utils.main_select_gui import apply_template_default_groups, run_main_selection_gui
 from utils.track_summary import summarize_files
-from utils.track_config_gui import build_default_defaults_dict
+from utils.track_config_gui import build_default_defaults_dict, load_gui_data_from_paths
 
 
 VIDEO_EXTS = {".mkv", ".mp4"}
+VIDEO_EXTRACT_EXTS = {".mkv", ".mp4", ".avi", ".mov"}
 
 
 def enter_numbers(raw: str, min_value: int, max_value: int) -> List[int]:
@@ -52,6 +54,9 @@ def enter_numbers(raw: str, min_value: int, max_value: int) -> List[int]:
 
 def is_supported_video_file(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in VIDEO_EXTS and not path.name.lower().endswith(("-av1.mkv", "-av1.mp4"))
+
+def is_supported_video_file_for_extract(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in VIDEO_EXTRACT_EXTS
 
 
 def prompt_for_path(prompt: str) -> Path:
@@ -116,7 +121,7 @@ def resolve_input_items(raw_paths: Sequence[str]) -> List[Tuple[Path, Path]]:
                 if isinstance(plan, FilePlan):
                     _add_input_item(items, seen, gui_path=plan_path, source_path=resolve_paths(plan, plan_path).source)
             continue
-        if not is_supported_video_file(path):
+        if not is_supported_video_file_for_extract(path):
             raise RuntimeError(f"Unsupported input path: {path}")
         _add_input_item(items, seen, gui_path=path, source_path=path)
     return items
@@ -166,6 +171,31 @@ def run_gui_plan_save(input_paths: Sequence[Path]) -> List[Path]:
     cmd = [toolchain.python_exe, str(UTILS_DIR / "track_config_gui.py"), *[str(path) for path in input_paths]]
     proc = subprocess.run(
         cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(ROOT_DIR),
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"track_config_gui failed with code {proc.returncode}\n{proc.stderr}")
+    data = json.loads(proc.stdout or "{}")
+    if str(data.get("status") or "").lower() != "ok":
+        return []
+    saved = [Path(item).resolve() for item in (data.get("savedPlans") or [])]
+    return saved
+
+
+def run_gui_plan_save_from_data(data: Dict[str, Any]) -> List[Path]:
+    toolchain = load_toolchain()
+    payload_data = dict(data)
+    payload_data["outputMode"] = "plans"
+    payload = json.dumps(payload_data, ensure_ascii=False)
+    cmd = [toolchain.python_exe, str(UTILS_DIR / "track_config_gui.py")]
+    proc = subprocess.run(
+        cmd,
+        input=payload,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -267,19 +297,25 @@ def run_extract_attachments(files: Sequence[Path], *, outdir: str = "") -> int:
 
 
 def run_main(paths: Sequence[str]) -> int:
-    input_items = resolve_input_items(paths)
+    selection = run_main_selection_gui(paths)
+    if selection is None:
+        print("No files selected.")
+        return 0
+    input_items = selection.input_items
     files = [source for _, source in input_items]
     if not files:
         print("No files selected.")
         return 1
+    gui_data = load_gui_data_from_paths([str(gui_path) for gui_path, _ in input_items])
+    gui_data = apply_template_default_groups(gui_data, selection.template_plan_path, selection.default_groups)
     print("Files:")
     for path in files:
         print(f"  {path.name}")
-    summary = summarize_files(files)
+    summary = gui_data.get("summary") or summarize_files(files)
     print("\nTracks summary:")
     for row in summary:
         print(f"  {row.get('line')}")
-    saved_plans = run_gui_plan_save([gui_path for gui_path, _ in input_items])
+    saved_plans = run_gui_plan_save_from_data(gui_data)
     if not saved_plans:
         print("No plans saved.")
         return 0

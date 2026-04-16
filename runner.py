@@ -15,6 +15,7 @@ from utils.pipeline_runtime import AUTOBOOST_DIR, ROOT_DIR, UTILS_DIR, ensure_di
 from utils.plan_model import BatchPlan, FilePlan, ResolvedFilePlan, RunnerEvent, load_plan, resolve_file_plan
 
 FAST_INTERRUPT = False
+WRAPPER_VPY = ROOT_DIR / "wrapper.vpy"
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,30 @@ def resolve_optional_path(raw_value: str, plan_path: Path) -> str:
     if not path.is_absolute():
         path = (plan_path.parent / path).resolve()
     return str(path)
+
+
+def bool_arg(value: bool) -> str:
+    return "1" if bool(value) else "0"
+
+
+def build_wrapper_vspipe_args(
+    item: "QueueItem",
+    *,
+    user_vpy: str,
+    pass_name: str,
+) -> List[str]:
+    plan = item.resolved.plan
+    experimental = plan.video.experimental
+    return [
+        f"src={item.source}",
+        f"vpy={user_vpy or ''}",
+        f"rules={item.resolved.paths.crop_resize_file}",
+        f"pass_name={pass_name}",
+        f"source_loader={experimental.source_loader or 'ffms2'}",
+        f"crop_enabled={bool_arg(experimental.crop_resize_enabled)}",
+        f"plan_path={item.plan_path}",
+        f"workdir={item.workdir}",
+    ]
 
 
 def build_queue(plan_args: List[str], cli_mode: str) -> List[QueueItem]:
@@ -269,6 +294,9 @@ class SessionController:
         ensure_dir(paths.zone_file.parent)
         if not paths.zone_file.exists():
             paths.zone_file.write_text("", encoding="utf-8", newline="\n")
+        ensure_dir(paths.crop_resize_file.parent)
+        if not paths.crop_resize_file.exists():
+            paths.crop_resize_file.write_text("", encoding="utf-8", newline="\n")
 
         commands: List[tuple[str, List[str]]] = [
             (
@@ -304,6 +332,20 @@ class SessionController:
             fast_vpy = resolve_optional_path(details.fast_vpy, paths.plan_path)
             main_vpy = resolve_optional_path(details.main_vpy, paths.plan_path)
             proxy_vpy = resolve_optional_path(details.proxy_vpy, paths.plan_path)
+            experimental = plan.video.experimental
+            use_wrapper = bool(experimental.vpy_wrapper or experimental.crop_resize_enabled)
+            fastpass_input_vpy = str(WRAPPER_VPY) if use_wrapper else fast_vpy
+            mainpass_input_vpy = str(WRAPPER_VPY) if use_wrapper else main_vpy
+            fastpass_vspipe_args = (
+                build_wrapper_vspipe_args(item, user_vpy=fast_vpy, pass_name="fast")
+                if use_wrapper
+                else ([f"src={paths.source}"] if fast_vpy or proxy_vpy else [])
+            )
+            mainpass_vspipe_args = (
+                build_wrapper_vspipe_args(item, user_vpy=main_vpy, pass_name="main")
+                if use_wrapper
+                else ([f"src={paths.source}"] if main_vpy or proxy_vpy else [])
+            )
             auto_boost_cmd = [
                 self.toolchain.vs_python_exe,
                 str(AUTOBOOST_DIR / "auto_boost.py"),
@@ -348,8 +390,10 @@ class SessionController:
                 auto_boost_cmd.append("--no-fastpass")
             if primary.fastpass_hdr:
                 auto_boost_cmd.append("--fastpass-hdr")
-            if fast_vpy:
-                auto_boost_cmd.extend(["--fastpass-vpy", fast_vpy])
+            if fastpass_input_vpy:
+                auto_boost_cmd.extend(["--fastpass-vpy", fastpass_input_vpy])
+            for arg in fastpass_vspipe_args:
+                auto_boost_cmd.extend(["--fastpass-vspipe-arg", arg])
             if proxy_vpy:
                 auto_boost_cmd.extend(["--fastpass-proxy", proxy_vpy])
             if primary.fastpass_preset:
@@ -416,7 +460,7 @@ class SessionController:
                     )
                 )
 
-                main_input = main_vpy or str(paths.source)
+                main_input = mainpass_input_vpy or str(paths.source)
                 mainpass_cmd = [
                     self.toolchain.av1an_exe,
                     "-i",
@@ -457,8 +501,9 @@ class SessionController:
                         mainpass_cmd.append("--fast-interrupt")
                 if proxy_vpy:
                     mainpass_cmd.extend(["--proxy", proxy_vpy])
-                if main_vpy or proxy_vpy:
-                    mainpass_cmd.extend(["--vspipe-args", f"src={paths.source}"])
+                if mainpass_vspipe_args:
+                    mainpass_cmd.append("--vspipe-args")
+                    mainpass_cmd.extend(mainpass_vspipe_args)
                 if details.mainpass_filter:
                     mainpass_cmd.extend(["-f", f"-vf {details.mainpass_filter}"])
                 commands.append(("mainpass", mainpass_cmd))
@@ -500,6 +545,7 @@ class SessionController:
                 plan_path,
                 "--log",
                 str(log_dir / "09_mux.log"),
+                "--no-source-bitrate"
             ]
             if self.no_source_bitrate:
                 mux_cmd.append("--no-source-bitrate")

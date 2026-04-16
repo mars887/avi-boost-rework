@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import os
 
@@ -56,6 +56,23 @@ from ab_state import (
     marker_paths,
 )
 
+
+def vspipe_args_to_dict(items: List[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for item in items or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if "=" not in text:
+            out[text] = ""
+            continue
+        key, value = text.split("=", 1)
+        key = key.strip()
+        if key:
+            out[key] = value
+    return out
+
+
 def main() -> int:
     """CLI entry point that orchestrates stages and resume logic."""
     parser = argparse.ArgumentParser(description="auto-boost 2.8.json + av1an fastpass + per-scene CRF zones + resume.")
@@ -94,6 +111,8 @@ def main() -> int:
                         help="Optional .vpy path for fast-pass input (used for av1an -i). Adds --vspipe-args src=<input>.")
     parser.add_argument("--fastpass-proxy", default=None,
                         help="Optional av1an --proxy path for fast-pass. Adds --proxy and --vspipe-args src=<input>.")
+    parser.add_argument("--fastpass-vspipe-arg", action="append", default=[],
+                        help="Extra key=value argument forwarded to av1an --vspipe-args for --fastpass-vpy.")
     parser.add_argument("--av1an", default="av1an",
                         help="Path to av1an executable for fork-aware fast-pass invocation.")
     parser.add_argument("--encoder", default="svt-av1",
@@ -173,7 +192,7 @@ def main() -> int:
     parser.add_argument("--neg-dev-multiplier", type=float, default=None,
                         help="Multiplier used when adj is negative (requires --pos-dev-multiplier if set).")
     parser.add_argument("--avg-func", default="",
-                        help="Adjust metric avg: +N/-N (shift), !N (set), or target%percent (move toward target by percent).")
+                        help="Adjust metric avg: +N/-N (shift), !N (set), or target%%percent (move toward target by percent).")
 
     args = parser.parse_args()
     args.encoder = normalize_encoder(args.encoder)
@@ -206,6 +225,10 @@ def main() -> int:
     fastpass_out = Path(args.fastpass_out).expanduser().resolve() if args.fastpass_out else (fastpass_dir / f"{input_file.stem}.fastpass.mkv")
     fastpass_vpy = Path(args.fastpass_vpy).expanduser().resolve() if args.fastpass_vpy else None
     fastpass_proxy = Path(args.fastpass_proxy).expanduser().resolve() if args.fastpass_proxy else None
+    fastpass_vspipe_args = [str(item) for item in (args.fastpass_vspipe_arg or []) if str(item).strip()]
+    fastpass_vpy_args = vspipe_args_to_dict(fastpass_vspipe_args)
+    if fastpass_vpy is not None and "src" not in fastpass_vpy_args:
+        fastpass_vpy_args["src"] = str(input_file)
     hdr_patch_script = Path(args.hdr_patch_script).expanduser().resolve()
     if args.fastpass_hdr:
         ensure_exists(hdr_patch_script, "HDR patch script")
@@ -213,6 +236,7 @@ def main() -> int:
     # Metrics reference: if fast-pass input is a .vpy (may crop/scale), compare against that pipeline, not the original source.
     metrics_ref_src = fastpass_vpy if fastpass_vpy is not None else input_file
     metrics_ref_vpy_src = input_file if fastpass_vpy is not None else None
+    metrics_ref_vpy_args = fastpass_vpy_args if fastpass_vpy is not None else None
 
     ssimu2_log = fastpass_dir / f"{input_file.stem}_ssimu2.log"
 
@@ -347,6 +371,7 @@ def main() -> int:
                         chunk_order=str(args.chunk_order or ""),
                         encoder_path=str(args.encoder_path or ""),
                         fast_interrupt=bool(args.fast_interrupt),
+                        vspipe_args=fastpass_vspipe_args,
                     )
                     touch(marks["fastpass"])
             else:
@@ -386,6 +411,7 @@ def main() -> int:
                         chunk_order=str(args.chunk_order or ""),
                         encoder_path=str(args.encoder_path or ""),
                         fast_interrupt=bool(args.fast_interrupt),
+                        vspipe_args=fastpass_vspipe_args,
                     )
                     touch(marks["fastpass"])
 
@@ -431,6 +457,7 @@ def main() -> int:
                     backend=str(args.ssimu2_backend),
                     vs_source=str(args.vs_source),
                     vpy_src=metrics_ref_vpy_src,
+                    vpy_args=metrics_ref_vpy_args,
                 )
                 touch(marks["ssimu2"])
 

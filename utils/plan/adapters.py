@@ -9,18 +9,21 @@ from utils.plan.types import (
     DEFAULT_QUALITY,
     DEFAULT_SCENE_DETECTION,
     DEFAULT_CHUNK_ORDER,
+    DEFAULT_SOURCE_LOADER,
     AudioPlan,
     FilePlan,
     PlanMeta,
     PlanPaths,
     SubPlan,
     VideoDetails,
+    VideoExperimental,
     VideoPlan,
     VideoPrimary,
     coerce_scalar,
     format_value,
     normalize_encoder,
     normalize_chunk_order,
+    normalize_source_loader,
     normalize_track_type,
     params_map_to_tokens,
     parse_bool_value,
@@ -32,6 +35,7 @@ def gui_defaults_from_file_plan(plan: FilePlan) -> Dict[str, Any]:
     video = plan.video
     primary = video.primary
     details = video.details
+    experimental = video.experimental
     fastpass_tokens = params_map_to_tokens(video.fastpass_params)
     mainpass_tokens = params_map_to_tokens(video.mainpass_params)
     fastpass_tokens.extend(["--crf", format_value(primary.quality)])
@@ -68,6 +72,9 @@ def gui_defaults_from_file_plan(plan: FilePlan) -> Dict[str, Any]:
         "main_vpy": details.main_vpy,
         "fast_vpy": details.fast_vpy,
         "proxy_vpy": details.proxy_vpy,
+        "vpy_wrapper": experimental.vpy_wrapper,
+        "source_loader": experimental.source_loader,
+        "crop_resize_enabled": experimental.crop_resize_enabled,
         "note": details.note,
     }
 
@@ -183,6 +190,11 @@ def file_plan_from_gui_result(
         proxy_vpy=str(defaults.get("proxy_vpy") or ""),
         note=str(defaults.get("note") or ""),
     )
+    video_experimental = VideoExperimental(
+        vpy_wrapper=parse_bool_value(defaults.get("vpy_wrapper"), False),
+        source_loader=normalize_source_loader(defaults.get("source_loader") or DEFAULT_SOURCE_LOADER),
+        crop_resize_enabled=parse_bool_value(defaults.get("crop_resize_enabled"), False),
+    )
 
     video_config = dict(video_result.get("videoConfig") or {})
     quality, fastpass_preset, preset, fastpass_params, mainpass_params = _parse_video_config(
@@ -200,6 +212,7 @@ def file_plan_from_gui_result(
         action=str(video_result.get("trackStatus") or "EDIT").lower(),
         primary=video_primary,
         details=video_details,
+        experimental=video_experimental,
         fastpass_params=fastpass_params,
         mainpass_params=mainpass_params,
     )
