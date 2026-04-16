@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -16,7 +17,15 @@ from typing import Any, Deque, Dict, List, Optional
 
 from utils.discord_config import discord_config_value
 from utils.discord_bridge import DiscordBridge
-from utils.pipeline_runtime import AUTOBOOST_DIR, ROOT_DIR, UTILS_DIR, ensure_dir, is_mars_av1an_fork, load_toolchain
+from utils.pipeline_runtime import (
+    AUTOBOOST_DIR,
+    ROOT_DIR,
+    UTILS_DIR,
+    ensure_dir,
+    is_mars_av1an_fork,
+    load_toolchain,
+    read_command_output,
+)
 from utils.plan_model import BatchPlan, FilePlan, ResolvedFilePlan, RunnerEvent, load_plan, resolve_file_plan
 
 FAST_INTERRUPT = False
@@ -36,7 +45,19 @@ STAGE_AUDIO = "Audio Tool"
 STAGE_VERIFY = "Verify"
 STAGE_MUX = "Mux"
 CACHED_STAGE_MESSAGE = "cached"
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 PERCENT_RE = re.compile(r"(?<!\d)(100(?:\.0+)?|[0-9]{1,2}(?:\.[0-9]+)?)\s*%")
+AV1AN_PROGRESS_RE = re.compile(
+    r"(?P<percent>100(?:\.0+)?|[0-9]{1,2}(?:\.[0-9]+)?)\s*%\s+"
+    r"(?P<pos>\d+)\s*/\s*(?P<total>\d+)\s*"
+    r"\(\s*(?:(?P<fps>[0-9]+(?:\.[0-9]+)?)\s*fps|(?P<spf>[0-9]+(?:\.[0-9]+)?)\s*s/fr|0\s*fps)"
+    r"\s*,\s*eta\s+(?P<eta>[^,\)]+)"
+    r"(?:,\s*(?P<kbps>[0-9]+(?:\.[0-9]+)?)\s*Kbps)?",
+    re.IGNORECASE,
+)
+AV1AN_CHUNK_RE = re.compile(r"\[(?P<done>\d+)\s*/\s*(?P<total>\d+)\s+Chunks\]", re.IGNORECASE)
+_DURATION_CACHE: Dict[str, float] = {}
+_AV1AN_PROGRESS_JSONL_SUPPORT: Dict[str, bool] = {}
 
 CHILD_EVENT_ENV = "PBBATCH_RUNNER_CHILD_EVENTS_JSONL"
 SESSION_ID_ENV = "PBBATCH_RUNNER_SESSION_ID"
@@ -51,6 +72,7 @@ class StageState:
     ended_at: float = 0.0
     message: str = ""
     progress: Optional[float] = None
+    details: Dict[str, Any] = field(default_factory=dict)
 
     def snapshot(self) -> Dict[str, Any]:
         elapsed = 0.0
@@ -61,6 +83,7 @@ class StageState:
             "status": self.status,
             "message": self.message,
             "progress": self.progress,
+            "details": dict(self.details),
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "elapsed_seconds": round(elapsed, 3),
@@ -87,6 +110,8 @@ class ActivePlanState:
 
     def snapshot(self) -> Dict[str, Any]:
         source_size = self.item.source.stat().st_size if self.item.source.exists() else 0
+        output_path = self.item.source.parent / f"{self.item.source.stem}-av1.mkv"
+        output_size = output_path.stat().st_size if output_path.exists() else 0
         elapsed = 0.0
         if self.started_at:
             elapsed = (self.ended_at or time.time()) - self.started_at
@@ -99,6 +124,9 @@ class ActivePlanState:
             "plan": str(self.item.plan_path),
             "source": str(self.item.source),
             "source_size": source_size,
+            "duration_seconds": probe_source_duration(self.item.source),
+            "output": str(output_path),
+            "output_size": output_size,
             "workdir": str(self.item.workdir),
             "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -129,6 +157,7 @@ class FinishedPlanState:
             "plan": str(self.item.plan_path),
             "source": str(self.item.source),
             "source_size": source_size,
+            "duration_seconds": probe_source_duration(self.item.source),
             "output": str(output_path),
             "output_size": output_size,
             "workdir": str(self.item.workdir),
@@ -244,6 +273,52 @@ def bool_arg(value: bool) -> str:
     return "1" if bool(value) else "0"
 
 
+def probe_source_duration(source: Path) -> float:
+    key = str(source.resolve()).lower()
+    if key in _DURATION_CACHE:
+        return _DURATION_CACHE[key]
+    duration = 0.0
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe and source.exists():
+        cmd = [
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(source),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode == 0:
+                duration = max(0.0, float(str(proc.stdout or "0").strip() or "0"))
+        except Exception:
+            duration = 0.0
+    _DURATION_CACHE[key] = duration
+    return duration
+
+
+def av1an_supports_progress_jsonl(av1an_exe: str) -> bool:
+    key = str(av1an_exe or "").strip().lower()
+    if key in _AV1AN_PROGRESS_JSONL_SUPPORT:
+        return _AV1AN_PROGRESS_JSONL_SUPPORT[key]
+    help_text = read_command_output([str(av1an_exe or "av1an"), "--help"], timeout=5.0)
+    supported = "--progress-jsonl" in help_text
+    _AV1AN_PROGRESS_JSONL_SUPPORT[key] = supported
+    return supported
+
+
 def item_short_snapshot(item: QueueItem) -> Dict[str, Any]:
     source_size = item.source.stat().st_size if item.source.exists() else 0
     return {
@@ -252,6 +327,7 @@ def item_short_snapshot(item: QueueItem) -> Dict[str, Any]:
         "plan": str(item.plan_path),
         "source": str(item.source),
         "source_size": source_size,
+        "duration_seconds": probe_source_duration(item.source),
         "workdir": str(item.workdir),
     }
 
@@ -288,7 +364,7 @@ def stage_resume_marker_exists(item: QueueItem, stage: str) -> bool:
     if stage == STAGE_ATTACHMENTS:
         return (state_dir / "ATTACHMENTS_CLEAN_DONE").exists()
     if stage == STAGE_AUTOBOOST_PSD_SCENE:
-        return (video_state_dir / "PSD_FINISHED").exists()
+        return (video_state_dir / "PSD_FINISHED").exists() or (video_state_dir / "FASTPASS_COMPLETED").exists()
     if stage == STAGE_AUTOBOOST_SCENE:
         return (video_state_dir / "FASTPASS_COMPLETED").exists()
     if stage == STAGE_FASTPASS:
@@ -296,9 +372,11 @@ def stage_resume_marker_exists(item: QueueItem, stage: str) -> bool:
     if stage == STAGE_SSIMU2:
         return (video_state_dir / "SSIMU2_COMPLETED").exists()
     if stage == STAGE_HDR_PATCH:
-        return (video_state_dir / "HDR_PATCH_DONE").exists()
+        return (state_dir / "HDR_PATCH_DONE").exists()
     if stage == STAGE_ZONE_EDIT:
-        return (video_state_dir / "ZONE_EDIT_DONE").exists()
+        return (state_dir / "ZONE_EDIT_DONE").exists()
+    if stage == STAGE_MAINPASS:
+        return (workdir / "video" / "video-final.mkv").exists()
     if stage == STAGE_AUDIO:
         return (state_dir / "AUDIO_DONE").exists()
     if stage == STAGE_VERIFY:
@@ -306,6 +384,20 @@ def stage_resume_marker_exists(item: QueueItem, stage: str) -> bool:
     if stage == STAGE_MUX:
         return (state_dir / "MUX_DONE").exists()
     return False
+
+
+def stage_is_composite_autoboost(stage: str) -> bool:
+    return stage in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE)
+
+
+def initial_stage_states(item: QueueItem) -> List[StageState]:
+    states: List[StageState] = []
+    for name in display_stage_plan(item):
+        if stage_resume_marker_exists(item, name):
+            states.append(StageState(name=name, status="completed", message=CACHED_STAGE_MESSAGE))
+        else:
+            states.append(StageState(name=name))
+    return states
 
 
 def build_wrapper_vspipe_args(
@@ -369,6 +461,7 @@ class SessionController:
         self.session_id = session_id or uuid.uuid4().hex
         self.toolchain = load_toolchain()
         self.av1an_fork_enabled = is_mars_av1an_fork(self.toolchain.av1an_exe)
+        self.av1an_progress_jsonl_enabled = av1an_supports_progress_jsonl(self.toolchain.av1an_exe)
         self.queue: Deque[QueueItem] = deque(items)
         self.failed: List[QueueItem] = []
         self.completed: List[QueueItem] = []
@@ -584,6 +677,26 @@ class SessionController:
                 return state
         return None
 
+    @staticmethod
+    def _reset_cached_following_stages(active: ActivePlanState, stage: str) -> None:
+        try:
+            stage_names = display_stage_plan(active.item)
+            index = stage_names.index(stage)
+        except ValueError:
+            return
+        following = set(stage_names[index + 1 :])
+        for state in active.stages:
+            if state.name not in following:
+                continue
+            if state.status in ("pending", "started"):
+                continue
+            state.status = "pending"
+            state.started_at = 0.0
+            state.ended_at = 0.0
+            state.message = ""
+            state.progress = None
+            state.details.clear()
+
     def _update_active_event(
         self,
         item: QueueItem,
@@ -617,10 +730,21 @@ class SessionController:
                         parent_state = next((item for item in active.stages if item.name == parent_name), None)
                         if parent_state is None or parent_state.status not in ("pending", "started"):
                             continue
-                        parent_state.status = "completed"
-                        parent_state.message = CACHED_STAGE_MESSAGE
-                        parent_state.started_at = 0.0
-                        parent_state.ended_at = 0.0
+                        parent_elapsed = (timestamp - parent_state.started_at) if parent_state.started_at else 0.0
+                        parent_cached = (
+                            is_cached_stage_message(parent_state.message)
+                            or is_cached_stage_message(message)
+                            or parent_state.status == "pending"
+                            or parent_elapsed < 1.0
+                        )
+                        if not parent_cached:
+                            parent_state.status = "completed"
+                            parent_state.ended_at = timestamp
+                        else:
+                            parent_state.status = "completed"
+                            parent_state.message = CACHED_STAGE_MESSAGE
+                            parent_state.started_at = 0.0
+                            parent_state.ended_at = 0.0
                 if (
                     stage in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE)
                     and status == "completed"
@@ -636,25 +760,23 @@ class SessionController:
                     if started_at:
                         elapsed = (ended_at or timestamp) - started_at
                     return active.plan_run_id, started_at, ended_at, elapsed
+                previous_status = stage_state.status
                 stage_state.status = status
                 stage_state.message = message
-                if status == "started" and not stage_state.started_at:
-                    stage_state.started_at = timestamp
-                    stage_state.ended_at = 0.0
+                if status == "started":
+                    if previous_status != "started" or not stage_state.started_at:
+                        stage_state.started_at = timestamp
+                        stage_state.ended_at = 0.0
+                        stage_state.progress = None
+                        stage_state.details.clear()
+                    if not is_cached_stage_message(message):
+                        self._reset_cached_following_stages(active, stage)
                 if status in ("completed", "failed", "skipped"):
                     if is_cached_stage_message(message):
                         stage_state.started_at = 0.0
                         stage_state.ended_at = 0.0
                     else:
                         stage_state.ended_at = timestamp
-                    if status == "completed" and stage in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE):
-                        for child_name in (STAGE_FASTPASS, STAGE_SSIMU2):
-                            for child_state in active.stages:
-                                if child_state.name != child_name or child_state.status != "pending":
-                                    continue
-                                child_state.status = "completed"
-                                child_state.started_at = stage_state.started_at
-                                child_state.ended_at = timestamp
                 if progress is not None and progress >= 0:
                     stage_state.progress = progress
                 started_at = stage_state.started_at
@@ -779,23 +901,117 @@ class SessionController:
         except Exception:
             return offset
 
-    def _last_percent_from_log(self, path: Path) -> Optional[float]:
+    @staticmethod
+    def _parse_av1an_progress_text(text: str) -> Dict[str, Any]:
+        clean = ANSI_RE.sub("", str(text or "")).replace("\r", "\n")
+        result: Dict[str, Any] = {}
+        matches = list(AV1AN_PROGRESS_RE.finditer(clean))
+        if matches:
+            match = matches[-1]
+            try:
+                result["progress"] = max(0.0, min(100.0, float(match.group("percent"))))
+            except Exception:
+                pass
+            try:
+                result["pos"] = int(match.group("pos"))
+                result["total"] = int(match.group("total"))
+            except Exception:
+                pass
+            try:
+                if match.group("fps") is not None:
+                    result["fps"] = float(match.group("fps"))
+                elif match.group("spf") is not None:
+                    result["spf"] = float(match.group("spf"))
+            except Exception:
+                pass
+            try:
+                if match.group("kbps") is not None:
+                    result["kbps"] = float(match.group("kbps"))
+            except Exception:
+                pass
+            eta = str(match.group("eta") or "").strip()
+            if eta:
+                result["eta"] = eta
+            chunk_matches = list(AV1AN_CHUNK_RE.finditer(clean[: match.start()]))
+            if chunk_matches:
+                chunk_match = chunk_matches[-1]
+                try:
+                    result["chunks_done"] = int(chunk_match.group("done"))
+                    result["chunks_total"] = int(chunk_match.group("total"))
+                except Exception:
+                    pass
+            return result
+
+        percent_matches = PERCENT_RE.findall(clean)
+        if percent_matches:
+            try:
+                result["progress"] = max(0.0, min(100.0, float(percent_matches[-1])))
+            except Exception:
+                pass
+        return result
+
+    def _last_av1an_progress_from_log(self, path: Path) -> Dict[str, Any]:
         if not path.exists() or not path.is_file():
-            return None
+            return {}
         try:
             with path.open("rb") as fh:
                 size = fh.seek(0, os.SEEK_END)
                 fh.seek(max(0, size - 128 * 1024))
                 text = fh.read().decode("utf-8", errors="replace")
         except Exception:
-            return None
-        matches = PERCENT_RE.findall(text)
-        if not matches:
-            return None
+            return {}
+        return self._parse_av1an_progress_text(text)
+
+    def _last_av1an_progress_from_jsonl(self, path: Path) -> Dict[str, Any]:
+        if not path.exists() or not path.is_file():
+            return {}
         try:
-            return max(0.0, min(100.0, float(matches[-1])))
+            with path.open("rb") as fh:
+                size = fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, size - 128 * 1024))
+                text = fh.read().decode("utf-8", errors="replace")
         except Exception:
-            return None
+            return {}
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            result: Dict[str, Any] = {}
+            for source_key, target_key in (
+                ("progress", "progress"),
+                ("percent", "progress"),
+                ("fps", "fps"),
+                ("spf", "spf"),
+                ("kbps", "kbps"),
+                ("pos", "pos"),
+                ("frame", "pos"),
+                ("total", "total"),
+                ("total_frames", "total"),
+                ("chunks_done", "chunks_done"),
+                ("chunks_total", "chunks_total"),
+                ("eta", "eta"),
+            ):
+                if source_key in payload and payload[source_key] not in (None, ""):
+                    result[target_key] = payload[source_key]
+            try:
+                if "progress" in result:
+                    result["progress"] = max(0.0, min(100.0, float(result["progress"])))
+                if "fps" in result:
+                    result["fps"] = float(result["fps"])
+                if "spf" in result:
+                    result["spf"] = float(result["spf"])
+                if "kbps" in result:
+                    result["kbps"] = float(result["kbps"])
+            except Exception:
+                pass
+            return result
+        return {}
 
     def _refresh_running_stage_progress(self, item: QueueItem) -> None:
         log_dir = item.workdir / "00_logs"
@@ -803,18 +1019,24 @@ class SessionController:
             STAGE_FASTPASS: log_dir / "03.1_fastpass.log",
             STAGE_MAINPASS: log_dir / "06_av1an_mainpass.log",
         }
+        progress_jsonl_sources = {
+            STAGE_FASTPASS: log_dir / "03.1_fastpass.progress.jsonl",
+            STAGE_MAINPASS: log_dir / "06_av1an_mainpass.progress.jsonl",
+        }
         with self.lock:
             active = self._active_state_for_item(item)
             if active is None:
                 return
             running = [stage.name for stage in active.stages if stage.status == "started"]
-        updates: Dict[str, float] = {}
+        updates: Dict[str, Dict[str, Any]] = {}
         for stage_name in running:
             log_path = progress_sources.get(stage_name)
             if log_path is None:
                 continue
-            progress = self._last_percent_from_log(log_path)
-            if progress is not None:
+            progress = self._last_av1an_progress_from_jsonl(progress_jsonl_sources.get(stage_name, Path()))
+            if not progress:
+                progress = self._last_av1an_progress_from_log(log_path)
+            if progress:
                 updates[stage_name] = progress
         if not updates:
             return
@@ -824,7 +1046,10 @@ class SessionController:
                 return
             for stage in active.stages:
                 if stage.name in updates and stage.status == "started":
-                    stage.progress = updates[stage.name]
+                    stage_update = updates[stage.name]
+                    if "progress" in stage_update:
+                        stage.progress = stage_update["progress"]
+                    stage.details.update({key: value for key, value in stage_update.items() if key != "progress"})
 
     def _run_stage(self, item: QueueItem, stage: str, cmd: List[str]) -> None:
         cached_before = stage_resume_marker_exists(item, stage)
@@ -833,6 +1058,9 @@ class SessionController:
             self.current_stage = stage
             active = self._active_state_for_item(item)
             plan_run_id = active.plan_run_id if active is not None else self.current_plan_run_id
+        if cached_before and not stage_is_composite_autoboost(stage):
+            self._emit(item, stage, "completed", stage_message)
+            return
         self._emit(item, stage, "started", stage_message)
         print("[cmd]", subprocess.list2cmdline(cmd), flush=True)
         child_events = self.events_jsonl or (item.workdir / "00_meta" / "runner_events.jsonl")
@@ -970,6 +1198,8 @@ class SessionController:
                 "--keep",
                 "--verbose",
             ]
+            if self.av1an_progress_jsonl_enabled:
+                auto_boost_cmd.extend(["--av1an-progress-jsonl", str(log_dir / "03.1_fastpass.progress.jsonl")])
             if self.av1an_fork_enabled:
                 auto_boost_cmd.extend(["--chunk-order", str(primary.chunk_order or "")])
                 if str(primary.encoder_path or "").strip():
@@ -1084,6 +1314,8 @@ class SessionController:
                     "--no-defaults",
                     "-a=-an -sn",
                 ]
+                if self.av1an_progress_jsonl_enabled:
+                    mainpass_cmd.extend(["--progress-jsonl", str(log_dir / "06_av1an_mainpass.progress.jsonl")])
                 if self.av1an_fork_enabled:
                     if str(primary.chunk_order or "").strip():
                         mainpass_cmd.extend(["--chunk-order", str(primary.chunk_order)])
@@ -1182,7 +1414,7 @@ class SessionController:
                         item=item,
                         status="queued",
                         started_at=time.time(),
-                        stages=[StageState(name=name) for name in display_stage_plan(item)],
+                        stages=initial_stage_states(item),
                     )
                     self.active[plan_run_id] = active_state
                     self.current_plan_run_id = plan_run_id
@@ -1276,7 +1508,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-interactive", action="store_true")
     parser.add_argument("--exit-when-idle", action="store_true")
     parser.add_argument("--session-id", default="")
-    parser.add_argument("--discord", action="store_true", help="Register this runner in the local Discord bot service.")
+    parser.add_argument("--no-discord", action="store_false", help="Register this runner in the local Discord bot service.")
     parser.add_argument(
         "--discord-service-url",
         default=discord_config_value("PBBATCH_DISCORD_SERVICE_URL", "http://127.0.0.1:8794"),
@@ -1289,7 +1521,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[runner] no plans resolved", file=sys.stderr)
         return 1
     source_dirs = sorted({str(item.source.parent.resolve()) for item in queue}, key=str.lower)
-    if args.discord and len(source_dirs) != 1:
+    if args.no_discord and len(source_dirs) != 1:
         print("[runner] --discord requires all plans to belong to one source folder", file=sys.stderr)
         for source_dir in source_dirs:
             print(f"  {source_dir}", file=sys.stderr)
@@ -1309,13 +1541,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     bridge = DiscordBridge(
         service_url=args.discord_service_url,
         session_id=controller.session_id,
-        enabled=args.discord,
+        enabled=args.no_discord,
     )
     bridge.attach(snapshot_provider=controller.snapshot, command_handler=controller.handle_command)
     bridge.set_error_callback(lambda message: print(f"[discord] bridge unavailable: {message}", flush=True))
     controller.add_event_sink(bridge.notify_event)
-    folder_lock = SourceDirLock(source_dir=controller.source_dir, session_id=controller.session_id, enabled=args.discord)
-    if args.discord:
+    folder_lock = SourceDirLock(source_dir=controller.source_dir, session_id=controller.session_id, enabled=args.no_discord)
+    if args.no_discord:
         print(f"[discord] enabled: session_id={controller.session_id}", flush=True)
         print(f"[discord] service_url={args.discord_service_url}", flush=True)
         print(f"[discord] source_dir={controller.source_dir}", flush=True)
@@ -1326,16 +1558,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     except RuntimeError as exc:
         print(f"[runner] {exc}", file=sys.stderr)
         return 2
-    if args.discord:
+    if args.no_discord:
         print(f"[discord] folder lock acquired: {folder_lock.path}", flush=True)
+    controller.start()
     bridge.start()
-    if args.discord:
+    if args.no_discord:
         if bridge.connected:
             print("[discord] runner registered in bot service", flush=True)
         else:
             detail = f" ({bridge.last_error})" if bridge.last_error else ""
-            print(f"[discord] bot service not reachable yet{detail}; runner will keep working locally", flush=True)
-    controller.start()
+            print(f"[discord] bot service registration not confirmed{detail}; runner will keep working locally", flush=True)
 
     if args.no_interactive:
         try:
@@ -1344,7 +1576,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         finally:
             bridge.stop()
             folder_lock.release()
-            if args.discord:
+            if args.no_discord:
                 print("[discord] bridge stopped; folder lock released", flush=True)
 
     print_help()
@@ -1395,7 +1627,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     finally:
         bridge.stop()
         folder_lock.release()
-        if args.discord:
+        if args.no_discord:
             print("[discord] bridge stopped; folder lock released", flush=True)
 
 

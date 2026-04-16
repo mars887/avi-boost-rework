@@ -83,6 +83,7 @@ def run_fastpass_av1an(
     sc_only: bool,
     log_file: Optional[Path],
     log_level: Optional[str],
+    progress_jsonl: Optional[Path] = None,
     fastpass_hdr: bool = False,
     hdr_patch_script: Optional[Path] = None,
     chunk_order: str = "",
@@ -113,6 +114,8 @@ def run_fastpass_av1an(
         cmd.extend(["--log-level", str(log_level)])
     if log_file is not None:
         cmd.extend(["--log-file", str(log_file)])
+    if progress_jsonl is not None:
+        cmd.extend(["--progress-jsonl", str(progress_jsonl)])
     if fastpass_proxy is not None:
         cmd.extend(["--proxy", str(fastpass_proxy)])
     vspipe_arg_list = [str(item) for item in (vspipe_args or []) if str(item).strip()]

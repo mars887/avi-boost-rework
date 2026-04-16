@@ -174,6 +174,8 @@ def main() -> int:
                         help="av1an --log-file path. 'auto' => <project>/av1an.log, 'none' => disable.")
     parser.add_argument("--av1an-log-level", default="info",
                         help="av1an --log-level (e.g. info, debug, warn).")
+    parser.add_argument("--av1an-progress-jsonl", default="",
+                        help="Optional av1an --progress-jsonl sidecar path for machine-readable progress.")
     parser.add_argument("--chunk-order", default=None,
                         help="Fork-only av1an chunk order. Accepted but currently not applied to fast-pass.")
     parser.add_argument("--encoder-path", default="",
@@ -282,6 +284,9 @@ def main() -> int:
         av1an_log_file = Path(args.av1an_log_file).expanduser()
         if not av1an_log_file.is_absolute():
             av1an_log_file = project_dir / av1an_log_file
+    av1an_progress_jsonl = Path(str(args.av1an_progress_jsonl)).expanduser() if str(args.av1an_progress_jsonl).strip() else None
+    if av1an_progress_jsonl is not None and not av1an_progress_jsonl.is_absolute():
+        av1an_progress_jsonl = project_dir / av1an_progress_jsonl
 
     marks = marker_paths(project_dir)
 
@@ -410,6 +415,7 @@ def main() -> int:
                                 None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
                                 else str(args.av1an_log_level).strip()
                             ),
+                            progress_jsonl=av1an_progress_jsonl,
                             fastpass_hdr=bool(args.fastpass_hdr),
                             hdr_patch_script=hdr_patch_script,
                             chunk_order=str(args.chunk_order or ""),
@@ -461,6 +467,7 @@ def main() -> int:
                                 None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
                                 else str(args.av1an_log_level).strip()
                             ),
+                            progress_jsonl=av1an_progress_jsonl,
                             fastpass_hdr=bool(args.fastpass_hdr),
                             hdr_patch_script=hdr_patch_script,
                             chunk_order=str(args.chunk_order or ""),

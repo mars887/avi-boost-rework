@@ -29,6 +29,7 @@ class DiscordBridge:
         self.connected = False
         self.last_error = ""
         self.last_error_at = 0.0
+        self.ever_connected = False
         self.error_callback: Optional[Callable[[str], None]] = None
 
     def attach(self, *, snapshot_provider: SnapshotProvider, command_handler: CommandHandler) -> None:
@@ -41,8 +42,9 @@ class DiscordBridge:
     def start(self) -> None:
         if not self.enabled or self.snapshot_provider is None:
             return
-        result = self._post("/api/sessions/register", {"snapshot": self.snapshot_provider()})
+        result = self._post("/api/sessions/register", {"snapshot": self.snapshot_provider()}, timeout=10.0)
         self.connected = isinstance(result, dict) and str(result.get("status") or "").lower() == "ok"
+        self.ever_connected = self.ever_connected or self.connected
         self.sender.start()
         self.poller.start()
 
@@ -87,6 +89,7 @@ class DiscordBridge:
             result = self._post(str(item["path"]), dict(item["payload"]))
             if isinstance(result, dict) and str(result.get("status") or "").lower() == "ok":
                 self.connected = True
+                self.ever_connected = True
 
     def _poller_main(self) -> None:
         while not self.stop_event.wait(1.0):
@@ -96,6 +99,7 @@ class DiscordBridge:
             if not isinstance(commands, list):
                 continue
             self.connected = True
+            self.ever_connected = True
             for command in commands:
                 if not isinstance(command, dict):
                     continue
@@ -119,10 +123,10 @@ class DiscordBridge:
                     },
                 )
 
-    def _get(self, path: str) -> Any:
+    def _get(self, path: str, *, timeout: float = 2.0) -> Any:
         url = self.service_url + path
         try:
-            with urllib.request.urlopen(url, timeout=2.0) as response:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             self._record_error(exc)
@@ -134,7 +138,7 @@ class DiscordBridge:
         except Exception:
             return None
 
-    def _post(self, path: str, payload: Dict[str, Any]) -> Any:
+    def _post(self, path: str, payload: Dict[str, Any], *, timeout: float = 2.0) -> Any:
         url = self.service_url + path
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
@@ -144,7 +148,7 @@ class DiscordBridge:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=2.0) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             self._record_error(exc)
@@ -157,8 +161,12 @@ class DiscordBridge:
             return None
 
     def _record_error(self, exc: Exception) -> None:
-        self.connected = False
         message = str(exc)
+        if self.ever_connected and "timed out" in message.lower():
+            self.last_error = message
+            self.last_error_at = time.time()
+            return
+        self.connected = False
         if message == self.last_error and (time.time() - self.last_error_at) < 30.0:
             return
         self.last_error = message

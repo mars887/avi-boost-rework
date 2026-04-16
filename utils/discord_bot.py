@@ -46,6 +46,18 @@ COMMANDS = {
     "exit_when_idle": "Exit when idle",
 }
 
+DASHBOARD_MAJOR_INTERVAL_SECONDS = 5.0
+DASHBOARD_PROGRESS_INTERVAL_SECONDS = 20.0
+DONE_SQUARE = "\U0001F7E9"
+RUNNING_SQUARE = "\U0001F7E6"
+PENDING_SQUARE = "\u2B1B"
+FAILED_SQUARE = "\U0001F7E5"
+STAGE_DISPLAY_NAMES = {
+    "Attachments cleanup": "Fonts clean",
+    "Auto-Boost: Scene Detection": "Auto-Boost: SCD",
+    "Auto-Boost: PSD Scene Detection": "PSD Scene Detect",
+}
+
 
 @dataclass(frozen=True)
 class BotConfig:
@@ -142,12 +154,31 @@ class StateStore:
                 (source_dir, int(channel_id), json.dumps(snapshot, ensure_ascii=False), time.time(), session_id),
             )
         else:
+            previous = self.latest_session_for_source_dir(source_dir)
             self.db.execute(
                 """
-                insert into sessions(session_id, source_dir, channel_id, snapshot_json, updated_at)
-                values(?, ?, ?, ?, ?)
+                insert into sessions(
+                    session_id,
+                    source_dir,
+                    channel_id,
+                    snapshot_json,
+                    history_message_id,
+                    current_message_id,
+                    queue_message_id,
+                    updated_at
+                )
+                values(?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, source_dir, int(channel_id), json.dumps(snapshot, ensure_ascii=False), time.time()),
+                (
+                    session_id,
+                    source_dir,
+                    int(channel_id),
+                    json.dumps(snapshot, ensure_ascii=False),
+                    int(previous["history_message_id"] or 0) if previous else 0,
+                    int(previous["current_message_id"] or 0) if previous else 0,
+                    int(previous["queue_message_id"] or 0) if previous else 0,
+                    time.time(),
+                ),
             )
         self.db.commit()
 
@@ -270,6 +301,14 @@ def fmt_seconds(value: Any) -> str:
     return f"{seconds}s"
 
 
+def fmt_duration(value: Any) -> str:
+    try:
+        total = float(value)
+    except Exception:
+        total = 0.0
+    return fmt_seconds(total) if total > 0 else "-"
+
+
 def fmt_size(value: Any) -> str:
     try:
         size = float(value)
@@ -283,17 +322,40 @@ def fmt_size(value: Any) -> str:
     return f"{size:.1f} {units[idx]}" if idx else f"{int(size)} {units[idx]}"
 
 
-def status_icon(status: str) -> str:
-    normalized = str(status or "").lower()
-    if normalized == "completed":
-        return "OK"
-    if normalized == "skipped":
-        return "SKP"
-    if normalized == "started":
-        return "RUN"
-    if normalized == "failed":
-        return "ERR"
-    return "..."
+def fmt_size_pair(source_size: Any, output_size: Any) -> str:
+    try:
+        output = float(output_size)
+    except Exception:
+        output = 0.0
+    return f"{fmt_size(source_size)} -> {fmt_size(output)}" if output > 0 else f"{fmt_size(source_size)} -> -"
+
+
+def mode_label(value: Any) -> str:
+    return "FP ONLY" if str(value or "").strip().lower() == "fastpass" else "FULL"
+
+
+def display_filename(item: Dict[str, Any]) -> str:
+    source = str(item.get("source") or "")
+    if source:
+        return Path(source).name
+    plan = str(item.get("plan") or "")
+    if plan:
+        return Path(plan).name
+    return str(item.get("name") or "plan")
+
+
+def clip_field(value: Any, width: int) -> str:
+    text = str(value or "")
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def display_stage_name(stage: Dict[str, Any]) -> str:
+    name = str(stage.get("name") or "")
+    return STAGE_DISPLAY_NAMES.get(name, name)
 
 
 def is_cached_stage(stage: Dict[str, Any]) -> bool:
@@ -301,42 +363,75 @@ def is_cached_stage(stage: Dict[str, Any]) -> bool:
     return message in ("cached", "resume", "using_existing_base_scenes")
 
 
-def progress_bar(progress: Any, width: int = 24) -> str:
+def progress_bar(progress: Any, width: int = 23) -> str:
     try:
         value = float(progress)
     except Exception:
         value = -1.0
+    percent_text = " --.-%" if value < 0 else f"  {max(0.0, min(100.0, value)):.1f}%"
+    inner_width = max(4, int(width) - 2 - len(percent_text))
     if value < 0:
-        return "[" + ("-" * width) + "]"
+        return "[" + ("-" * inner_width) + "]" + percent_text
     value = max(0.0, min(100.0, value))
-    filled = int(round((value / 100.0) * width))
-    return "[" + ("#" * filled) + ("-" * (width - filled)) + f"] {value:.1f}%"
+    filled = int(round((value / 100.0) * inner_width))
+    return "[" + ("#" * filled) + ("-" * (inner_width - filled)) + "]" + percent_text
+
+
+def render_progress_line(stage: Dict[str, Any], width: int) -> str:
+    details = dict(stage.get("details") or {})
+    progress_parts = [progress_bar(stage.get("progress"), width=max(8, width))]
+    try:
+        progress_parts.append(f"{float(details.get('fps')):.2f} FPS")
+    except Exception:
+        try:
+            progress_parts.append(f"{float(details.get('spf')):.2f} s/fr")
+        except Exception:
+            pass
+    try:
+        progress_parts.append(f"{float(details.get('kbps')):.0f} Kbps")
+    except Exception:
+        pass
+    return " | ".join(progress_parts)
 
 
 def render_stage_table(stages: List[Dict[str, Any]]) -> str:
     if not stages:
         return ""
-    name_width = max(len(str(stage.get("name") or "")) for stage in stages)
-    name_width = max(10, min(name_width, 34))
+    name_width = max(10, min(max(len(display_stage_name(stage)) for stage in stages), 36))
     lines: List[str] = []
     for stage in stages:
-        name = truncate(str(stage.get("name") or ""), name_width)
+        name = clip_field(display_stage_name(stage), name_width)
         status = str(stage.get("status") or "pending").lower()
         cached = is_cached_stage(stage)
-        icon = "OK" if cached else status_icon(status)
+        icon = PENDING_SQUARE
+        if status == "failed":
+            icon = FAILED_SQUARE
+        elif cached or status in ("completed", "skipped"):
+            icon = DONE_SQUARE
+        elif status == "started":
+            icon = RUNNING_SQUARE
         detail = ""
         if cached:
             detail = "cached"
         elif status == "started":
-            detail = f"{fmt_seconds(stage.get('elapsed_seconds'))} {progress_bar(stage.get('progress'))}"
+            detail = fmt_seconds(stage.get("elapsed_seconds"))
         elif status == "completed":
             detail = fmt_seconds(stage.get("elapsed_seconds"))
         elif status == "skipped":
             detail = "skipped"
         elif status == "failed":
             detail = truncate(str(stage.get("message") or "failed"), 44)
-        lines.append(f"{icon:<3} {name:<{name_width}} {detail}".rstrip())
-    return "```text\n" + "\n".join(lines) + "\n```"
+        line = f"{icon} {name:<{name_width}}"
+        details = dict(stage.get("details") or {})
+        eta = str(details.get("eta") or "").strip()
+        if status == "started" and eta:
+            detail = f"{detail} | eta {eta}" if detail else f"eta {eta}"
+        if detail:
+            line += f" | {detail}"
+        lines.append(line.rstrip())
+        if status == "started" and stage.get("progress") is not None:
+            lines.append(render_progress_line(stage, name_width + 4))
+    return "\n".join(lines)
 
 
 def snapshot_from_row(row: sqlite3.Row) -> Dict[str, Any]:
@@ -346,22 +441,56 @@ def snapshot_from_row(row: sqlite3.Row) -> Dict[str, Any]:
         return {}
 
 
-def render_history_embed(snapshot: Dict[str, Any]) -> Any:
-    embed = discord.Embed(title="History", color=0x2B2D31)
-    completed = list(snapshot.get("completed") or [])[-12:]
-    failed = list(snapshot.get("failed") or [])[-8:]
+def render_plan_detail(plan: Dict[str, Any]) -> str:
+    header = (
+        f"{mode_label(plan.get('mode'))} | "
+        f"{fmt_duration(plan.get('duration_seconds'))} | "
+        f"{fmt_size_pair(plan.get('source_size'), plan.get('output_size'))}"
+    )
+    elapsed = f"Elapsed: {fmt_seconds(plan.get('elapsed_seconds'))}"
+    table = render_stage_table(list(plan.get("stages") or [])) or "-"
+    return f"{header}\n\n{elapsed}\n```text\n{table}\n```"
+
+
+def render_overview_embed(snapshot: Dict[str, Any]) -> Any:
+    embed = discord.Embed(title="Plans", color=0x2B2D31)
     lines: List[str] = []
-    for index, item in enumerate(completed, start=1):
-        lines.append(
-            f"✅ {index} | {Path(str(item.get('plan') or '')).name} | {fmt_seconds(item.get('elapsed_seconds'))} | "
-            f"{fmt_size(item.get('source_size'))} -> {fmt_size(item.get('output_size'))}"
+
+    def row(icon: str, item: Dict[str, Any], *fields: str) -> None:
+        suffix = " | ".join(fields)
+        lines.append(display_filename(item))
+        lines.append(f"{icon} | {suffix}".rstrip())
+
+    for item in list(snapshot.get("completed") or [])[-8:]:
+        row(
+            DONE_SQUARE,
+            item,
+            f"{fmt_duration(item.get('duration_seconds')):<7}",
+            f"{fmt_size_pair(item.get('source_size'), item.get('output_size')):<20}",
+            fmt_seconds(item.get("elapsed_seconds")),
         )
-    for index, item in enumerate(failed, start=1):
-        lines.append(
-            f"❌ {index} | {Path(str(item.get('plan') or '')).name} | {item.get('stage') or '-'} | "
-            f"{truncate(str(item.get('message') or ''), 160)}"
+    for item in list(snapshot.get("failed") or [])[-6:]:
+        row(
+            FAILED_SQUARE,
+            item,
+            f"{fmt_duration(item.get('duration_seconds')):<7}",
+            clip_field(str(item.get("stage") or "-"), 22),
+            truncate(str(item.get("message") or "failed"), 80),
         )
-    embed.description = truncate("\n".join(lines) if lines else "No finished plans yet.", 4000)
+    for item in list(snapshot.get("active") or [])[:6]:
+        row(
+            RUNNING_SQUARE,
+            item,
+            fmt_duration(item.get("duration_seconds")),
+        )
+    queue_items = list(snapshot.get("queue") or [])
+    for item in queue_items[:20]:
+        row(PENDING_SQUARE, item, fmt_duration(item.get("duration_seconds")))
+    if len(queue_items) > 20:
+        lines.append(f"... and {len(queue_items) - 20} more queued")
+
+    body = "\n".join(lines) if lines else "No plans yet."
+    embed.description = "```text\n" + truncate(body, 3900) + "\n```"
     return embed
 
 
@@ -372,32 +501,67 @@ def render_current_embed(snapshot: Dict[str, Any]) -> Any:
         embed = discord.Embed(title="Current process", description=f"State: `{state}`", color=0x5865F2)
         return embed
 
-    title = "Active plans" if len(active) > 1 else str(active[0].get("name") or "Current plan")
+    title = "Active plans" if len(active) > 1 else display_filename(active[0])
     embed = discord.Embed(title=title, color=0x5865F2)
     for index, plan in enumerate(active[:6]):
-        header = f"mode `{plan.get('mode')}` | elapsed `{fmt_seconds(plan.get('elapsed_seconds'))}` | source `{fmt_size(plan.get('source_size'))}`"
-        table = render_stage_table(list(plan.get("stages") or []))
-        value = truncate(f"{header}\n{table}", 4000)
+        value = truncate(render_plan_detail(plan), 4000 if len(active) == 1 else 1000)
         if len(active) == 1:
             embed.description = value
         else:
-            embed.add_field(name=str(plan.get("name") or f"plan {index + 1}"), value=value, inline=False)
+            embed.add_field(name=display_filename(plan) or f"plan {index + 1}", value=value, inline=False)
     return embed
 
 
-def render_queue_embed(snapshot: Dict[str, Any]) -> Any:
-    embed = discord.Embed(title="Queue", color=0x2B2D31)
-    queue_items = list(snapshot.get("queue") or [])
-    if not queue_items:
-        embed.description = "Queue is empty."
-        return embed
-    lines = []
-    for index, item in enumerate(queue_items[:30], start=1):
-        lines.append(f"... {index}. `{Path(str(item.get('plan') or '')).name}` | `{item.get('mode')}` | {fmt_size(item.get('source_size'))}")
-    if len(queue_items) > 30:
-        lines.append(f"... and {len(queue_items) - 30} more")
-    embed.description = truncate("\n".join(lines), 4000)
-    return embed
+def dashboard_major_signature(snapshot: Dict[str, Any]) -> str:
+    def plan_signature(plan: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": str(plan.get("plan_run_id") or ""),
+            "name": display_filename(plan),
+            "status": str(plan.get("status") or ""),
+            "mode": str(plan.get("mode") or ""),
+            "stages": [
+                {
+                    "name": str(stage.get("name") or ""),
+                    "status": str(stage.get("status") or ""),
+                    "message": str(stage.get("message") or ""),
+                }
+                for stage in list(plan.get("stages") or [])
+            ],
+        }
+
+    data = {
+        "state": str(snapshot.get("state") or ""),
+        "paused": bool(snapshot.get("paused")),
+        "pause_after_current": bool(snapshot.get("pause_after_current")),
+        "exit_when_idle": bool(snapshot.get("exit_when_idle")),
+        "active": [plan_signature(plan) for plan in list(snapshot.get("active") or [])],
+        "queue": [
+            {
+                "name": display_filename(item),
+                "mode": str(item.get("mode") or ""),
+                "plan": str(item.get("plan") or ""),
+            }
+            for item in list(snapshot.get("queue") or [])
+        ],
+        "completed": [
+            {
+                "id": str(item.get("plan_run_id") or ""),
+                "status": str(item.get("status") or ""),
+                "name": display_filename(item),
+            }
+            for item in list(snapshot.get("completed") or [])
+        ],
+        "failed": [
+            {
+                "id": str(item.get("plan_run_id") or ""),
+                "status": str(item.get("status") or ""),
+                "stage": str(item.get("stage") or ""),
+                "message": str(item.get("message") or ""),
+            }
+            for item in list(snapshot.get("failed") or [])
+        ],
+    }
+    return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def load_batch_manager_module() -> Any:
@@ -457,6 +621,15 @@ async def run_bot(config: BotConfig) -> None:
     client = discord.Client(intents=intents)
     tree = app_commands.CommandTree(client)
     guild_object = discord.Object(id=config.guild_id)
+    last_render_at: Dict[str, float] = {}
+    last_major_signature: Dict[str, str] = {}
+    pending_snapshots: Dict[str, Dict[str, Any]] = {}
+    pending_tasks: Dict[str, Any] = {}
+    pending_due_at: Dict[str, float] = {}
+    pending_generation: Dict[str, int] = {}
+    latest_session_by_source: Dict[str, str] = {}
+    channel_locks: Dict[str, Any] = {}
+    dashboard_locks: Dict[str, Any] = {}
 
     def is_authorized(interaction: Any) -> bool:
         if config.admin_role_id == 0 and config.operator_role_id == 0:
@@ -466,63 +639,149 @@ async def run_bot(config: BotConfig) -> None:
         return bool(role_ids.intersection({config.admin_role_id, config.operator_role_id}))
 
     async def ensure_channel(source_dir: str) -> Any:
-        await client.wait_until_ready()
-        existing_id = store.get_channel_id(source_dir)
-        if existing_id:
-            channel = client.get_channel(existing_id)
-            if channel is not None:
-                return channel
-        guild = client.get_guild(config.guild_id)
-        if guild is None:
-            raise RuntimeError(f"guild not found: {config.guild_id}")
-        category = guild.get_channel(config.category_id)
-        if category is None:
-            raise RuntimeError(f"category not found: {config.category_id}")
-        channel_name = channel_name_for_source(source_dir)
-        for channel in category.channels:
-            if getattr(channel, "name", "") == channel_name:
-                store.set_channel(source_dir, int(channel.id), channel_name)
-                return channel
-        channel = await guild.create_text_channel(
-            name=channel_name,
-            category=category,
-            topic=f"PBBatch source: {source_dir}",
-            reason="PBBatch runner session",
-        )
-        store.set_channel(source_dir, int(channel.id), channel_name)
-        return channel
+        lock = channel_locks.setdefault(source_dir, asyncio.Lock())
+        async with lock:
+            await client.wait_until_ready()
+            existing_id = store.get_channel_id(source_dir)
+            guild = client.get_guild(config.guild_id)
+            if guild is None:
+                raise RuntimeError(f"guild not found: {config.guild_id}")
+            if existing_id:
+                channel = client.get_channel(existing_id)
+                if channel is None:
+                    try:
+                        channel = await guild.fetch_channel(existing_id)
+                    except Exception:
+                        channel = None
+                if channel is not None:
+                    return channel
+            category = guild.get_channel(config.category_id)
+            if category is None:
+                try:
+                    category = await guild.fetch_channel(config.category_id)
+                except Exception:
+                    category = None
+            if category is None:
+                raise RuntimeError(f"category not found: {config.category_id}")
+            channel_name = channel_name_for_source(source_dir)
+            candidates = list(getattr(category, "channels", []) or [])
+            try:
+                fetched_channels = await guild.fetch_channels()
+                for channel in fetched_channels:
+                    parent_id = int(getattr(channel, "category_id", 0) or getattr(channel, "parent_id", 0) or 0)
+                    if parent_id == int(config.category_id):
+                        candidates.append(channel)
+            except Exception:
+                pass
+            seen_ids: set[int] = set()
+            for channel in candidates:
+                channel_id = int(getattr(channel, "id", 0) or 0)
+                if not channel_id or channel_id in seen_ids:
+                    continue
+                seen_ids.add(channel_id)
+                if getattr(channel, "name", "") == channel_name:
+                    store.set_channel(source_dir, channel_id, channel_name)
+                    return channel
+            channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                topic=f"PBBatch source: {source_dir}",
+                reason="PBBatch runner session",
+            )
+            store.set_channel(source_dir, int(channel.id), channel_name)
+            return channel
 
-    async def update_dashboard(snapshot: Dict[str, Any]) -> None:
+    async def delayed_dashboard_update(session_id: str, generation: int, delay: float) -> None:
+        try:
+            await asyncio.sleep(max(0.0, delay))
+        except asyncio.CancelledError:
+            return
+        if pending_generation.get(session_id) != generation:
+            return
+        latest = pending_snapshots.pop(session_id, None)
+        pending_tasks.pop(session_id, None)
+        pending_due_at.pop(session_id, None)
+        if latest is not None:
+            await update_dashboard(latest, force=True)
+
+    def schedule_dashboard_update(session_id: str, snapshot: Dict[str, Any], delay: float) -> None:
+        now = time.monotonic()
+        due_at = now + max(0.0, delay)
+        pending_snapshots[session_id] = snapshot
+        existing_task = pending_tasks.get(session_id)
+        existing_due_at = pending_due_at.get(session_id, 0.0)
+        if existing_task is not None and not existing_task.done() and existing_due_at <= due_at + 0.5:
+            return
+        if existing_task is not None and not existing_task.done():
+            existing_task.cancel()
+        generation = pending_generation.get(session_id, 0) + 1
+        pending_generation[session_id] = generation
+        pending_due_at[session_id] = due_at
+        pending_tasks[session_id] = asyncio.create_task(delayed_dashboard_update(session_id, generation, delay))
+
+    async def update_dashboard(snapshot: Dict[str, Any], *, force: bool = False, takeover: bool = False) -> None:
         session_id = str(snapshot.get("session_id") or "")
         source_dir = str(snapshot.get("source_dir") or "")
         if not session_id or not source_dir:
             return
-        channel = await ensure_channel(source_dir)
-        store.upsert_session(snapshot, int(channel.id))
-        row = store.get_session(session_id)
-        history_id = int(row["history_message_id"] or 0) if row else 0
-        current_id = int(row["current_message_id"] or 0) if row else 0
-        queue_id = int(row["queue_message_id"] or 0) if row else 0
+        lock = dashboard_locks.setdefault(source_dir, asyncio.Lock())
+        async with lock:
+            owner_session_id = latest_session_by_source.get(source_dir)
+            if takeover or not owner_session_id:
+                latest_session_by_source[source_dir] = session_id
+            elif owner_session_id != session_id:
+                return
+            channel = await ensure_channel(source_dir)
+            store.upsert_session(snapshot, int(channel.id))
 
-        async def upsert_message(message_id: int, *, embed: Any, view: Any = None) -> Any:
-            if message_id:
+            signature = dashboard_major_signature(snapshot)
+            last_at = last_render_at.get(session_id, 0.0)
+            signature_changed = signature != last_major_signature.get(session_id)
+            interval = DASHBOARD_MAJOR_INTERVAL_SECONDS if signature_changed else DASHBOARD_PROGRESS_INTERVAL_SECONDS
+            elapsed = time.monotonic() - last_at if last_at else interval
+            if not force and elapsed < interval:
+                schedule_dashboard_update(session_id, snapshot, interval - elapsed)
+                return
+
+            current_task = asyncio.current_task()
+            task = pending_tasks.pop(session_id, None)
+            pending_snapshots.pop(session_id, None)
+            pending_due_at.pop(session_id, None)
+            pending_generation[session_id] = pending_generation.get(session_id, 0) + 1
+            if task is not None and task is not current_task and not task.done():
+                task.cancel()
+
+            row = store.get_session(session_id)
+            history_id = int(row["history_message_id"] or 0) if row else 0
+            current_id = int(row["current_message_id"] or 0) if row else 0
+            queue_id = int(row["queue_message_id"] or 0) if row else 0
+
+            async def upsert_message(message_id: int, *, embed: Any, view: Any = None) -> Any:
+                if message_id:
+                    try:
+                        message = await channel.fetch_message(message_id)
+                        await message.edit(embed=embed, view=view)
+                        return message
+                    except Exception:
+                        pass
+                return await channel.send(embed=embed, view=view)
+
+            history_msg = await upsert_message(history_id, embed=render_overview_embed(snapshot))
+            current_msg = await upsert_message(current_id, embed=render_current_embed(snapshot), view=build_control_view(session_id))
+            if queue_id and queue_id not in (int(history_msg.id), int(current_msg.id)):
                 try:
-                    message = await channel.fetch_message(message_id)
-                    await message.edit(embed=embed, view=view)
-                    return message
+                    queue_msg = await channel.fetch_message(queue_id)
+                    await queue_msg.delete()
                 except Exception:
                     pass
-            return await channel.send(embed=embed, view=view)
-
-        history_msg = await upsert_message(history_id, embed=render_history_embed(snapshot))
-        current_msg = await upsert_message(current_id, embed=render_current_embed(snapshot), view=build_control_view(session_id))
-        queue_msg = await upsert_message(queue_id, embed=render_queue_embed(snapshot))
-        store.set_session_messages(
-            session_id,
-            history=int(history_msg.id),
-            current=int(current_msg.id),
-            queue_message=int(queue_msg.id),
-        )
+            store.set_session_messages(
+                session_id,
+                history=int(history_msg.id),
+                current=int(current_msg.id),
+                queue_message=0,
+            )
+            last_render_at[session_id] = time.monotonic()
+            last_major_signature[session_id] = signature
 
     async def enqueue_from_interaction(interaction: Any, session_id: str, command: str) -> None:
         if not is_authorized(interaction):
@@ -566,7 +825,7 @@ async def run_bot(config: BotConfig) -> None:
         if row is None:
             await interaction.response.send_message("No PBBatch session is known for this channel.", ephemeral=True)
             return
-        await update_dashboard(snapshot_from_row(row))
+        await update_dashboard(snapshot_from_row(row), force=True)
         await interaction.response.send_message("Panel refreshed.", ephemeral=True)
 
     @tree.command(name="pbbatch_command", description="Queue a command for the latest runner session in this channel.", guild=guild_object)
@@ -665,7 +924,11 @@ async def run_bot(config: BotConfig) -> None:
     async def http_register(request: Any) -> Any:
         payload = await request.json()
         snapshot = dict(payload.get("snapshot") or {})
-        await update_dashboard(snapshot)
+        session_id = str(snapshot.get("session_id") or "")
+        source_dir = str(snapshot.get("source_dir") or "")
+        if session_id and source_dir:
+            latest_session_by_source[source_dir] = session_id
+        asyncio.create_task(update_dashboard(snapshot, force=True, takeover=True))
         return web.json_response({"status": "ok"})
 
     async def http_snapshot(request: Any) -> Any:
