@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -243,6 +244,10 @@ class QueueItem:
         return self.resolved.paths.source
 
     @property
+    def source_dir(self) -> str:
+        return str(self.source.parent.resolve())
+
+    @property
     def workdir(self) -> Path:
         return self.resolved.paths.workdir
 
@@ -473,8 +478,9 @@ class SessionController:
         self.last_item: Optional[QueueItem] = None
         self.events_jsonl = Path(events_jsonl).expanduser().resolve() if events_jsonl else None
         self.no_source_bitrate = bool(no_source_bitrate)
-        self.pause_after_current = False
-        self.paused = False
+        self.source_dirs = sorted({item.source_dir for item in items}, key=str.lower)
+        self.pause_after_current_by_source: Dict[str, bool] = {source_dir: False for source_dir in self.source_dirs}
+        self.paused_by_source: Dict[str, bool] = {source_dir: False for source_dir in self.source_dirs}
         self.exit_when_idle = bool(exit_when_idle)
         self.rerun_after_current = False
         self.stop_requested = False
@@ -489,6 +495,32 @@ class SessionController:
     def _resolve_source_dir(items: List[QueueItem]) -> str:
         dirs = sorted({str(item.source.parent.resolve()) for item in items}, key=str.lower)
         return dirs[0] if len(dirs) == 1 else ""
+
+    def _source_dir_for_command(self, source_dir: str = "") -> str:
+        value = str(source_dir or "").strip()
+        if value:
+            return value
+        if self.source_dir:
+            return self.source_dir
+        if self.current is not None:
+            return self.current.source_dir
+        return self.source_dirs[0] if self.source_dirs else ""
+
+    def _items_for_source(self, items: List[Any], source_dir: str) -> List[Any]:
+        if not source_dir:
+            return list(items)
+        out: List[Any] = []
+        for item in items:
+            queue_item = getattr(item, "item", item)
+            if getattr(queue_item, "source_dir", "") == source_dir:
+                out.append(item)
+        return out
+
+    def _folder_paused(self, source_dir: str) -> bool:
+        return bool(self.paused_by_source.get(source_dir, False))
+
+    def _folder_pause_after_current(self, source_dir: str) -> bool:
+        return bool(self.pause_after_current_by_source.get(source_dir, False))
 
     def start(self) -> None:
         self.worker.start()
@@ -518,8 +550,8 @@ class SessionController:
             queued = len(self.queue)
             failed = len(self.failed)
             completed = len(self.completed)
-            paused = "yes" if self.paused else "no"
-            pause_after = "yes" if self.pause_after_current else "no"
+            paused = ", ".join(sorted(k for k, v in self.paused_by_source.items() if v)) or "no"
+            pause_after = ", ".join(sorted(k for k, v in self.pause_after_current_by_source.items() if v)) or "no"
             exit_idle = "yes" if self.exit_when_idle else "no"
         if active:
             current = "\n".join(
@@ -538,33 +570,47 @@ class SessionController:
             f"exit_when_idle: {exit_idle}"
         )
 
-    def snapshot(self) -> Dict[str, Any]:
+    def snapshot(self, source_dir: str = "", session_id: str = "") -> Dict[str, Any]:
         with self.lock:
+            selected_source = source_dir or self.source_dir
+            active = self._items_for_source(list(self.active.values()), selected_source)
+            queue = self._items_for_source(list(self.queue), selected_source)
+            finished = self._items_for_source(list(self.finished_runs), selected_source)
+            completed_runs = [run for run in finished if run.status in ("completed", "skipped")]
+            failed_runs = [run for run in finished if run.status == "failed"]
+            paused = self._folder_paused(selected_source) if selected_source else any(self.paused_by_source.values())
+            pause_after_current = (
+                self._folder_pause_after_current(selected_source)
+                if selected_source
+                else any(self.pause_after_current_by_source.values())
+            )
+            state = (
+                "finished"
+                if (self.worker_done or (bool(selected_source) and (completed_runs or failed_runs))) and not active and not queue
+                else "paused"
+                if paused
+                else "running"
+                if active
+                else "idle"
+            )
             return {
-                "session_id": self.session_id,
-                "source_dir": self.source_dir,
-                "state": (
-                    "finished"
-                    if self.worker_done
-                    else "paused"
-                    if self.paused
-                    else "running"
-                    if self.active
-                    else "idle"
-                ),
-                "paused": self.paused,
-                "pause_after_current": self.pause_after_current,
+                "session_id": session_id or self.session_id,
+                "runner_session_id": self.session_id,
+                "source_dir": selected_source,
+                "state": state,
+                "paused": paused,
+                "pause_after_current": pause_after_current,
                 "exit_when_idle": self.exit_when_idle,
                 "stop_requested": self.stop_requested,
-                "active": [state.snapshot() for state in self.active.values()],
-                "queue": [item_short_snapshot(item) for item in self.queue],
-                "completed": [run.snapshot() for run in self.finished_runs if run.status in ("completed", "skipped")],
-                "failed": [run.snapshot() for run in self.finished_runs if run.status == "failed"],
+                "active": [state.snapshot() for state in active],
+                "queue": [item_short_snapshot(item) for item in queue],
+                "completed": [run.snapshot() for run in completed_runs],
+                "failed": [run.snapshot() for run in failed_runs],
                 "counts": {
-                    "active": len(self.active),
-                    "queued": len(self.queue),
-                    "completed": len(self.completed),
-                    "failed": len(self.failed),
+                    "active": len(active),
+                    "queued": len(queue),
+                    "completed": len(completed_runs),
+                    "failed": len(failed_runs),
                 },
             }
 
@@ -578,15 +624,53 @@ class SessionController:
             return completed[-1].name
         return ""
 
-    def request_pause_after_current(self) -> None:
+    def request_pause_after_current(self, source_dir: str = "") -> None:
         with self.lock:
-            self.pause_after_current = True
+            selected_source = self._source_dir_for_command(source_dir)
+            has_active = any(state.item.source_dir == selected_source for state in self.active.values())
+            if has_active:
+                self.pause_after_current_by_source[selected_source] = True
+            else:
+                self.paused_by_source[selected_source] = True
+                self.pause_after_current_by_source[selected_source] = False
 
-    def resume(self) -> None:
+    def resume(self, source_dir: str = "") -> None:
         with self.lock:
-            self.paused = False
-            self.pause_after_current = False
+            selected_source = self._source_dir_for_command(source_dir)
+            self.paused_by_source[selected_source] = False
+            self.pause_after_current_by_source[selected_source] = False
         self.wake_event.set()
+
+    def _pause_between_stages_if_requested(self, item: QueueItem, stage: str) -> None:
+        source_dir = item.source_dir
+        paused_now = False
+        with self.lock:
+            if self.pause_after_current_by_source.get(source_dir, False):
+                self.paused_by_source[source_dir] = True
+                self.pause_after_current_by_source[source_dir] = False
+                paused_now = True
+        if paused_now:
+            print(f"[runner] {item.name} | paused after stage {stage}", flush=True)
+            self._notify_event_sinks(
+                {
+                    "event": "runner_pause",
+                    "session_id": self.session_id,
+                    "plan_run_id": self.current_plan_run_id,
+                    "stage": stage,
+                    "status": "paused",
+                    "timestamp": time.time(),
+                    "source": str(item.source),
+                    "workdir": str(item.workdir),
+                }
+            )
+        while True:
+            with self.lock:
+                if self.stop_requested:
+                    return
+                if not self.paused_by_source.get(source_dir, False):
+                    return
+            self.wake_event.wait(0.25)
+            self.wake_event.clear()
 
     def retry_failed(self) -> None:
         with self.lock:
@@ -595,7 +679,8 @@ class SessionController:
             for item in self.failed:
                 self.queue.append(item)
             self.failed.clear()
-            self.paused = False
+            for source_dir in self.paused_by_source:
+                self.paused_by_source[source_dir] = False
         self.wake_event.set()
 
     def rerun_current_item(self) -> None:
@@ -604,7 +689,7 @@ class SessionController:
                 self.rerun_after_current = True
             elif self.last_item is not None:
                 self.queue.appendleft(self.last_item)
-                self.paused = False
+                self.paused_by_source[self.last_item.source_dir] = False
                 self.wake_event.set()
 
     def request_exit_when_idle(self) -> None:
@@ -616,21 +701,22 @@ class SessionController:
         with self.lock:
             self.stop_requested = True
             self.exit_when_idle = True
-            self.paused = False
-            self.pause_after_current = False
+            for source_dir in self.paused_by_source:
+                self.paused_by_source[source_dir] = False
+                self.pause_after_current_by_source[source_dir] = False
             self.rerun_after_current = False
             self.queue.clear()
         self.wake_event.set()
 
-    def handle_command(self, command: str) -> str:
+    def handle_command(self, command: str, source_dir: str = "") -> str:
         name = str(command or "").strip().lower().replace("-", "_").replace(" ", "_")
         if name in ("status", "snapshot"):
             return "status sent"
         if name in ("pause", "pause_after_current"):
-            self.request_pause_after_current()
+            self.request_pause_after_current(source_dir)
             return "will pause after current active plan"
         if name == "resume":
-            self.resume()
+            self.resume(source_dir)
             return "resumed"
         if name == "retry_failed":
             self.retry_failed()
@@ -1388,6 +1474,7 @@ class SessionController:
         self._emit(item, STAGE_ITEM, "started")
         for stage, cmd in self._build_item_commands(item):
             self._run_stage(item, stage, cmd)
+            self._pause_between_stages_if_requested(item, stage)
             if item.mode == "fastpass" and stage in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE):
                 break
         self._emit(item, STAGE_ITEM, "completed")
@@ -1403,23 +1490,30 @@ class SessionController:
                         self.worker_done = True
                         return
                     should_wait = True
-                elif self.paused:
-                    should_wait = True
                 else:
-                    should_wait = False
-                    item = self.queue.popleft()
-                    plan_run_id = f"{self.session_id}-{uuid.uuid4().hex[:12]}"
-                    active_state = ActivePlanState(
-                        plan_run_id=plan_run_id,
-                        item=item,
-                        status="queued",
-                        started_at=time.time(),
-                        stages=initial_stage_states(item),
-                    )
-                    self.active[plan_run_id] = active_state
-                    self.current_plan_run_id = plan_run_id
-                    self.current = item
-                    self.current_stage = ""
+                    item = None
+                    for index, candidate in enumerate(list(self.queue)):
+                        if self.paused_by_source.get(candidate.source_dir, False):
+                            continue
+                        item = candidate
+                        del self.queue[index]
+                        break
+                    if item is None:
+                        should_wait = True
+                    else:
+                        should_wait = False
+                        plan_run_id = f"{self.session_id}-{uuid.uuid4().hex[:12]}"
+                        active_state = ActivePlanState(
+                            plan_run_id=plan_run_id,
+                            item=item,
+                            status="queued",
+                            started_at=time.time(),
+                            stages=initial_stage_states(item),
+                        )
+                        self.active[plan_run_id] = active_state
+                        self.current_plan_run_id = plan_run_id
+                        self.current = item
+                        self.current_stage = ""
             if should_wait:
                 self.wake_event.wait(0.25)
                 self.wake_event.clear()
@@ -1477,9 +1571,10 @@ class SessionController:
                     if self.rerun_after_current:
                         self.queue.appendleft(item)
                         self.rerun_after_current = False
-                    if self.pause_after_current:
-                        self.paused = True
-                        self.pause_after_current = False
+                    source_dir = item.source_dir
+                    if self.pause_after_current_by_source.get(source_dir, False):
+                        self.paused_by_source[source_dir] = True
+                        self.pause_after_current_by_source[source_dir] = False
                     self.current = None
                     self.current_stage = ""
                     self.current_plan_run_id = ""
@@ -1521,11 +1616,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[runner] no plans resolved", file=sys.stderr)
         return 1
     source_dirs = sorted({str(item.source.parent.resolve()) for item in queue}, key=str.lower)
-    if args.no_discord and len(source_dirs) != 1:
-        print("[runner] --discord requires all plans to belong to one source folder", file=sys.stderr)
-        for source_dir in source_dirs:
-            print(f"  {source_dir}", file=sys.stderr)
-        return 2
+    if args.no_discord and len(source_dirs) > 1:
+        print(f"[discord] multi-folder runner: {len(source_dirs)} folder sessions will be published", flush=True)
 
     print(f"[runner] queue size: {len(queue)}", flush=True)
     for index, item in enumerate(queue, start=1):
@@ -1538,44 +1630,81 @@ def main(argv: Optional[List[str]] = None) -> int:
         exit_when_idle=(args.exit_when_idle or args.no_interactive),
         session_id=args.session_id,
     )
-    bridge = DiscordBridge(
-        service_url=args.discord_service_url,
-        session_id=controller.session_id,
-        enabled=args.no_discord,
-    )
-    bridge.attach(snapshot_provider=controller.snapshot, command_handler=controller.handle_command)
-    bridge.set_error_callback(lambda message: print(f"[discord] bridge unavailable: {message}", flush=True))
-    controller.add_event_sink(bridge.notify_event)
-    folder_lock = SourceDirLock(source_dir=controller.source_dir, session_id=controller.session_id, enabled=args.no_discord)
+    def discord_session_id_for_source(source_dir: str) -> str:
+        if len(source_dirs) <= 1:
+            return controller.session_id
+        suffix = hashlib.sha1(source_dir.lower().encode("utf-8", errors="ignore")).hexdigest()[:8]
+        return f"{controller.session_id}-{suffix}"
+
+    bridges: List[tuple[str, DiscordBridge]] = []
+    if args.no_discord:
+        for source_dir in source_dirs:
+            discord_session_id = discord_session_id_for_source(source_dir)
+            bridge = DiscordBridge(
+                service_url=args.discord_service_url,
+                session_id=discord_session_id,
+                enabled=True,
+            )
+            bridge.attach(
+                snapshot_provider=lambda sd=source_dir, sid=discord_session_id: controller.snapshot(sd, session_id=sid),
+                command_handler=lambda command, sd=source_dir: controller.handle_command(command, source_dir=sd),
+            )
+            bridge.set_error_callback(
+                lambda message, sd=source_dir: print(f"[discord] bridge unavailable for {sd}: {message}", flush=True)
+            )
+            bridges.append((source_dir, bridge))
+
+        bridge_by_source = {source_dir: bridge for source_dir, bridge in bridges}
+
+        def notify_discord_event(payload: Dict[str, Any], _snapshot: Dict[str, Any]) -> None:
+            source = str(payload.get("source") or "")
+            source_dir = str(Path(source).parent.resolve()) if source else ""
+            bridge = bridge_by_source.get(source_dir)
+            if bridge is None:
+                return
+            bridge.notify_event(payload, controller.snapshot(source_dir, session_id=bridge.session_id))
+
+        controller.add_event_sink(notify_discord_event)
+    folder_locks = [SourceDirLock(source_dir=source_dir, session_id=controller.session_id, enabled=args.no_discord) for source_dir in source_dirs]
     if args.no_discord:
         print(f"[discord] enabled: session_id={controller.session_id}", flush=True)
         print(f"[discord] service_url={args.discord_service_url}", flush=True)
-        print(f"[discord] source_dir={controller.source_dir}", flush=True)
+        for source_dir, bridge in bridges:
+            print(f"[discord] source_dir={source_dir} | discord_session_id={bridge.session_id}", flush=True)
     else:
         print("[discord] disabled; run with --discord to publish this session", flush=True)
+    acquired_locks: List[SourceDirLock] = []
     try:
-        folder_lock.acquire()
+        for folder_lock in folder_locks:
+            folder_lock.acquire()
+            acquired_locks.append(folder_lock)
     except RuntimeError as exc:
+        for folder_lock in acquired_locks:
+            folder_lock.release()
         print(f"[runner] {exc}", file=sys.stderr)
         return 2
     if args.no_discord:
-        print(f"[discord] folder lock acquired: {folder_lock.path}", flush=True)
+        for folder_lock in folder_locks:
+            print(f"[discord] folder lock acquired: {folder_lock.path}", flush=True)
     controller.start()
-    bridge.start()
+    for _, bridge in bridges:
+        bridge.start()
     if args.no_discord:
-        if bridge.connected:
+        connected_count = sum(1 for _, bridge in bridges if bridge.connected)
+        if connected_count == len(bridges):
             print("[discord] runner registered in bot service", flush=True)
         else:
-            detail = f" ({bridge.last_error})" if bridge.last_error else ""
-            print(f"[discord] bot service registration not confirmed{detail}; runner will keep working locally", flush=True)
+            print(f"[discord] registered {connected_count}/{len(bridges)} folder sessions; runner will keep working locally", flush=True)
 
     if args.no_interactive:
         try:
             controller.join()
             return 1 if controller.failed else 0
         finally:
-            bridge.stop()
-            folder_lock.release()
+            for _, bridge in bridges:
+                bridge.stop()
+            for folder_lock in folder_locks:
+                folder_lock.release()
             if args.no_discord:
                 print("[discord] bridge stopped; folder lock released", flush=True)
 
@@ -1625,8 +1754,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         controller.join()
         return 1 if controller.failed else 0
     finally:
-        bridge.stop()
-        folder_lock.release()
+        for _, bridge in bridges:
+            bridge.stop()
+        for folder_lock in folder_locks:
+            folder_lock.release()
         if args.no_discord:
             print("[discord] bridge stopped; folder lock released", flush=True)
 
