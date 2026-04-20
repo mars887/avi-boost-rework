@@ -61,6 +61,7 @@ from utils.track_gui_shared import (
     sanitize_params_display_text,
     save_plan,
 )
+from utils.zoned_commands import combine_zoned_texts
 
 class TrackConfigGui:
     def __init__(self, data):
@@ -628,7 +629,7 @@ class TrackConfigGui:
         self._build_labeled_text(
             params_section,
             row,
-            "Zone commands",
+            "Zoned commands",
             self.default_zoning_text,
             height=6,
         )
@@ -788,7 +789,7 @@ class TrackConfigGui:
         )
         row += 1
         self.crop_resize_text = tk.Text(crop_section, height=12, width=80, wrap="none")
-        self._build_labeled_text(crop_section, row, "Commands", self.crop_resize_text, height=14)
+        self._build_labeled_text(crop_section, row, "Legacy commands", self.crop_resize_text, height=14)
         self.crop_resize_text.insert("1.0", self.defaults.crop_resize_commands)
         self.crop_resize_text.edit_modified(False)
         self.crop_resize_text.bind("<<Modified>>", self.on_crop_resize_change)
@@ -1558,10 +1559,12 @@ class TrackConfigGui:
             )
             save_plan(plan, plan_path)
             resolved = resolve_paths(plan, plan_path)
+            zoned_text = combine_zoned_texts(self.defaults.zoning, self.defaults.crop_resize_commands)
             resolved.zone_file.parent.mkdir(parents=True, exist_ok=True)
-            resolved.zone_file.write_text(self.defaults.zoning or "", encoding="utf-8", newline="\n")
-            resolved.crop_resize_file.parent.mkdir(parents=True, exist_ok=True)
-            resolved.crop_resize_file.write_text(self.defaults.crop_resize_commands or "", encoding="utf-8", newline="\n")
+            resolved.zone_file.write_text(zoned_text, encoding="utf-8", newline="\n")
+            if resolved.crop_resize_file.resolve() != resolved.zone_file.resolve():
+                resolved.crop_resize_file.parent.mkdir(parents=True, exist_ok=True)
+                resolved.crop_resize_file.write_text(self.defaults.crop_resize_commands or "", encoding="utf-8", newline="\n")
             saved.append(str(plan_path))
         payload = {"status": "ok", "savedPlans": saved}
         sys.stdout.write(json.dumps(payload, ensure_ascii=False))

@@ -28,6 +28,7 @@ from utils.pipeline_runtime import (
     list_portable_encoder_binaries,
     load_toolchain,
 )
+from utils.zoned_commands import read_zoned_command_text
 
 
 TYPE_OPTIONS = ["auto", "video", "audio", "sub"]
@@ -727,8 +728,10 @@ def load_gui_data_from_paths(raw_paths):
             source = resolved.source
             if len(normalized_paths) == 1:
                 defaults.update(gui_defaults_from_file_plan(plan))
-                if resolved.crop_resize_file.exists():
-                    defaults["crop_resize_commands"] = resolved.crop_resize_file.read_text(encoding="utf-8")
+                zoned_text = read_zoned_command_text(resolved.workdir, resolved.zone_file)
+                if zoned_text:
+                    defaults["zoning"] = zoned_text
+                    defaults["crop_resize_commands"] = ""
                 settings = gui_settings_from_file_plan(plan)
             plan_paths[str(source)] = str(path)
             files.append(str(source))
@@ -743,8 +746,10 @@ def load_gui_data_from_paths(raw_paths):
             plan = load_file_plan(existing_plan)
             resolved = resolve_paths(plan, existing_plan)
             defaults.update(gui_defaults_from_file_plan(plan))
-            if resolved.crop_resize_file.exists():
-                defaults["crop_resize_commands"] = resolved.crop_resize_file.read_text(encoding="utf-8")
+            zoned_text = read_zoned_command_text(resolved.workdir, resolved.zone_file)
+            if zoned_text:
+                defaults["zoning"] = zoned_text
+                defaults["crop_resize_commands"] = ""
             settings = gui_settings_from_file_plan(plan)
         files.append(str(source))
         plan_paths[str(source)] = str(existing_plan)

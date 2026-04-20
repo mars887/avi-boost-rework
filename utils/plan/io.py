@@ -42,6 +42,7 @@ from utils.plan.types import (
     sanitize_component,
     to_float,
 )
+from utils.zoned_commands import zoned_command_path
 
 
 _PARAM_SECTION_HEADERS = {"[video.fastpass.params]", "[video.mainpass.params]"}
@@ -125,14 +126,13 @@ def resolve_paths(plan: FilePlan, plan_path: Path) -> ResolvedPaths:
     base_dir = plan_file.parent
     source = _resolve_path(plan.paths.source, base_dir)
     workdir = (base_dir / _workdir_name(plan, source)).resolve()
-    zone_file = (workdir / "zone_edit_command.txt").resolve()
-    crop_resize_file = (workdir / "crop_resize_command.txt").resolve()
+    zoned_file = zoned_command_path(workdir).resolve()
     return ResolvedPaths(
         plan_path=plan_file,
         source=source,
         workdir=workdir,
-        zone_file=zone_file,
-        crop_resize_file=crop_resize_file,
+        zone_file=zoned_file,
+        crop_resize_file=zoned_file,
     )
 
 

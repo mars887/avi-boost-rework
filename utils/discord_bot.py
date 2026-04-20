@@ -30,15 +30,12 @@ from utils.discord_store import (
     DEFAULT_RUNNER_STARTUP_DELAY_SECONDS,
     StateStore,
 )
+from utils.zoned_commands import ZONED_COMMAND_NAME
 
-try:
-    import discord  # type: ignore[import-not-found]
-    from aiohttp import web  # type: ignore[import-not-found]
-    from discord import app_commands  # type: ignore[import-not-found]
-except Exception:
-    discord = None
-    web = None
-    app_commands = None
+import discord  # type: ignore[import-not-found]
+from aiohttp import web  # type: ignore[import-not-found]
+from discord import app_commands  # type: ignore[import-not-found]
+
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -402,10 +399,11 @@ def plan_named_file(plan: Dict[str, Any], name: str) -> Path:
         "state": workdir / "00_meta" / "runner_state.json",
         "runner_state": workdir / "00_meta" / "runner_state.json",
         "events": workdir / "00_meta" / "runner_events.jsonl",
-        "zone": workdir / "zone_edit_command.txt",
-        "zone_edit": workdir / "zone_edit_command.txt",
-        "crop": workdir / "crop_resize_command.txt",
-        "crop_resize": workdir / "crop_resize_command.txt",
+        "zone": workdir / ZONED_COMMAND_NAME,
+        "zone_edit": workdir / ZONED_COMMAND_NAME,
+        "zoned": workdir / ZONED_COMMAND_NAME,
+        "crop": workdir / ZONED_COMMAND_NAME,
+        "crop_resize": workdir / ZONED_COMMAND_NAME,
     }
     if normalized in mapping:
         return mapping[normalized]
@@ -1411,8 +1409,7 @@ async def run_bot(config: BotConfig) -> None:
             app_commands.Choice(name="{basename}.plan", value="plan"),
             app_commands.Choice(name="full-batch.plan", value="full-batch"),
             app_commands.Choice(name="fastpass-batch.plan", value="fastpass-batch"),
-            app_commands.Choice(name="zone_edit_command.txt", value="zone"),
-            app_commands.Choice(name="crop_resize_command.txt", value="crop-resize"),
+            app_commands.Choice(name=ZONED_COMMAND_NAME, value="zone"),
         ]
     )
     async def batch_edit_text(
@@ -1563,8 +1560,7 @@ async def run_bot(config: BotConfig) -> None:
             app_commands.Choice(name="Current .plan", value="plan"),
             app_commands.Choice(name="Runner state", value="state"),
             app_commands.Choice(name="Recent logs zip hint", value="logs"),
-            app_commands.Choice(name="Zone edit command", value="zone"),
-            app_commands.Choice(name="Crop/resize command", value="crop"),
+            app_commands.Choice(name="Zoned command", value="zone"),
         ]
     )
     async def pbbatch_file(interaction: Any, kind: app_commands.Choice[str]) -> None:
@@ -1590,8 +1586,8 @@ async def run_bot(config: BotConfig) -> None:
         paths = {
             "plan": plan,
             "state": workdir / "00_meta" / "runner_state.json",
-            "zone": workdir / "zone_edit_command.txt",
-            "crop": workdir / "crop_resize_command.txt",
+            "zone": workdir / ZONED_COMMAND_NAME,
+            "crop": workdir / ZONED_COMMAND_NAME,
         }
         if str(kind.value) == "logs":
             await interaction.response.send_message(f"Logs directory: `{workdir / '00_logs'}`", ephemeral=True)

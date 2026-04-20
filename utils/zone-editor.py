@@ -34,6 +34,12 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.zoned_commands import project_zone_command_lines
+
 # ------------------------- state markers -------------------------
 
 STATE_DIR_NAME = ".state"
@@ -731,14 +737,14 @@ def load_commands(command_arg: str) -> List[str]:
     if os.path.exists(command_arg) and os.path.isfile(command_arg):
         with open(command_arg, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
-        return lines
+        return project_zone_command_lines(lines)
 
     # Otherwise treat as inline:
     # delimiter is "?" (per spec). Also allow newlines if user passed them.
     if "\n" in command_arg:
-        return command_arg.splitlines()
+        return project_zone_command_lines(command_arg.splitlines())
 
-    return [x.strip() for x in command_arg.split("?")]
+    return project_zone_command_lines([x.strip() for x in command_arg.split("?")])
 
 
 def parse_commands(

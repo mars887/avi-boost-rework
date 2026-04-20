@@ -8,13 +8,16 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from utils.zoned_commands import project_crop_resize_command_lines
+
 
 _RX_FRAME = re.compile(r"^(\d+)f(\d+)$", re.IGNORECASE)
 _RX_TIME = re.compile(r"^([0-9:.,]+)t([0-9:.,]+)$", re.IGNORECASE)
-_SIZE_SEP = r"[:xX*]"
+_SIZE_SEP = r"[:xX*/]"
 _RX_SIZE = re.compile(rf"^(\d+)\s*{_SIZE_SEP}\s*(\d+)$", re.IGNORECASE)
 _RX_CROP = re.compile(rf"^crop=(\d+)\s*{_SIZE_SEP}\s*(\d+)(?::(-?\d+):(-?\d+))?$", re.IGNORECASE)
 _RX_SCALE = re.compile(rf"^scale=(-?\d+)\s*{_SIZE_SEP}\s*(-?\d+)$", re.IGNORECASE)
+_RX_FUNCTION_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(frozen=True)
@@ -172,11 +175,13 @@ def parse_crop_resize_lines(lines: Iterable[str]) -> CropResizePlan:
     default_ops: Optional[Tuple[CropResizeOp, ...]] = None
     raw_rules: List[Tuple[Tuple[str, ...], str, str]] = []
 
-    for raw in lines:
+    for raw in project_crop_resize_command_lines(lines):
         line = _strip_line(raw)
         if not line:
             continue
         selector_text, chain_text = _split_rule_line(line)
+        if _RX_FUNCTION_NAME.match(chain_text):
+            continue
         if selector_text == "@default":
             default_ops = _parse_chain(chain_text)
             continue

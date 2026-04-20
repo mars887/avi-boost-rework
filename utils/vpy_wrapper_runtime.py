@@ -1,17 +1,47 @@
 from __future__ import annotations
 
 import os
+import re
 import runpy
 import sys
 import ast
+import keyword
+from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from utils.crop_resize import apply_crop_resize_to_clip, load_crop_resize_plan
+from utils.crop_resize import (
+    FrameRange,
+    apply_crop_resize_to_clip,
+    load_chapters,
+    load_crop_resize_lines,
+    load_crop_resize_plan,
+    resolve_selector,
+)
+from utils.zoned_commands import project_vpy_function_lines
 
 
 SOURCE_LOADERS = ("auto", "ffms2", "bs", "lsmas")
+_RX_FRAME_SELECTOR = re.compile(r"^(\d+)f(\d+)$", re.IGNORECASE)
+_RX_TIME_SELECTOR = re.compile(r"^([0-9:.,]+)t([0-9:.,]+)$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class VpyFunctionRule:
+    selectors: Tuple[str, ...]
+    function_name: str
+    raw_line: str
+
+
+@dataclass(frozen=True)
+class VpyFunctionPlan:
+    default_function: str
+    rules: Tuple[VpyFunctionRule, ...]
+
+
+EMPTY_VPY_FUNCTION_PLAN = VpyFunctionPlan(default_function="", rules=())
 
 
 def _coerce_text(value: Any) -> str:
@@ -155,11 +185,206 @@ def _create_pipe(args: SimpleNamespace, user_ns: Dict[str, Any]) -> Any:
     return _load_default_source(args)
 
 
+def _strip_rule_line(raw: str) -> str:
+    line = str(raw or "").strip()
+    if not line or line.startswith("#") or line.startswith("//"):
+        return ""
+    return line
+
+
+def _split_rule_line(line: str) -> Tuple[str, str]:
+    if " - " in line:
+        left, right = line.split(" - ", 1)
+    else:
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[1] != "-":
+            raise ValueError("expected '<selector> - <function>'")
+        left, right = parts[0], parts[2]
+    left = left.strip()
+    right = right.strip()
+    if not left:
+        raise ValueError("missing selector")
+    if not right:
+        raise ValueError("missing function")
+    return left, right
+
+
+def _is_function_name(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(text and text.isidentifier() and not keyword.iskeyword(text))
+
+
+def _parse_vpy_function_lines(lines: Iterable[str]) -> VpyFunctionPlan:
+    default_function = ""
+    rules: List[VpyFunctionRule] = []
+
+    for raw in project_vpy_function_lines(lines):
+        line = _strip_rule_line(raw)
+        if not line:
+            continue
+        try:
+            selector_text, function_name = _split_rule_line(line)
+        except ValueError:
+            continue
+        if not _is_function_name(function_name):
+            continue
+        if selector_text == "@default":
+            default_function = function_name
+            continue
+        selectors = tuple(part.strip() for part in selector_text.split(",") if part.strip())
+        if not selectors:
+            raise ValueError(f"no selectors in line: {line}")
+        rules.append(VpyFunctionRule(selectors=selectors, function_name=function_name, raw_line=line))
+
+    if not default_function and not rules:
+        return EMPTY_VPY_FUNCTION_PLAN
+    return VpyFunctionPlan(default_function=default_function, rules=tuple(rules))
+
+
+def _load_vpy_function_plan(args: SimpleNamespace) -> VpyFunctionPlan:
+    rules_path = Path(args.rules).expanduser() if str(args.rules or "").strip() else None
+    if rules_path is None or not rules_path.exists():
+        return EMPTY_VPY_FUNCTION_PLAN
+    return _parse_vpy_function_lines(load_crop_resize_lines(rules_path))
+
+
+def _fps_from_clip(clip: Any) -> Fraction:
+    num = int(getattr(clip, "fps_num", 0) or 0)
+    den = int(getattr(clip, "fps_den", 0) or 0)
+    if num > 0 and den > 0:
+        return Fraction(num, den)
+    return Fraction(24000, 1001)
+
+
+def _resolve_vpy_function_rule_ranges(
+    plan: VpyFunctionPlan,
+    *,
+    clip: Any,
+    source: Optional[Path] = None,
+) -> List[List[FrameRange]]:
+    total_frames = int(getattr(clip, "num_frames", 0) or 0)
+    fps = _fps_from_clip(clip)
+    chapters = []
+    needs_chapters = any(
+        not _RX_FRAME_SELECTOR.match(selector.strip()) and not _RX_TIME_SELECTOR.match(selector.strip())
+        for rule in plan.rules
+        for selector in rule.selectors
+    )
+    if needs_chapters:
+        if source is None:
+            raise ValueError("chapter selectors require source path")
+        chapters = load_chapters(source)
+
+    resolved: List[List[FrameRange]] = []
+    for rule in plan.rules:
+        ranges: List[FrameRange] = []
+        for selector in rule.selectors:
+            ranges.extend(resolve_selector(selector, fps=fps, total_frames=total_frames, chapters=chapters))
+        resolved.append(ranges)
+    return resolved
+
+
+def _format_name(clip: Any) -> str:
+    fmt = getattr(clip, "format", None)
+    name = getattr(fmt, "name", None)
+    if name:
+        return str(name)
+    fmt_id = getattr(fmt, "id", None)
+    return str(fmt_id) if fmt_id is not None else ""
+
+
+def _validate_function_clip(base: Any, variant: Any, function_name: str) -> None:
+    base_width = int(getattr(base, "width", 0) or 0)
+    base_height = int(getattr(base, "height", 0) or 0)
+    variant_width = int(getattr(variant, "width", 0) or 0)
+    variant_height = int(getattr(variant, "height", 0) or 0)
+    if variant_width != base_width or variant_height != base_height:
+        raise RuntimeError(
+            f"wrapper.vpy function {function_name!r} produced invalid geometry: "
+            f"{variant_width}x{variant_height}, expected {base_width}x{base_height}"
+        )
+
+    base_frames = int(getattr(base, "num_frames", 0) or 0)
+    variant_frames = int(getattr(variant, "num_frames", 0) or 0)
+    if base_frames and variant_frames and variant_frames != base_frames:
+        raise RuntimeError(
+            f"wrapper.vpy function {function_name!r} produced invalid frame count: "
+            f"{variant_frames}, expected {base_frames}"
+        )
+
+    base_format = _format_name(base)
+    variant_format = _format_name(variant)
+    if base_format and variant_format and variant_format != base_format:
+        raise RuntimeError(
+            f"wrapper.vpy function {function_name!r} produced invalid format: "
+            f"{variant_format}, expected {base_format}"
+        )
+
+
+def _run_named_pipeline(
+    args: SimpleNamespace,
+    user_ns: Dict[str, Any],
+    clip: Any,
+    function_name: str,
+) -> Any:
+    function = user_ns.get(function_name)
+    if callable(function):
+        return function(args, clip)
+    if function_name == "pipeline":
+        return clip
+    raise RuntimeError(f"wrapper.vpy function not found: {function_name}")
+
+
 def _run_pipeline(args: SimpleNamespace, user_ns: Dict[str, Any], clip: Any) -> Any:
     pipeline = user_ns.get("pipeline")
     if callable(pipeline):
         return pipeline(args, clip)
     return clip
+
+
+def _run_pipeline_zones(args: SimpleNamespace, user_ns: Dict[str, Any], clip: Any) -> Any:
+    if not str(args.vpy or "").strip():
+        return _run_pipeline(args, user_ns, clip)
+
+    plan = _load_vpy_function_plan(args)
+    if not plan.default_function and not plan.rules:
+        return _run_pipeline(args, user_ns, clip)
+
+    import vapoursynth as vs  # type: ignore
+
+    base_function = plan.default_function or "pipeline"
+    base = _run_named_pipeline(args, user_ns, clip, base_function)
+
+    total_frames = int(getattr(base, "num_frames", 0) or 0)
+    variant_indexes = [0] * total_frames
+    variants: List[Any] = [base]
+    variant_by_function: Dict[str, int] = {base_function: 0}
+
+    rule_ranges = _resolve_vpy_function_rule_ranges(
+        plan,
+        clip=base,
+        source=Path(args.src).expanduser() if str(args.src or "").strip() else None,
+    )
+
+    for rule, ranges in zip(plan.rules, rule_ranges):
+        variant_index = variant_by_function.get(rule.function_name)
+        if variant_index is None:
+            variant = _run_named_pipeline(args, user_ns, clip, rule.function_name)
+            _validate_function_clip(base, variant, rule.function_name)
+            variant_index = len(variants)
+            variant_by_function[rule.function_name] = variant_index
+            variants.append(variant)
+        for frame_range in ranges:
+            for frame_no in range(frame_range.start, frame_range.end):
+                variant_indexes[frame_no] = variant_index
+
+    if len(variants) == 1:
+        return base
+
+    def select_frame(n: int) -> Any:
+        return variants[variant_indexes[n]]
+
+    return vs.core.std.FrameEval(base, select_frame)
 
 
 def _run_pre_pipeline(args: SimpleNamespace, user_ns: Dict[str, Any], clip: Any) -> Any:
@@ -188,7 +413,7 @@ def build_clip(raw_globals: Dict[str, Any]) -> Any:
                     )
 
     clip = _run_pre_pipeline(args, user_ns, clip)
-    clip = _run_pipeline(args, user_ns, clip)
+    clip = _run_pipeline_zones(args, user_ns, clip)
     return clip
 
 

@@ -29,12 +29,19 @@ from utils.plan_model import (
     save_plan,
 )
 from utils.plan_support import collect_file_plan_paths, refresh_directory_support_files
+from utils.zoned_commands import (
+    LEGACY_CROP_RESIZE_COMMAND_NAME,
+    LEGACY_ZONE_COMMAND_NAME,
+    ZONED_COMMAND_NAME,
+    zoned_command_path,
+)
 
 VIDEO_EXTS = (".mkv", ".mp4")
 ADDITIONAL_WORK_EXTS = ("ffindex", "lvi")
 KNOWN_WORKDIR_TOP_LEVEL = {
-    "zone_edit_command.txt",
-    "crop_resize_command.txt",
+    ZONED_COMMAND_NAME,
+    LEGACY_ZONE_COMMAND_NAME,
+    LEGACY_CROP_RESIZE_COMMAND_NAME,
     ".state",
     "00_meta",
     "00_logs",
@@ -104,7 +111,13 @@ def choose_source_path(source_dir: Path, base: str) -> Path:
 
 
 def is_workdir(p: Path) -> bool:
-    return (p / "zone_edit_command.txt").exists() or (p / "crop_resize_command.txt").exists() or (p / "video").exists() or (p / "audio").exists()
+    return (
+        (p / ZONED_COMMAND_NAME).exists()
+        or (p / LEGACY_ZONE_COMMAND_NAME).exists()
+        or (p / LEGACY_CROP_RESIZE_COMMAND_NAME).exists()
+        or (p / "video").exists()
+        or (p / "audio").exists()
+    )
 
 
 def build_group_from_source(source: Path) -> SourceGroup:
@@ -113,8 +126,8 @@ def build_group_from_source(source: Path) -> SourceGroup:
     source_dir = src.parent
     plan_path = source_dir / f"{base}.plan"
     workdir = source_dir / base
-    zone_file = workdir / "zone_edit_command.txt"
-    crop_resize_file = workdir / "crop_resize_command.txt"
+    zone_file = zoned_command_path(workdir)
+    crop_resize_file = zone_file
     if plan_path.exists():
         try:
             plan = load_file_plan(plan_path)
@@ -193,7 +206,7 @@ def resolve_source_from_path(p: Path) -> Optional[Path]:
                     return resolved[0].paths.source
         return None
 
-    if name in ("zone_edit_command.txt",):
+    if name in (ZONED_COMMAND_NAME, LEGACY_ZONE_COMMAND_NAME, LEGACY_CROP_RESIZE_COMMAND_NAME):
         workdir = p.parent
         base = workdir.name
         return choose_source_path(workdir.parent, base)
@@ -578,8 +591,9 @@ def dump_configs_to_meta(groups: List[SourceGroup]) -> Dict[Path, List[SourceGro
         moved_dir_level: set[str] = set()
         for g in items:
             move_if_exists(g.plan_path, meta / f"{g.base}.plan")
-            move_if_exists(g.zone_file, meta / f"{g.base}-zoning.txt")
-            move_if_exists(g.crop_resize_file, meta / f"{g.base}-crop-resize.txt")
+            move_if_exists(g.zone_file, meta / f"{g.base}-zoned.txt")
+            if g.crop_resize_file.resolve() != g.zone_file.resolve():
+                move_if_exists(g.crop_resize_file, meta / f"{g.base}-crop-resize.txt")
             for src, dst_name in (
                 (g.full_batch_plan, "full-batch.plan"),
                 (g.fastpass_batch_plan, "fastpass-batch.plan"),
@@ -677,8 +691,7 @@ def prompt_edit_target() -> Optional[str]:
     print("  1) {basename}.plan")
     print("  2) full-batch.plan")
     print("  3) fastpass-batch.plan")
-    print("  4) zone_edit_command.txt")
-    print("  5) crop_resize_command.txt")
+    print(f"  4) {ZONED_COMMAND_NAME}")
     print("  B) Back")
     while True:
         choice = input("Select file to edit: ").strip().lower()
@@ -692,8 +705,6 @@ def prompt_edit_target() -> Optional[str]:
             return "fastpass-batch"
         if choice == "4":
             return "zone"
-        if choice == "5":
-            return "crop-resize"
         print("Unknown option.")
 
 
@@ -719,9 +730,9 @@ def edit_target_label(target: str) -> str:
     if target == "fastpass-batch":
         return "fastpass-batch.plan"
     if target == "zone":
-        return "zone_edit_command.txt"
+        return ZONED_COMMAND_NAME
     if target == "crop-resize":
-        return "crop_resize_command.txt"
+        return ZONED_COMMAND_NAME
     return target
 
 
@@ -929,6 +940,8 @@ def clone_source_config(template: SourceGroup, target: SourceGroup) -> bool:
         return False
 
     ok_zone = copy_zone_command(template, target)
+    if template.crop_resize_file.resolve() == template.zone_file.resolve() and target.crop_resize_file.resolve() == target.zone_file.resolve():
+        return ok_zone
     ok_crop = copy_crop_resize_command(template, target)
     return ok_zone and ok_crop
 

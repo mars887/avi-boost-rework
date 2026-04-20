@@ -54,6 +54,7 @@ from utils.runner_state import (
     stage_resume_marker_exists,
     write_stage_marker,
 )
+from utils.zoned_commands import ensure_zoned_command_file
 
 FAST_INTERRUPT = False
 WRAPPER_VPY = ROOT_DIR / "wrapper.vpy"
@@ -1192,11 +1193,7 @@ class SessionController:
         ensure_dir(workdir / "attachments")
         ensure_dir(workdir / "chapters")
         ensure_dir(paths.zone_file.parent)
-        if not paths.zone_file.exists():
-            paths.zone_file.write_text("", encoding="utf-8", newline="\n")
-        ensure_dir(paths.crop_resize_file.parent)
-        if not paths.crop_resize_file.exists():
-            paths.crop_resize_file.write_text("", encoding="utf-8", newline="\n")
+        ensure_zoned_command_file(workdir, paths.zone_file)
 
         commands: List[tuple[str, List[str]]] = [
             (

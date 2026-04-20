@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 
 from utils.plan_model import format_value, normalize_track_type, resolve_file_plan
 from utils.crop_resize import load_crop_resize_plan, validate_crop_resize_plan
+from utils.zoned_commands import ZONED_COMMAND_NAME, project_zone_command_lines
 
 
 NULL_DEVICE = "NUL" if os.name == "nt" else "/dev/null"
@@ -101,7 +102,7 @@ def check_zone_syntax(zone_path: Path, source: Path) -> Tuple[List[str], List[st
     errors: List[str] = []
     warnings: List[str] = []
     if not zone_path.exists():
-        warnings.append(f"zone_edit_command.txt missing: {zone_path}")
+        warnings.append(f"{ZONED_COMMAND_NAME} missing: {zone_path}")
         return errors, warnings
 
     zone_editor = Path(__file__).with_name("zone-editor.py")
@@ -129,7 +130,7 @@ def check_crop_resize_syntax(crop_path: Path, source: Path, enabled: bool) -> Tu
     warnings: List[str] = []
     if not crop_path.exists():
         if enabled:
-            warnings.append(f"crop_resize_command.txt missing: {crop_path}")
+            warnings.append(f"{ZONED_COMMAND_NAME} missing: {crop_path}")
         return errors, warnings
     text = read_text_guess(crop_path)
     if not text.strip():
@@ -161,12 +162,20 @@ def parse_zone_actions(line: str) -> List[str]:
     if not tokens:
         return []
     sep_idx = None
-    for i, t in enumerate(tokens):
-        if t in ("-", "!", "^"):
-            sep_idx = i
-            break
+    if "|" in tokens:
+        first_bar = tokens.index("|")
+        try:
+            second_bar = tokens.index("|", first_bar + 1)
+        except ValueError:
+            raise ValueError("missing second boundary separator (|)")
+        sep_idx = second_bar
+    else:
+        for i, t in enumerate(tokens):
+            if t in ("-", "!", "^"):
+                sep_idx = i
+                break
     if sep_idx is None:
-        raise ValueError("missing separator (- ! ^)")
+        raise ValueError("missing separator (- ! ^ |)")
     action_tokens = tokens[sep_idx + 1 :]
     if len(action_tokens) % 2 != 0:
         raise ValueError("actions must be param/value pairs")
@@ -226,7 +235,7 @@ def apply_override(base_tokens: List[str], override_tokens: List[str]) -> List[s
 def load_zone_lines(path: Path) -> List[str]:
     text = read_text_guess(path)
     lines = []
-    for raw in text.splitlines():
+    for raw in project_zone_command_lines(text.splitlines()):
         line = raw.strip()
         if not line:
             continue
@@ -340,17 +349,18 @@ def main(argv: List[str]) -> int:
         z_errs, z_warns = check_zone_syntax(zone_path, source)
         errors.extend(z_errs)
         warnings.extend(z_warns)
-        c_errs, c_warns = check_crop_resize_syntax(
-            crop_path,
-            source,
-            bool(resolved_plan.plan.video.experimental.crop_resize_enabled),
-        )
-        errors.extend(c_errs)
-        warnings.extend(c_warns)
+        if crop_path != zone_path or crop_path.exists():
+            c_errs, c_warns = check_crop_resize_syntax(
+                crop_path,
+                source,
+                bool(resolved_plan.plan.video.experimental.crop_resize_enabled),
+            )
+            errors.extend(c_errs)
+            warnings.extend(c_warns)
     else:
         if zone_path.exists():
             warnings.append("zone syntax skipped: source missing")
-        if crop_path.exists():
+        if crop_path.exists() and crop_path != zone_path:
             warnings.append("crop/resize syntax skipped: source missing")
 
     if args.check_filters and source.exists():

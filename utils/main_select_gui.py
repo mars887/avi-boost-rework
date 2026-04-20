@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from utils.plan_model import FilePlan, gui_defaults_from_file_plan, load_plan, resolve_batch_plan, resolve_paths
 from utils.plan_support import collect_file_plan_paths
+from utils.zoned_commands import read_zoned_command_text
 from utils.track_gui_shared import (
     APP_ACCENT,
     APP_ACCENT_SOFT,
@@ -188,10 +189,10 @@ def load_template_defaults(plan_path: str | Path) -> Dict[str, Any]:
     defaults = build_default_defaults_dict()
     defaults.update(gui_defaults_from_file_plan(plan))
     resolved = resolve_paths(plan, template_path)
-    if resolved.zone_file.exists():
-        defaults["zoning"] = resolved.zone_file.read_text(encoding="utf-8")
-    if resolved.crop_resize_file.exists():
-        defaults["crop_resize_commands"] = resolved.crop_resize_file.read_text(encoding="utf-8")
+    zoned_text = read_zoned_command_text(resolved.workdir, resolved.zone_file)
+    if zoned_text:
+        defaults["zoning"] = zoned_text
+        defaults["crop_resize_commands"] = ""
     return defaults
 
 
