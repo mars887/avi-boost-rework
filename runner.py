@@ -63,6 +63,8 @@ _AV1AN_PROGRESS_JSONL_SUPPORT: Dict[str, bool] = {}
 CHILD_EVENT_ENV = "PBBATCH_RUNNER_CHILD_EVENTS_JSONL"
 SESSION_ID_ENV = "PBBATCH_RUNNER_SESSION_ID"
 PLAN_RUN_ID_ENV = "PBBATCH_RUNNER_PLAN_RUN_ID"
+RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
+MIN_VALID_MEDIA_BYTES = 1024
 
 
 @dataclass
@@ -89,6 +91,15 @@ class StageState:
             "ended_at": self.ended_at,
             "elapsed_seconds": round(elapsed, 3),
         }
+
+
+@dataclass(frozen=True)
+class StageResumeInfo:
+    marker: Optional[Path] = None
+    marker_exists: bool = False
+    marker_valid: bool = True
+    completed: bool = False
+    reason: str = ""
 
 
 @dataclass
@@ -360,39 +371,228 @@ def is_cached_stage_message(message: str) -> bool:
     return normalized in (CACHED_STAGE_MESSAGE, "resume", "using_existing_base_scenes")
 
 
-def stage_resume_marker_exists(item: QueueItem, stage: str) -> bool:
+def file_has_bytes(path: Path, min_bytes: int = 1) -> bool:
+    try:
+        return path.exists() and path.is_file() and path.stat().st_size >= min_bytes
+    except Exception:
+        return False
+
+
+def load_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    if not file_has_bytes(path, 2):
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def valid_json_file(path: Path) -> bool:
+    return load_json_object(path) is not None
+
+
+def valid_scenes_json(path: Path, *, require_zone_overrides: bool = False) -> bool:
+    obj = load_json_object(path)
+    if obj is None:
+        return False
+    scenes = obj.get("scenes") or obj.get("split_scenes") or []
+    if not isinstance(scenes, list) or not scenes:
+        return False
+    if require_zone_overrides:
+        return any(isinstance(scene, dict) and bool(scene.get("zone_overrides")) for scene in scenes)
+    return True
+
+
+def valid_ssimu2_log(path: Path) -> bool:
+    if not file_has_bytes(path, 10):
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    return bool(re.search(r"\d+(?:\.\d+)?", text))
+
+
+def valid_audio_manifest(item: QueueItem) -> bool:
+    obj = load_json_object(item.workdir / "00_meta" / "audio_manifest.json")
+    if obj is None:
+        return False
+    outputs = obj.get("outputs")
+    if not isinstance(outputs, list):
+        return False
+    for output in outputs:
+        if not isinstance(output, dict):
+            return False
+        out_path = str(output.get("outPath") or "").strip()
+        if not out_path:
+            continue
+        path = Path(out_path)
+        if not path.is_absolute():
+            path = item.workdir / path
+        if not file_has_bytes(path, MIN_VALID_MEDIA_BYTES):
+            return False
+    return True
+
+
+def autoboost_project_dir(item: QueueItem) -> Path:
+    return item.workdir / "video"
+
+
+def autoboost_state_dir(item: QueueItem) -> Path:
+    return autoboost_project_dir(item) / ".state"
+
+
+def autoboost_base_scenes(item: QueueItem) -> Path:
+    return autoboost_project_dir(item) / "psd" / "scenes.psd.json"
+
+
+def autoboost_av1an_scenes(item: QueueItem) -> Path:
+    return autoboost_project_dir(item) / "fastpass" / "scenes.json"
+
+
+def autoboost_fastpass_output(item: QueueItem) -> Path:
+    return autoboost_project_dir(item) / "fastpass" / f"{item.source.stem}.fastpass.mkv"
+
+
+def autoboost_ssimu2_log(item: QueueItem) -> Path:
+    return autoboost_project_dir(item) / "fastpass" / f"{item.source.stem}_ssimu2.log"
+
+
+def autoboost_stage4_scenes(item: QueueItem) -> Path:
+    name = "scenes-preview.json" if item.mode == "fastpass" else "scenes.json"
+    return autoboost_project_dir(item) / name
+
+
+def stage_marker_path(item: QueueItem, stage: str) -> Optional[Path]:
     workdir = item.workdir
     state_dir = workdir / ".state"
-    video_state_dir = workdir / "video" / ".state"
     if stage == STAGE_DEMUX:
-        return (state_dir / "DEMUX_DONE").exists()
+        return state_dir / "DEMUX_DONE"
     if stage == STAGE_ATTACHMENTS:
-        return (state_dir / "ATTACHMENTS_CLEAN_DONE").exists()
+        return state_dir / "ATTACHMENTS_CLEAN_DONE"
     if stage == STAGE_AUTOBOOST_PSD_SCENE:
-        return (video_state_dir / "PSD_FINISHED").exists() or (video_state_dir / "FASTPASS_COMPLETED").exists()
+        return autoboost_state_dir(item) / "PSD_FINISHED"
     if stage == STAGE_AUTOBOOST_SCENE:
-        return (video_state_dir / "FASTPASS_COMPLETED").exists()
+        return autoboost_state_dir(item) / "FASTPASS_COMPLETED"
     if stage == STAGE_FASTPASS:
-        return (video_state_dir / "FASTPASS_COMPLETED").exists()
+        return autoboost_state_dir(item) / "FASTPASS_COMPLETED"
     if stage == STAGE_SSIMU2:
-        return (video_state_dir / "SSIMU2_COMPLETED").exists()
+        return autoboost_state_dir(item) / "SSIMU2_COMPLETED"
     if stage == STAGE_HDR_PATCH:
-        return (state_dir / "HDR_PATCH_DONE").exists()
+        return state_dir / "HDR_PATCH_DONE"
     if stage == STAGE_ZONE_EDIT:
-        return (state_dir / "ZONE_EDIT_DONE").exists()
-    if stage == STAGE_MAINPASS:
-        return (workdir / "video" / "video-final.mkv").exists()
+        return state_dir / "ZONE_EDIT_DONE"
     if stage == STAGE_AUDIO:
-        return (state_dir / "AUDIO_DONE").exists()
+        return state_dir / "AUDIO_DONE"
     if stage == STAGE_VERIFY:
-        return (state_dir / "VERIFY_DONE").exists()
+        return state_dir / "VERIFY_DONE"
     if stage == STAGE_MUX:
-        return (state_dir / "MUX_DONE").exists()
-    return False
+        return state_dir / "MUX_DONE"
+    return None
 
 
-def stage_is_composite_autoboost(stage: str) -> bool:
-    return stage in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE)
+def stage_marker_artifacts_valid(item: QueueItem, stage: str) -> bool:
+    if stage == STAGE_DEMUX:
+        return valid_json_file(item.workdir / "00_meta" / "demux_manifest.json")
+    if stage == STAGE_ATTACHMENTS:
+        return valid_json_file(item.workdir / "attachments" / "attachments_cleaner_report.json")
+    if stage == STAGE_AUTOBOOST_PSD_SCENE:
+        return valid_scenes_json(autoboost_base_scenes(item))
+    if stage == STAGE_AUTOBOOST_SCENE:
+        return valid_scenes_json(autoboost_base_scenes(item)) or valid_scenes_json(autoboost_av1an_scenes(item))
+    if stage == STAGE_FASTPASS:
+        return file_has_bytes(autoboost_fastpass_output(item), MIN_VALID_MEDIA_BYTES)
+    if stage == STAGE_SSIMU2:
+        return valid_ssimu2_log(autoboost_ssimu2_log(item))
+    if stage == STAGE_HDR_PATCH:
+        return valid_scenes_json(item.workdir / "video" / "scenes-hdr.json", require_zone_overrides=True)
+    if stage == STAGE_ZONE_EDIT:
+        return valid_scenes_json(item.workdir / "video" / "scenes-final.json", require_zone_overrides=True)
+    if stage == STAGE_AUDIO:
+        return valid_audio_manifest(item)
+    if stage == STAGE_VERIFY:
+        if (item.workdir / "00_logs" / "verify_error.txt").exists():
+            return False
+        if not valid_json_file(item.workdir / "00_meta" / "demux_manifest.json"):
+            return False
+        if not valid_audio_manifest(item):
+            return False
+        if item.resolved.has_video_edit() and not file_has_bytes(
+            item.workdir / "video" / "video-final.mkv",
+            MIN_VALID_MEDIA_BYTES,
+        ):
+            return False
+        return True
+    if stage == STAGE_MUX:
+        return file_has_bytes(item.source.parent / f"{item.source.stem}-av1.mkv", MIN_VALID_MEDIA_BYTES)
+    return True
+
+
+def stage_completion_artifacts_valid(item: QueueItem, stage: str) -> bool:
+    primary = item.resolved.plan.video.primary
+    if stage in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE) and primary.no_fastpass:
+        return stage_marker_artifacts_valid(item, stage) and valid_scenes_json(
+            autoboost_stage4_scenes(item),
+            require_zone_overrides=True,
+        )
+    if stage == STAGE_SSIMU2:
+        return stage_marker_artifacts_valid(item, stage) and valid_scenes_json(
+            autoboost_stage4_scenes(item),
+            require_zone_overrides=True,
+        )
+    if stage == STAGE_MAINPASS:
+        return file_has_bytes(item.workdir / "video" / "video-final.mkv", MIN_VALID_MEDIA_BYTES)
+    return stage_marker_artifacts_valid(item, stage)
+
+
+def stage_resume_info(item: QueueItem, stage: str) -> StageResumeInfo:
+    marker = stage_marker_path(item, stage)
+    if marker is None:
+        completed = stage_completion_artifacts_valid(item, stage)
+        return StageResumeInfo(marker=None, completed=completed, reason="" if completed else "artifact_missing")
+    marker_exists = marker.exists()
+    marker_valid = True
+    completed = False
+    reason = "marker_missing"
+    if marker_exists:
+        marker_valid = stage_marker_artifacts_valid(item, stage)
+        completed = marker_valid and stage_completion_artifacts_valid(item, stage)
+        if completed:
+            reason = ""
+        elif marker_valid:
+            reason = "dependent_artifact_missing"
+        else:
+            reason = "stale_marker"
+    return StageResumeInfo(
+        marker=marker,
+        marker_exists=marker_exists,
+        marker_valid=marker_valid,
+        completed=completed,
+        reason=reason,
+    )
+
+
+def stage_resume_marker_exists(item: QueueItem, stage: str) -> bool:
+    return stage_resume_info(item, stage).completed
+
+
+def write_stage_marker(item: QueueItem, stage: str) -> None:
+    marker = stage_marker_path(item, stage)
+    if marker is None:
+        return
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("ok\n", encoding="utf-8")
+
+
+def clear_stage_marker(item: QueueItem, stage: str) -> None:
+    marker = stage_marker_path(item, stage)
+    if marker is None or not marker.exists():
+        return
+    try:
+        marker.unlink()
+    except Exception:
+        pass
 
 
 def initial_stage_states(item: QueueItem) -> List[StageState]:
@@ -428,12 +628,15 @@ def build_wrapper_vspipe_args(
 def build_queue(plan_args: List[str], cli_mode: str) -> List[QueueItem]:
     queue: List[QueueItem] = []
     seen: set[str] = set()
+    visiting: set[str] = set()
 
     def visit(path: Path, inherited_mode: str) -> None:
         plan_path = path.expanduser().resolve()
+        key = str(plan_path).lower()
+        if key in visiting:
+            raise RuntimeError(f"batch plan cycle detected at {plan_path}")
         plan = load_plan(plan_path)
         if isinstance(plan, FilePlan):
-            key = str(plan_path).lower()
             if key in seen:
                 return
             seen.add(key)
@@ -441,12 +644,16 @@ def build_queue(plan_args: List[str], cli_mode: str) -> List[QueueItem]:
             queue.append(QueueItem(resolved=resolve_file_plan(plan_path), mode=mode))
             return
 
-        batch_mode = normalize_mode(cli_mode or plan.meta.mode or inherited_mode)
-        for item in plan.items:
-            nested = Path(item.plan).expanduser()
-            if not nested.is_absolute():
-                nested = (plan_path.parent / nested).resolve()
-            visit(nested, batch_mode)
+        visiting.add(key)
+        try:
+            batch_mode = normalize_mode(cli_mode or plan.meta.mode or inherited_mode)
+            for item in plan.items:
+                nested = Path(item.plan).expanduser()
+                if not nested.is_absolute():
+                    nested = (plan_path.parent / nested).resolve()
+                visit(nested, batch_mode)
+        finally:
+            visiting.remove(key)
 
     for raw in plan_args:
         visit(Path(raw), cli_mode or "")
@@ -459,7 +666,7 @@ class SessionController:
         *,
         items: List[QueueItem],
         events_jsonl: str,
-        no_source_bitrate: bool,
+        add_source_bitrate: bool,
         exit_when_idle: bool,
         session_id: str = "",
     ) -> None:
@@ -477,7 +684,7 @@ class SessionController:
         self.finished_runs: List[FinishedPlanState] = []
         self.last_item: Optional[QueueItem] = None
         self.events_jsonl = Path(events_jsonl).expanduser().resolve() if events_jsonl else None
-        self.no_source_bitrate = bool(no_source_bitrate)
+        self.add_source_bitrate = bool(add_source_bitrate)
         self.source_dirs = sorted({item.source_dir for item in items}, key=str.lower)
         self.pause_after_current_by_source: Dict[str, bool] = {source_dir: False for source_dir in self.source_dirs}
         self.paused_by_source: Dict[str, bool] = {source_dir: False for source_dir in self.source_dirs}
@@ -676,7 +883,17 @@ class SessionController:
         with self.lock:
             if not self.failed:
                 return
-            for item in self.failed:
+            failed_items = list(self.failed)
+            failed_keys = {(str(item.plan_path).lower(), str(item.source).lower()) for item in failed_items}
+            self.finished_runs = [
+                run
+                for run in self.finished_runs
+                if not (
+                    run.status == "failed"
+                    and (str(run.item.plan_path).lower(), str(run.item.source).lower()) in failed_keys
+                )
+            ]
+            for item in failed_items:
                 self.queue.append(item)
             self.failed.clear()
             for source_dir in self.paused_by_source:
@@ -810,18 +1027,15 @@ class SessionController:
                 stage_state = active.stage(stage)
                 if (
                     stage in (STAGE_FASTPASS, STAGE_SSIMU2)
-                    and status in ("started", "completed", "failed")
+                    and status in ("completed", "failed")
                 ):
                     for parent_name in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE):
                         parent_state = next((item for item in active.stages if item.name == parent_name), None)
-                        if parent_state is None or parent_state.status not in ("pending", "started"):
+                        if parent_state is None or parent_state.status != "started":
                             continue
-                        parent_elapsed = (timestamp - parent_state.started_at) if parent_state.started_at else 0.0
                         parent_cached = (
                             is_cached_stage_message(parent_state.message)
                             or is_cached_stage_message(message)
-                            or parent_state.status == "pending"
-                            or parent_elapsed < 1.0
                         )
                         if not parent_cached:
                             parent_state.status = "completed"
@@ -1138,13 +1352,17 @@ class SessionController:
                     stage.details.update({key: value for key, value in stage_update.items() if key != "progress"})
 
     def _run_stage(self, item: QueueItem, stage: str, cmd: List[str]) -> None:
-        cached_before = stage_resume_marker_exists(item, stage)
+        resume_info = stage_resume_info(item, stage)
+        if resume_info.marker_exists and not resume_info.marker_valid:
+            clear_stage_marker(item, stage)
+            print(f"[runner] {item.name} | {stage} | stale marker ignored | {resume_info.reason}", flush=True)
+        cached_before = resume_info.completed
         stage_message = CACHED_STAGE_MESSAGE if cached_before else ""
         with self.lock:
             self.current_stage = stage
             active = self._active_state_for_item(item)
             plan_run_id = active.plan_run_id if active is not None else self.current_plan_run_id
-        if cached_before and not stage_is_composite_autoboost(stage):
+        if cached_before:
             self._emit(item, stage, "completed", stage_message)
             return
         self._emit(item, stage, "started", stage_message)
@@ -1155,6 +1373,7 @@ class SessionController:
         env[CHILD_EVENT_ENV] = str(child_events)
         env[SESSION_ID_ENV] = self.session_id
         env[PLAN_RUN_ID_ENV] = plan_run_id
+        env[RUNNER_MANAGED_STATE_ENV] = "1"
         offset = child_events.stat().st_size if child_events.exists() else 0
         proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR), env=env)
         last_heartbeat = 0.0
@@ -1171,6 +1390,8 @@ class SessionController:
                         "stage": stage,
                         "status": "started",
                         "timestamp": now,
+                        "source": str(item.source),
+                        "workdir": str(item.workdir),
                     }
                 )
                 last_heartbeat = now
@@ -1178,8 +1399,15 @@ class SessionController:
         offset = self._forward_child_events(child_events, offset, item)
         rc = int(proc.returncode or 0)
         if rc != 0:
+            clear_stage_marker(item, stage)
             self._emit(item, stage, "failed", f"exit_code={rc}")
             raise RuntimeError(f"{stage}_failed_rc_{rc}")
+        if not stage_completion_artifacts_valid(item, stage):
+            clear_stage_marker(item, stage)
+            reason = "stage_artifact_validation_failed"
+            self._emit(item, stage, "failed", reason)
+            raise RuntimeError(f"{stage}_{reason}")
+        write_stage_marker(item, stage)
         self._emit(item, stage, "completed", stage_message)
 
     def _build_item_commands(self, item: QueueItem) -> List[tuple[str, List[str]]]:
@@ -1319,9 +1547,25 @@ class SessionController:
                 auto_boost_cmd.extend(["--max-negative-dev", str(primary.ab_neg_dev)])
             if details.fastpass_filter:
                 auto_boost_cmd.extend(["-f", str(details.fastpass_filter)])
-            if item.mode == "fastpass":
-                auto_boost_cmd.append("--stop-before-stage4")
-            commands.append((autoboost_scene_stage(item), auto_boost_cmd))
+
+            def auto_boost_cmd_for(*run_stages: str) -> List[str]:
+                cmd = list(auto_boost_cmd)
+                if item.mode == "fastpass":
+                    cmd.append("--stop-before-stage4")
+                cmd.extend(["--run-stages", ",".join(run_stages)])
+                return cmd
+
+            scene_detection = str(primary.scene_detection or "").strip().lower()
+            if primary.no_fastpass:
+                if scene_detection == "psd":
+                    commands.append((STAGE_AUTOBOOST_PSD_SCENE, auto_boost_cmd_for("psd", "base-scenes")))
+                else:
+                    commands.append((STAGE_AUTOBOOST_SCENE, auto_boost_cmd_for("fastpass", "base-scenes")))
+            else:
+                if scene_detection == "psd":
+                    commands.append((STAGE_AUTOBOOST_PSD_SCENE, auto_boost_cmd_for("psd")))
+                commands.append((STAGE_FASTPASS, auto_boost_cmd_for("fastpass")))
+                commands.append((STAGE_SSIMU2, auto_boost_cmd_for("ssimu2", "base-scenes")))
 
             if item.mode == "full":
                 hdr_cmd = [
@@ -1455,9 +1699,8 @@ class SessionController:
                 plan_path,
                 "--log",
                 str(log_dir / "09_mux.log"),
-                "--no-source-bitrate"
             ]
-            if self.no_source_bitrate:
+            if not self.add_source_bitrate:
                 mux_cmd.append("--no-source-bitrate")
             commands.append((STAGE_MUX, mux_cmd))
         return commands
@@ -1475,8 +1718,6 @@ class SessionController:
         for stage, cmd in self._build_item_commands(item):
             self._run_stage(item, stage, cmd)
             self._pause_between_stages_if_requested(item, stage)
-            if item.mode == "fastpass" and stage in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE):
-                break
         self._emit(item, STAGE_ITEM, "completed")
 
     def _worker_main(self) -> None:
@@ -1556,7 +1797,9 @@ class SessionController:
                         )
                     else:
                         final_status = "skipped"
-                        if active_state is not None and any(stage.status == "completed" for stage in active_state.stages):
+                        if active_state is not None and active_state.status == "skipped":
+                            final_status = "skipped"
+                        elif active_state is not None and any(stage.status == "completed" for stage in active_state.stages):
                             final_status = "completed"
                         self.finished_runs.append(
                             FinishedPlanState(
@@ -1599,14 +1842,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Session runner for file and batch .plan files.")
     parser.add_argument("--mode", choices=["full", "fastpass"], default="")
     parser.add_argument("--events-jsonl", default="")
-    parser.add_argument("--no-source-bitrate", action="store_true")
+    parser.add_argument("--add-source-bitrate", action="store_true", help="Include source bitrate metadata in mux output.")
+    parser.add_argument(
+        "--no-source-bitrate",
+        dest="add_source_bitrate",
+        action="store_false",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--no-interactive", action="store_true")
     parser.add_argument("--exit-when-idle", action="store_true")
     parser.add_argument("--session-id", default="")
-    parser.add_argument("--no-discord", action="store_false", help="Register this runner in the local Discord bot service.")
+    parser.add_argument(
+        "--no-discord",
+        dest="discord_enabled",
+        action="store_false",
+        default=True,
+        help="Disable registration in the local Discord bot service.",
+    )
     parser.add_argument(
         "--discord-service-url",
         default=discord_config_value("PBBATCH_DISCORD_SERVICE_URL", "http://127.0.0.1:8794"),
+    )
+    parser.add_argument(
+        "--discord-shared-secret",
+        default=discord_config_value("PBBATCH_DISCORD_SHARED_SECRET", ""),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("plans", nargs="+")
     args = parser.parse_args(argv)
@@ -1616,7 +1877,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[runner] no plans resolved", file=sys.stderr)
         return 1
     source_dirs = sorted({str(item.source.parent.resolve()) for item in queue}, key=str.lower)
-    if args.no_discord and len(source_dirs) > 1:
+    if args.discord_enabled and len(source_dirs) > 1:
         print(f"[discord] multi-folder runner: {len(source_dirs)} folder sessions will be published", flush=True)
 
     print(f"[runner] queue size: {len(queue)}", flush=True)
@@ -1626,7 +1887,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     controller = SessionController(
         items=queue,
         events_jsonl=args.events_jsonl,
-        no_source_bitrate=args.no_source_bitrate,
+        add_source_bitrate=args.add_source_bitrate,
         exit_when_idle=(args.exit_when_idle or args.no_interactive),
         session_id=args.session_id,
     )
@@ -1637,13 +1898,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return f"{controller.session_id}-{suffix}"
 
     bridges: List[tuple[str, DiscordBridge]] = []
-    if args.no_discord:
+    if args.discord_enabled:
         for source_dir in source_dirs:
             discord_session_id = discord_session_id_for_source(source_dir)
             bridge = DiscordBridge(
                 service_url=args.discord_service_url,
                 session_id=discord_session_id,
                 enabled=True,
+                shared_secret=args.discord_shared_secret,
             )
             bridge.attach(
                 snapshot_provider=lambda sd=source_dir, sid=discord_session_id: controller.snapshot(sd, session_id=sid),
@@ -1665,14 +1927,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             bridge.notify_event(payload, controller.snapshot(source_dir, session_id=bridge.session_id))
 
         controller.add_event_sink(notify_discord_event)
-    folder_locks = [SourceDirLock(source_dir=source_dir, session_id=controller.session_id, enabled=args.no_discord) for source_dir in source_dirs]
-    if args.no_discord:
+    folder_locks = [SourceDirLock(source_dir=source_dir, session_id=controller.session_id, enabled=True) for source_dir in source_dirs]
+    if args.discord_enabled:
         print(f"[discord] enabled: session_id={controller.session_id}", flush=True)
         print(f"[discord] service_url={args.discord_service_url}", flush=True)
         for source_dir, bridge in bridges:
             print(f"[discord] source_dir={source_dir} | discord_session_id={bridge.session_id}", flush=True)
     else:
-        print("[discord] disabled; run with --discord to publish this session", flush=True)
+        print("[discord] disabled", flush=True)
     acquired_locks: List[SourceDirLock] = []
     try:
         for folder_lock in folder_locks:
@@ -1683,13 +1945,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             folder_lock.release()
         print(f"[runner] {exc}", file=sys.stderr)
         return 2
-    if args.no_discord:
-        for folder_lock in folder_locks:
-            print(f"[discord] folder lock acquired: {folder_lock.path}", flush=True)
+    for folder_lock in folder_locks:
+        print(f"[runner] folder lock acquired: {folder_lock.path}", flush=True)
     controller.start()
     for _, bridge in bridges:
         bridge.start()
-    if args.no_discord:
+    if args.discord_enabled:
         connected_count = sum(1 for _, bridge in bridges if bridge.connected)
         if connected_count == len(bridges):
             print("[discord] runner registered in bot service", flush=True)
@@ -1705,8 +1966,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 bridge.stop()
             for folder_lock in folder_locks:
                 folder_lock.release()
-            if args.no_discord:
-                print("[discord] bridge stopped; folder lock released", flush=True)
+            if args.discord_enabled:
+                print("[discord] bridge stopped", flush=True)
+            print("[runner] folder lock released", flush=True)
 
     print_help()
     while not controller.is_finished():
@@ -1758,8 +2020,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             bridge.stop()
         for folder_lock in folder_locks:
             folder_lock.release()
-        if args.no_discord:
-            print("[discord] bridge stopped; folder lock released", flush=True)
+        if args.discord_enabled:
+            print("[discord] bridge stopped", flush=True)
+        print("[runner] folder lock released", flush=True)
 
 
 if __name__ == "__main__":

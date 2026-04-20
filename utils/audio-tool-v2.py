@@ -50,6 +50,7 @@ MIN_OUT_BYTES = 1024  # sanity check
 DEFAULT_TMP_CODEC = "flac"  # preferred intermediate for "complex" EDIT
 STATE_DIR_NAME = ".state"
 AUDIO_MARKER = "AUDIO_DONE"
+RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 
 
 class AudioToolError(RuntimeError):
@@ -60,6 +61,10 @@ class AudioToolError(RuntimeError):
 
 def eprint(*a: Any) -> None:
     print(*a, file=sys.stderr)
+
+
+def runner_managed_state() -> bool:
+    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 class TeeStream:
@@ -658,7 +663,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     workdir = resolved_plan.paths.workdir
     setup_logging(args.log, workdir)
     marker = marker_path(workdir)
-    if marker.exists() and not args.overwrite:
+    if marker.exists() and not args.overwrite and not runner_managed_state():
         print(f"[{TOOL_NAME}] skip: marker exists: {marker}")
         return 0
 
@@ -924,7 +929,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 pass
 
         print(f"[{TOOL_NAME}] done. outputs={len(outputs)} manifest=00_meta/audio_manifest.json")
-        write_marker(workdir)
+        if not runner_managed_state():
+            write_marker(workdir)
         return 0
 
     except AudioToolError as ex:

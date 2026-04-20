@@ -50,6 +50,7 @@ from utils.plan_model import resolve_file_plan
 
 STATE_DIR_NAME = ".state"
 MUX_MARKER = "MUX_DONE"
+RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 CRF_METADATA_STEP = 1.0
 SOURCE_BITRATE_TIMEOUT_SEC = 30.0
 SOURCE_BITRATE_TIMEOUT_CHECK_EVERY = 2048
@@ -147,6 +148,9 @@ def write_marker(workdir: Path) -> None:
     p = marker_path(workdir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("ok\n", encoding="utf-8")
+
+def runner_managed_state() -> bool:
+    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 def read_json(p: Path) -> Any:
     return json.loads(p.read_text(encoding="utf-8"))
@@ -1194,7 +1198,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     mkvmerge = which_or(args.mkvmerge)
     setup_logging(args.log, workdir)
     marker = marker_path(workdir)
-    if marker.exists():
+    if marker.exists() and not runner_managed_state():
         print(f"[mux] skip: marker exists: {marker}")
         return 0
 
@@ -1242,7 +1246,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         run_cmd(cmd)
 
         print("[mux] OK")
-        write_marker(workdir)
+        if not runner_managed_state():
+            write_marker(workdir)
         return 0
 
     except Exception as ex:

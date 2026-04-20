@@ -105,11 +105,61 @@ def emit_runner_child_event(stage: str, status: str, *, message: str = "", sourc
         return
 
 
+RUN_STAGE_ALIASES = {
+    "1": {1},
+    "stage1": {1},
+    "psd": {1},
+    "psd-scene": {1},
+    "psd-scene-detection": {1},
+    "2": {2},
+    "stage2": {2},
+    "fastpass": {2},
+    "fast-pass": {2},
+    "av1an-scene": {2},
+    "av1an-scene-detection": {2},
+    "3": {3},
+    "stage3": {3},
+    "ssimu2": {3},
+    "ssimu2-metrics": {3},
+    "metrics": {3},
+    "4": {4},
+    "stage4": {4},
+    "base-scenes": {4},
+    "base_scenes": {4},
+    "crf": {4},
+    "write-crf": {4},
+    "5": {5},
+    "stage5": {5},
+    "rules": {5},
+    "all": {1, 2, 3, 4, 5},
+}
+
+
+def resolve_run_stages(items: List[str], legacy_stage: int) -> set[int]:
+    if not items:
+        return {1, 2, 3, 4, 5} if int(legacy_stage) == 0 else {int(legacy_stage)}
+    out: set[int] = set()
+    for item in items:
+        for token in str(item or "").replace(",", " ").split():
+            key = token.strip().lower().replace("_", "-")
+            if not key:
+                continue
+            stages = RUN_STAGE_ALIASES.get(key)
+            if stages is None:
+                raise RuntimeError(f"Unknown --run-stages token: {token}")
+            out.update(stages)
+    if not out:
+        raise RuntimeError("--run-stages did not select any stages")
+    return out
+
+
 def main() -> int:
     """CLI entry point that orchestrates stages and resume logic."""
     parser = argparse.ArgumentParser(description="auto-boost 2.8.json + av1an fastpass + per-scene CRF zones + resume.")
     parser.add_argument("-s", "--stage", type=int, default=0,
                         help="Stage: 0=all, 1=PSD scenes (sdm=psd), 2=fastpass, 3=metrics, 4=write base scenes.json, 5=apply rules.")
+    parser.add_argument("--run-stages", action="append", default=[],
+                        help="Comma/space separated stage names to run: psd, fastpass, ssimu2, base-scenes, rules, all.")
     parser.add_argument("-i", "--input", required=True, help="Input video file (source).")
     parser.add_argument("-t", "--temp", default=None,
                         help="Project directory. Default: <input stem>_autoboost next to input.")
@@ -289,11 +339,18 @@ def main() -> int:
         av1an_progress_jsonl = project_dir / av1an_progress_jsonl
 
     marks = marker_paths(project_dir)
+    run_stages = resolve_run_stages([str(item) for item in (args.run_stages or [])], int(args.stage))
+
+    def should_run(*stage_numbers: int) -> bool:
+        return bool(run_stages.intersection({int(n) for n in stage_numbers}))
+
+    def only_stage(stage_number: int) -> bool:
+        return run_stages == {int(stage_number)}
 
     rule_name: Optional[str] = None
     compiled_rules: Optional[Any] = None
     required_metrics: List[str] = []
-    if args.stage in (0, 5):
+    if should_run(5):
         if args.rules or args.rules_inline:
             if args.rules:
                 rules_path = Path(args.rules).expanduser().resolve()
@@ -339,9 +396,9 @@ def main() -> int:
     # -----------------
     # Stage 1: PSD (scene detection)
     # -----------------
-    if args.stage in (0, 1):
+    if should_run(1):
         if args.sdm == "av1an":
-            if args.stage == 1:
+            if only_stage(1):
                 print("[skip] --sdm av1an uses av1an scene detection during stage 2.")
         else:
             if args.base_scenes:
@@ -374,7 +431,7 @@ def main() -> int:
     # -----------------
     # Stage 2: fast-pass
     # -----------------
-    if args.stage in (0, 2):
+    if should_run(2):
         if args.no_fastpass and args.sdm == "psd":
             print("[skip] no-fastpass enabled; fast-pass skipped for sdm=psd.")
             emit_runner_child_event("Fastpass", "skipped", message="no_fastpass", source=input_file, workdir=project_dir)
@@ -487,7 +544,7 @@ def main() -> int:
 
     frames_count = 0
     scene_ranges: List[Tuple[int, int]] = []
-    if args.stage in (0, 3, 4, 5):
+    if should_run(3, 4, 5):
         if args.sdm == "av1an":
             if base_scenes_path.exists():
                 raw = load_json(base_scenes_path)
@@ -509,7 +566,7 @@ def main() -> int:
     # -----------------
     # Stage 3: metrics
     # -----------------
-    if args.stage in (0, 3):
+    if should_run(3):
         if args.no_fastpass:
             print("[skip] no-fastpass enabled; metrics skipped.")
             emit_runner_child_event("SSIMU2 Metrics", "skipped", message="no_fastpass", source=input_file, workdir=project_dir)
@@ -543,83 +600,93 @@ def main() -> int:
     # Stage 4: base scenes
     # -----------------
     stage4_out_scenes_path = preview_scenes_path if args.stop_before_stage4 else out_scenes_path
-    if args.stage in (0, 4):
-        if args.stop_before_stage4:
-            stage4_ready = is_valid_final_scenes(stage4_out_scenes_path)
-        else:
-            stage4_ready = marks["final"].exists() and is_valid_final_scenes(stage4_out_scenes_path)
-
-        if stage4_ready:
+    if should_run(4):
+        try:
             if args.stop_before_stage4:
-                print(f"[resume] preview scenes already written: {stage4_out_scenes_path}")
+                stage4_ready = is_valid_final_scenes(stage4_out_scenes_path)
             else:
-                print(f"[resume] base scenes already written: {stage4_out_scenes_path}")
-        else:
-            if args.no_fastpass:
-                write_uniform_scenes(
-                    base_scenes_path=base_scenes_path,
-                    out_scenes_path=stage4_out_scenes_path,
-                    encoder=str(args.encoder),
-                    base_crf=float(args.quality),
-                    final_preset=final_preset,
-                    video_params=str(args.video_params),
-                    final_override=str(args.final_override),
-                )
-            else:
-                _, per_chunk_5, avg_total = compute_chunk_5p_single_metric(
-                    scene_ranges=scene_ranges,
-                    ssimu2_path=ssimu2_log,
-                )
-                
-                avg_total_adj = apply_avg_func(avg_total, args.avg_func)
-                if str(args.avg_func).strip():
-                    print(f"[avg-func] {avg_total} -> {avg_total_adj} ({args.avg_func})")
+                stage4_ready = marks["final"].exists() and is_valid_final_scenes(stage4_out_scenes_path)
 
-                aggressive_val = args.aggressive
-                pos_val = args.pos_dev_multiplier
-                neg_val = args.neg_dev_multiplier
-                if aggressive_val is not None:
-                    pos_dev_multiplier = float(aggressive_val)
-                    neg_dev_multiplier = float(aggressive_val)
+            if stage4_ready:
+                if args.stop_before_stage4:
+                    print(f"[resume] preview scenes already written: {stage4_out_scenes_path}")
                 else:
-                    if (pos_val is None) != (neg_val is None):
-                        raise RuntimeError(
-                            "Specify either --aggressive or both --pos-dev-multiplier and --neg-dev-multiplier."
-                        )
-                    if pos_val is None and neg_val is None:
-                        pos_dev_multiplier = 1.0
-                        neg_dev_multiplier = 1.0
-                    else:
-                        pos_dev_multiplier = float(pos_val)
-                        neg_dev_multiplier = float(neg_val)
-
-                apply_crf_adjustments_to_scenes(
-                    base_scenes_path=base_scenes_path,
-                    out_scenes_path=stage4_out_scenes_path,
-                    scene_ranges=scene_ranges,
-                    per_chunk_5=per_chunk_5,
-                    avg_total=avg_total_adj,
-                    encoder=str(args.encoder),
-                    base_crf=float(args.quality),
-                    pos_dev_multiplier=pos_dev_multiplier,
-                    neg_dev_multiplier=neg_dev_multiplier,
-                    deviation=float(args.deviation),
-                    max_positive_dev=args.max_positive_dev,
-                    max_negative_dev=args.max_negative_dev,
-                    final_preset=final_preset,
-                    video_params=str(args.video_params),
-                    final_override=str(args.final_override)
-                )
-            if args.stop_before_stage4:
-                print(f"[ok] preview scenes written: {stage4_out_scenes_path}")
+                    print(f"[resume] base scenes already written: {stage4_out_scenes_path}")
             else:
-                touch(marks["final"])
+                if args.no_fastpass:
+                    write_uniform_scenes(
+                        base_scenes_path=base_scenes_path,
+                        out_scenes_path=stage4_out_scenes_path,
+                        encoder=str(args.encoder),
+                        base_crf=float(args.quality),
+                        final_preset=final_preset,
+                        video_params=str(args.video_params),
+                        final_override=str(args.final_override),
+                    )
+                else:
+                    _, per_chunk_5, avg_total = compute_chunk_5p_single_metric(
+                        scene_ranges=scene_ranges,
+                        ssimu2_path=ssimu2_log,
+                    )
+
+                    avg_total_adj = apply_avg_func(avg_total, args.avg_func)
+                    if str(args.avg_func).strip():
+                        print(f"[avg-func] {avg_total} -> {avg_total_adj} ({args.avg_func})")
+
+                    aggressive_val = args.aggressive
+                    pos_val = args.pos_dev_multiplier
+                    neg_val = args.neg_dev_multiplier
+                    if aggressive_val is not None:
+                        pos_dev_multiplier = float(aggressive_val)
+                        neg_dev_multiplier = float(aggressive_val)
+                    else:
+                        if (pos_val is None) != (neg_val is None):
+                            raise RuntimeError(
+                                "Specify either --aggressive or both --pos-dev-multiplier and --neg-dev-multiplier."
+                            )
+                        if pos_val is None and neg_val is None:
+                            pos_dev_multiplier = 1.0
+                            neg_dev_multiplier = 1.0
+                        else:
+                            pos_dev_multiplier = float(pos_val)
+                            neg_dev_multiplier = float(neg_val)
+
+                    apply_crf_adjustments_to_scenes(
+                        base_scenes_path=base_scenes_path,
+                        out_scenes_path=stage4_out_scenes_path,
+                        scene_ranges=scene_ranges,
+                        per_chunk_5=per_chunk_5,
+                        avg_total=avg_total_adj,
+                        encoder=str(args.encoder),
+                        base_crf=float(args.quality),
+                        pos_dev_multiplier=pos_dev_multiplier,
+                        neg_dev_multiplier=neg_dev_multiplier,
+                        deviation=float(args.deviation),
+                        max_positive_dev=args.max_positive_dev,
+                        max_negative_dev=args.max_negative_dev,
+                        final_preset=final_preset,
+                        video_params=str(args.video_params),
+                        final_override=str(args.final_override)
+                    )
+                if args.stop_before_stage4:
+                    print(f"[ok] preview scenes written: {stage4_out_scenes_path}")
+                else:
+                    touch(marks["final"])
+        except Exception as exc:
+            emit_runner_child_event(
+                "SSIMU2 Metrics",
+                "failed",
+                message=f"base-scenes: {exc}",
+                source=input_file,
+                workdir=project_dir,
+            )
+            raise
 
     if args.stop_before_stage4:
         print(f"Base scenes    : {base_scenes_path}")
         print(f"Fast-pass      : {fastpass_out}")
         print(f"SSIMU2 log     : {ssimu2_log}")
-        if args.stage in (0, 4):
+        if should_run(4):
             print("[stop] requested stop before stage 5; preview scenes prepared.")
             print(f"Preview scenes : {preview_scenes_path}")
         else:
@@ -629,9 +696,9 @@ def main() -> int:
     # -----------------
     # Stage 5: apply rules
     # -----------------
-    if args.stage in (0, 5):
+    if should_run(5):
         if compiled_rules is None:
-            if args.stage == 5:
+            if only_stage(5):
                 print("[skip] no rules provided for stage 5.")
         else:
             if marks["rules"].exists() and is_valid_final_scenes(out_scenes_path):

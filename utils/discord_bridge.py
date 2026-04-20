@@ -6,24 +6,34 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 
 CommandHandler = Callable[[str], str]
 SnapshotProvider = Callable[[], Dict[str, Any]]
+DEFAULT_MAX_OUTBOX_ITEMS = 200
 
 
 class DiscordBridge:
     """Best-effort local bridge from runner to the Discord bot service."""
 
-    def __init__(self, *, service_url: str, session_id: str, enabled: bool) -> None:
+    def __init__(
+        self,
+        *,
+        service_url: str,
+        session_id: str,
+        enabled: bool,
+        shared_secret: str = "",
+        max_outbox_items: int = DEFAULT_MAX_OUTBOX_ITEMS,
+    ) -> None:
         self.service_url = service_url.rstrip("/")
         self.session_id = session_id
         self.enabled = bool(enabled and self.service_url)
+        self.shared_secret = str(shared_secret or "")
         self.snapshot_provider: Optional[SnapshotProvider] = None
         self.command_handler: Optional[CommandHandler] = None
         self.stop_event = threading.Event()
-        self.outbox: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self.outbox: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max(1, int(max_outbox_items)))
         self.sender = threading.Thread(target=self._sender_main, name="discord-bridge-sender", daemon=True)
         self.poller = threading.Thread(target=self._poller_main, name="discord-bridge-poller", daemon=True)
         self.connected = False
@@ -60,25 +70,43 @@ class DiscordBridge:
     def notify_event(self, event: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
         if not self.enabled:
             return
-        self.outbox.put(
+        low_priority = str(event.get("event") or "") == "runner_heartbeat"
+        self._enqueue(
             {
                 "path": f"/api/sessions/{self.session_id}/events",
                 "payload": {
                     "event": event,
                     "snapshot": snapshot,
                 },
-            }
+            },
+            drop_if_full=low_priority,
         )
 
     def notify_snapshot(self) -> None:
         if not self.enabled or self.snapshot_provider is None:
             return
-        self.outbox.put(
+        self._enqueue(
             {
                 "path": f"/api/sessions/{self.session_id}/snapshot",
                 "payload": {"snapshot": self.snapshot_provider()},
             }
         )
+
+    def _enqueue(self, item: Dict[str, Any], *, drop_if_full: bool = False) -> None:
+        try:
+            self.outbox.put_nowait(item)
+            return
+        except queue.Full:
+            if drop_if_full:
+                return
+        try:
+            self.outbox.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.outbox.put_nowait(item)
+        except queue.Full:
+            pass
 
     def _sender_main(self) -> None:
         while not self.stop_event.is_set() or not self.outbox.empty():
@@ -125,8 +153,12 @@ class DiscordBridge:
 
     def _get(self, path: str, *, timeout: float = 2.0) -> Any:
         url = self.service_url + path
+        headers = {}
+        if self.shared_secret:
+            headers["X-PBBATCH-Discord-Secret"] = self.shared_secret
+        request = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw = response.read().decode("utf-8", errors="replace")
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             self._record_error(exc)
@@ -144,7 +176,10 @@ class DiscordBridge:
         request = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                **({"X-PBBATCH-Discord-Secret": self.shared_secret} if self.shared_secret else {}),
+            },
             method="POST",
         )
         try:

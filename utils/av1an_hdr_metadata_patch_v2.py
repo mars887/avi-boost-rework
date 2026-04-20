@@ -59,6 +59,7 @@ from typing import Any, Dict, List, Optional, Tuple
 LOG = logging.getLogger("av1an_hdrmeta_patch")
 STATE_DIR_NAME = ".state"
 HDR_PATCH_MARKER = "HDR_PATCH_DONE"
+RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 DEFAULT_ENCODER = "svt-av1"
 _MASTER_DISPLAY_PATTERN = re.compile(
     r"^G\((?P<gx>[0-9.]+),(?P<gy>[0-9.]+)\)"
@@ -253,6 +254,10 @@ def write_marker(workdir: Path) -> None:
     p = marker_path(workdir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("ok\n", encoding="utf-8")
+
+
+def runner_managed_state() -> bool:
+    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def require_tool(name: str) -> None:
@@ -1104,7 +1109,7 @@ def main() -> None:
     workdir = Path(args.workdir).resolve()
     setup_logging(args.log, args.verbose, workdir)
     marker = marker_path(workdir)
-    if marker.exists():
+    if marker.exists() and not runner_managed_state():
         LOG.info("Skip: marker exists: %s", marker)
         return
     workdir.mkdir(parents=True, exist_ok=True)
@@ -1235,7 +1240,8 @@ def main() -> None:
     # Save patched scenes
     out_path = (workdir / args.output).resolve()
     dump_json(out_path, scenes_data)
-    write_marker(workdir)
+    if not runner_managed_state():
+        write_marker(workdir)
 
     LOG.info("---------------------------------------------------")
     LOG.info("Done.")

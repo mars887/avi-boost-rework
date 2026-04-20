@@ -39,6 +39,9 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8794
 MAX_EMBED_FIELD = 1024
 MAX_UPLOAD_MB_DEFAULT = 25
+COMMAND_LEASE_SECONDS_DEFAULT = 30.0
+LOADER_FILE_TTL_SECONDS = 600.0
+ADMINS_ONLY = False
 
 COMMANDS = {
     "pause_after_current": "Pause",
@@ -71,6 +74,8 @@ class BotConfig:
     max_upload_mb: int
     admin_role_id: int = 0
     operator_role_id: int = 0
+    admins_only: bool = False
+    shared_secret: str = ""
 
 
 class StateStore:
@@ -116,6 +121,7 @@ class StateStore:
                 status text not null,
                 message text not null,
                 created_at real not null,
+                sent_at real,
                 acked_at real
             );
             create table if not exists events (
@@ -130,6 +136,7 @@ class StateStore:
         self._ensure_column("folders", "updates_paused", "integer not null default 0")
         self._ensure_column("folders", "major_interval_seconds", "integer not null default 15")
         self._ensure_column("folders", "progress_interval_seconds", "integer not null default 60")
+        self._ensure_column("commands", "sent_at", "real")
         self.db.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -302,18 +309,24 @@ class StateStore:
         self.db.commit()
         return command_id
 
-    def pending_commands(self, session_id: str) -> List[Dict[str, str]]:
+    def pending_commands(self, session_id: str, *, lease_seconds: float = COMMAND_LEASE_SECONDS_DEFAULT) -> List[Dict[str, str]]:
+        now = time.time()
+        lease_before = now - max(1.0, float(lease_seconds))
         rows = self.db.execute(
             """
             select command_id, name from commands
-            where session_id = ? and status = 'pending'
+            where session_id = ?
+              and (
+                status = 'pending'
+                or (status = 'sent' and coalesce(sent_at, 0) <= ?)
+              )
             order by created_at asc
             """,
-            (session_id,),
+            (session_id, lease_before),
         ).fetchall()
         self.db.executemany(
-            "update commands set status='sent' where command_id=?",
-            [(str(row["command_id"]),) for row in rows],
+            "update commands set status='sent', sent_at=? where command_id=?",
+            [(now, str(row["command_id"])) for row in rows],
         )
         self.db.commit()
         return [{"command_id": str(row["command_id"]), "name": str(row["name"])} for row in rows]
@@ -346,6 +359,8 @@ def load_config(args: argparse.Namespace) -> BotConfig:
         ),
         admin_role_id=discord_config_int("PBBATCH_DISCORD_ADMIN_ROLE_ID", 0, file_values=file_values),
         operator_role_id=discord_config_int("PBBATCH_DISCORD_OPERATOR_ROLE_ID", 0, file_values=file_values),
+        admins_only=bool(discord_config_int("PBBATCH_DISCORD_ADMINS_ONLY", 1 if ADMINS_ONLY else 0, file_values=file_values)),
+        shared_secret=discord_config_value("PBBATCH_DISCORD_SHARED_SECRET", "", file_values=file_values),
     )
 
 
@@ -472,7 +487,7 @@ def progress_bar(progress: Any, width: int = 23) -> str:
     except Exception:
         value = -1.0
     percent_text = "--.-%" if value < 0 else f"  {max(0.0, min(100.0, value)):.1f}%"
-    inner_width = max(4, int(width) - 2 - len(percent_text))
+    inner_width = max(4, int(width) - 3 - len(percent_text))
     if value < 0:
         return "[" + ("-" * inner_width) + "]" + percent_text
     value = max(0.0, min(100.0, value))
@@ -714,12 +729,13 @@ def render_overview_embed(snapshot: Dict[str, Any]) -> Any:
         lines.append(f"{icon} | {suffix}".rstrip())
 
     for item in list(snapshot.get("completed") or [])[-8:]:
+        skipped = str(item.get("status") or "").lower() == "skipped"
         row(
-            DONE_SQUARE,
+            IDLE_SQUARE if skipped else DONE_SQUARE,
             item,
             f"{fmt_duration(item.get('duration_seconds')):<7}",
             f"{fmt_size_pair(item.get('source_size'), item.get('output_size')):<20}",
-            fmt_seconds(item.get("elapsed_seconds")),
+            "skipped" if skipped else fmt_seconds(item.get("elapsed_seconds")),
         )
     for item in list(snapshot.get("failed") or [])[-6:]:
         row(
@@ -920,14 +936,21 @@ async def run_bot(config: BotConfig) -> None:
     latest_session_by_source: Dict[str, str] = {}
     channel_locks: Dict[str, Any] = {}
     dashboard_locks: Dict[str, Any] = {}
-    loader_files: Dict[str, Path] = {}
+    loader_files: Dict[str, Tuple[Path, float]] = {}
     last_channel_rename_at: Dict[str, float] = {}
 
     def is_authorized(interaction: Any) -> bool:
+        user = getattr(interaction, "user", None)
+        permissions = getattr(user, "guild_permissions", None)
+        roles = getattr(user, "roles", []) or []
+        role_ids = {int(getattr(role, "id", 0)) for role in roles}
+        is_admin = bool(getattr(permissions, "administrator", False)) or (
+            bool(config.admin_role_id) and config.admin_role_id in role_ids
+        )
+        if config.admins_only:
+            return is_admin
         if config.admin_role_id == 0 and config.operator_role_id == 0:
             return True
-        roles = getattr(getattr(interaction, "user", None), "roles", []) or []
-        role_ids = {int(getattr(role, "id", 0)) for role in roles}
         return bool(role_ids.intersection({config.admin_role_id, config.operator_role_id}))
 
     def active_stage_label(plan: Dict[str, Any]) -> str:
@@ -1236,8 +1259,14 @@ async def run_bot(config: BotConfig) -> None:
             self.token = token
 
         async def callback(self, interaction: Any) -> None:
-            target = loader_files.get(self.token)
-            if target is None:
+            cleanup_loader_files()
+            entry = loader_files.get(self.token)
+            if entry is None:
+                await interaction.response.send_message("File handle expired.", ephemeral=True)
+                return
+            target, expires_at = entry
+            if time.monotonic() > expires_at:
+                loader_files.pop(self.token, None)
                 await interaction.response.send_message("File handle expired.", ephemeral=True)
                 return
             try:
@@ -1245,11 +1274,19 @@ async def run_bot(config: BotConfig) -> None:
             except Exception as exc:
                 await interaction.response.send_message(f"Upload failed: `{truncate(exc, 180)}`", ephemeral=True)
 
+    def cleanup_loader_files() -> None:
+        now = time.monotonic()
+        for token, (_, expires_at) in list(loader_files.items()):
+            if expires_at <= now:
+                loader_files.pop(token, None)
+
     def build_loader_view(paths: List[Path]) -> Any:
+        cleanup_loader_files()
         view = discord.ui.View(timeout=600)
+        expires_at = time.monotonic() + LOADER_FILE_TTL_SECONDS
         for index, path in enumerate(paths[:20], start=1):
             token = uuid.uuid4().hex[:18]
-            loader_files[token] = path
+            loader_files[token] = (path, expires_at)
             view.add_item(LoaderFileButton(token=token, label=str(index)))
         return view
 
@@ -1364,6 +1401,9 @@ async def run_bot(config: BotConfig) -> None:
 
     @bot_group.command(name="status", description="Show runner and bot status for this folder.")
     async def bot_status(interaction: Any) -> None:
+        if not is_authorized(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
         row = latest_row_for_interaction(interaction)
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
@@ -1470,6 +1510,9 @@ async def run_bot(config: BotConfig) -> None:
 
     @loader_group.command(name="show", description="Show selected .plan workdir contents.")
     async def loader_show(interaction: Any, selector: str) -> None:
+        if not is_authorized(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
         row = latest_row_for_interaction(interaction)
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
@@ -1483,6 +1526,9 @@ async def run_bot(config: BotConfig) -> None:
             await interaction.response.send_message(f"Loader show failed: `{truncate(exc, 180)}`", ephemeral=True)
 
     async def loader_pass(interaction: Any, pass_name: str, selector: str, count: int, sort_mode: str) -> None:
+        if not is_authorized(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
         row = latest_row_for_interaction(interaction)
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
@@ -1550,6 +1596,9 @@ async def run_bot(config: BotConfig) -> None:
 
     @tree.command(name="panel", description="Refresh the PBBatch dashboard in this channel.", guild=guild_object)
     async def panel(interaction: Any) -> None:
+        if not is_authorized(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
         row = store.latest_session_for_channel(int(interaction.channel_id))
         if row is None:
             await interaction.response.send_message("No PBBatch session is known for this channel.", ephemeral=True)
@@ -1577,6 +1626,9 @@ async def run_bot(config: BotConfig) -> None:
         ]
     )
     async def pbbatch_file(interaction: Any, kind: app_commands.Choice[str]) -> None:
+        if not is_authorized(interaction):
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
         row = store.latest_session_for_channel(int(interaction.channel_id))
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
@@ -1696,7 +1748,15 @@ async def run_bot(config: BotConfig) -> None:
             await update_dashboard(snapshot, force=True)
         return web.json_response({"status": "ok"})
 
-    app = web.Application()
+    @web.middleware
+    async def shared_secret_middleware(request: Any, handler: Any) -> Any:
+        if config.shared_secret:
+            received = str(request.headers.get("X-PBBATCH-Discord-Secret") or "")
+            if received != config.shared_secret:
+                return web.json_response({"status": "error", "message": "unauthorized"}, status=401)
+        return await handler(request)
+
+    app = web.Application(middlewares=[shared_secret_middleware])
     app.router.add_post("/api/sessions/register", http_register)
     app.router.add_post("/api/sessions/{session_id}/snapshot", http_snapshot)
     app.router.add_post("/api/sessions/{session_id}/events", http_event)

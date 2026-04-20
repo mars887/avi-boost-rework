@@ -38,6 +38,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 STATE_DIR_NAME = ".state"
 ZONE_MARKER = "ZONE_EDIT_DONE"
+RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 
 
 class TeeStream:
@@ -137,6 +138,10 @@ def write_marker(out_path: Path) -> None:
     p = marker_path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("ok\n", encoding="utf-8")
+
+
+def runner_managed_state() -> bool:
+    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # Можно заполнить позже: {"--crf": Decimal("0.25"), "--someparam": Decimal("2")}
@@ -1120,7 +1125,7 @@ def main(argv: Sequence[str]) -> int:
     out_path = Path(args.out).resolve()
     setup_logging(args.log, out_path.parent)
     marker = marker_path(out_path)
-    if marker.exists():
+    if marker.exists() and not runner_managed_state():
         print(f"[skip] marker exists: {marker}")
         return 0
 
@@ -1153,7 +1158,8 @@ def main(argv: Sequence[str]) -> int:
     # Save
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(scenes_data, f, ensure_ascii=False, indent=2)
-    write_marker(out_path)
+    if not runner_managed_state():
+        write_marker(out_path)
 
     return 0
 

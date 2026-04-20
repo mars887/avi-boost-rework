@@ -4,6 +4,7 @@
 import argparse
 import atexit
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -19,6 +20,7 @@ except Exception:
 
 STATE_DIR_NAME = ".state"
 ATTACH_MARKER = "ATTACHMENTS_CLEAN_DONE"
+RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 
 
 # -----------------------------
@@ -132,6 +134,10 @@ def write_marker(workdir: Path) -> None:
     p = marker_path(workdir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("ok\n", encoding="utf-8")
+
+
+def runner_managed_state() -> bool:
+    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # -----------------------------
@@ -406,7 +412,7 @@ def main() -> int:
     setup_logging(args.log, subs_dir.parent)
     workdir = subs_dir.parent
     marker = marker_path(workdir)
-    if marker.exists():
+    if marker.exists() and not runner_managed_state():
         log(f"[skip] marker exists: {marker}")
         return 0
 
@@ -502,7 +508,7 @@ def main() -> int:
         warn(f"Failed to write report '{report_path}': {ex}")
 
     log("[ok]")
-    if not args.dry_run:
+    if not args.dry_run and not runner_managed_state():
         write_marker(workdir)
     return 0
 

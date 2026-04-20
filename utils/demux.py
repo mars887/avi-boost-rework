@@ -4,6 +4,7 @@
 import argparse
 import atexit
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ WIN_BAD = r'<>:"/\|?*'
 WIN_BAD_RE = re.compile(rf"[{re.escape(WIN_BAD)}]")
 STATE_DIR_NAME = ".state"
 DEMUX_MARKER = "DEMUX_DONE"
+RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 
 
 def eprint(*args: Any) -> None:
@@ -130,6 +132,10 @@ def write_marker(workdir: Path) -> None:
     p = marker_path(workdir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("ok\n", encoding="utf-8")
+
+
+def runner_managed_state() -> bool:
+    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def which_or(name: str, fallback: str) -> str:
@@ -543,7 +549,7 @@ def main() -> int:
 
     setup_logging(args.log, workdir)
     marker = marker_path(workdir)
-    if marker.exists() and not args.overwrite:
+    if marker.exists() and not args.overwrite and not runner_managed_state():
         print(f"[demux] skip: marker exists: {marker}")
         return 0
 
@@ -613,7 +619,8 @@ def main() -> int:
             "chapters": chapters_info,
         }
         write_json(workdir / "00_meta" / "demux_manifest.json", manifest)
-        write_marker(workdir)
+        if not runner_managed_state():
+            write_marker(workdir)
 
         print("[demux] OK")
         return 0
