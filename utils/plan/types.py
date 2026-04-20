@@ -98,6 +98,7 @@ class VideoPrimary:
     ab_neg_dev: float = 4.0
     ab_pos_multiplier: str = ""
     ab_neg_multiplier: str = ""
+    avg_func: str = ""
 
 
 @dataclass
@@ -266,6 +267,7 @@ class ResolvedFilePlan:
             "abNegDev": format_value(primary.ab_neg_dev),
             "abPosMultiplier": str(primary.ab_pos_multiplier or ""),
             "abNegMultiplier": str(primary.ab_neg_multiplier or ""),
+            "avgFunc": str(primary.avg_func or ""),
             "fastpass": details.fastpass_filter,
             "mainpass": details.mainpass_filter,
             "mainVpy": details.main_vpy,

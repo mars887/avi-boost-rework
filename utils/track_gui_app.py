@@ -90,6 +90,13 @@ class TrackConfigGui:
             ab_neg_dev=defaults_raw.get("abNegDev") or defaults_raw.get("ab_neg_dev") or "",
             ab_pos_multiplier=defaults_raw.get("abPosMultiplier") or defaults_raw.get("ab_pos_multiplier") or "",
             ab_neg_multiplier=defaults_raw.get("abNegMultiplier") or defaults_raw.get("ab_neg_multiplier") or "",
+            avg_func=(
+                defaults_raw.get("avgFunc")
+                or defaults_raw.get("avg_func")
+                or defaults_raw.get("abAvgFunc")
+                or defaults_raw.get("ab_avg_func")
+                or ""
+            ),
             main_vpy=defaults_raw.get("mainVpy") or defaults_raw.get("main_vpy") or "",
             fast_vpy=defaults_raw.get("fastVpy") or defaults_raw.get("fast_vpy") or "",
             proxy_vpy=defaults_raw.get("proxyVpy") or defaults_raw.get("proxy_vpy") or "",
@@ -323,6 +330,39 @@ class TrackConfigGui:
             return bool(re.fullmatch(r"\d*(?:\.\d*)?", proposed))
         return True
 
+    def _validate_avg_func_value(self, value):
+        text = str(value or "").strip()
+        if not text:
+            return True
+        try:
+            if text[0] in "+-" and len(text) > 1:
+                float(text)
+                return True
+            if text[0] == "!" and len(text) > 1:
+                float(text[1:])
+                return True
+            if "%" in text:
+                parts = text.split("%")
+                if len(parts) == 2:
+                    target, percent = parts
+                    if not target or not percent:
+                        return False
+                    float(target)
+                    float(percent)
+                    return True
+                if len(parts) == 3:
+                    down_percent, target, up_percent = parts
+                    if not down_percent or not target or not up_percent:
+                        return False
+                    float(down_percent)
+                    float(target)
+                    float(up_percent)
+                    return True
+                return False
+        except ValueError:
+            return False
+        return False
+
     def _find_first_track(self, track_type):
         normalized = normalize_type(track_type)
         for file_index in sorted(self.tracks_by_file):
@@ -541,6 +581,7 @@ class TrackConfigGui:
         self.ab_neg_multiplier_var = tk.StringVar(value=self.defaults.ab_neg_multiplier)
         self.ab_pos_dev_var = tk.StringVar(value=self.defaults.ab_pos_dev)
         self.ab_neg_dev_var = tk.StringVar(value=self.defaults.ab_neg_dev)
+        self.avg_func_var = tk.StringVar(value=self.defaults.avg_func)
         self.main_vpy_var = tk.StringVar(value=self.defaults.main_vpy)
         self.fast_vpy_var = tk.StringVar(value=self.defaults.fast_vpy)
         self.proxy_vpy_var = tk.StringVar(value=self.defaults.proxy_vpy)
@@ -653,6 +694,8 @@ class TrackConfigGui:
         self._build_labeled_entry(tuning_section, row, 0, "Neg multiplier", self.ab_neg_multiplier_var, numeric="float")
         row += 1
         self._build_labeled_entry(tuning_section, row, 0, "Max - dev", self.ab_neg_dev_var, numeric="int")
+        row += 1
+        self._build_labeled_entry(tuning_section, row, 0, "Avg Func", self.avg_func_var)
 
         script_section, row = self._build_section(
             grid,
@@ -701,6 +744,7 @@ class TrackConfigGui:
         self.mainpass_workers_var.trace_add("write", self.on_defaults_change)
         self.ab_pos_dev_var.trace_add("write", self.on_defaults_change)
         self.ab_neg_dev_var.trace_add("write", self.on_defaults_change)
+        self.avg_func_var.trace_add("write", self.on_defaults_change)
         self.main_vpy_var.trace_add("write", self.on_defaults_change)
         self.fast_vpy_var.trace_add("write", self.on_defaults_change)
         self.proxy_vpy_var.trace_add("write", self.on_defaults_change)
@@ -1056,6 +1100,7 @@ class TrackConfigGui:
             ab_neg_dev=self._get_var_value("ab_neg_dev_var"),
             ab_pos_multiplier=self._get_var_value("ab_pos_multiplier_var"),
             ab_neg_multiplier=self._get_var_value("ab_neg_multiplier_var"),
+            avg_func=self._get_var_value("avg_func_var"),
             main_vpy=self._get_var_value("main_vpy_var"),
             fast_vpy=self._get_var_value("fast_vpy_var"),
             proxy_vpy=self._get_var_value("proxy_vpy_var"),
@@ -1400,6 +1445,12 @@ class TrackConfigGui:
 
     def on_apply(self):
         self.defaults = self._current_defaults()
+        if not self._validate_avg_func_value(self.defaults.avg_func):
+            messagebox.showwarning(
+                "Invalid Avg Func",
+                "Avg Func must be empty or use one of: +N, -N, !N, target%percent, downpercent%target%uppercent.",
+            )
+            return
         result, _ = build_results(self.files, self.tracks_by_file, self.settings, self.defaults)
         missing = []
         mismatch = []
@@ -1485,6 +1536,7 @@ class TrackConfigGui:
             "ab_neg_dev": self.defaults.ab_neg_dev,
             "ab_pos_multiplier": self.defaults.ab_pos_multiplier,
             "ab_neg_multiplier": self.defaults.ab_neg_multiplier,
+            "avg_func": self.defaults.avg_func,
             "main_vpy": self.defaults.main_vpy,
             "fast_vpy": self.defaults.fast_vpy,
             "proxy_vpy": self.defaults.proxy_vpy,

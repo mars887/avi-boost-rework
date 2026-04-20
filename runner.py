@@ -44,6 +44,7 @@ from utils.runner_state import (
     STAGE_SSIMU2,
     STAGE_VERIFY,
     STAGE_ZONE_EDIT,
+    autoboost_fastpass_output,
     autoboost_scene_stage,
     clear_stage_marker,
     display_stage_plan,
@@ -124,6 +125,8 @@ class ActivePlanState:
         source_size = self.item.source.stat().st_size if self.item.source.exists() else 0
         output_path = self.item.source.parent / f"{self.item.source.stem}-av1.mkv"
         output_size = output_path.stat().st_size if output_path.exists() else 0
+        fastpass_output_path = fastpass_output_path_for_item(self.item)
+        fastpass_output_size = fastpass_output_path.stat().st_size if fastpass_output_path.exists() else 0
         elapsed = 0.0
         if self.started_at:
             elapsed = (self.ended_at or time.time()) - self.started_at
@@ -139,6 +142,8 @@ class ActivePlanState:
             "duration_seconds": probe_source_duration(self.item.source),
             "output": str(output_path),
             "output_size": output_size,
+            "fastpass_output": str(fastpass_output_path),
+            "fastpass_output_size": fastpass_output_size,
             "workdir": str(self.item.workdir),
             "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -160,6 +165,8 @@ class FinishedPlanState:
     def snapshot(self) -> Dict[str, Any]:
         output_path = self.item.source.parent / f"{self.item.source.stem}-av1.mkv"
         output_size = output_path.stat().st_size if output_path.exists() else 0
+        fastpass_output_path = fastpass_output_path_for_item(self.item)
+        fastpass_output_size = fastpass_output_path.stat().st_size if fastpass_output_path.exists() else 0
         source_size = self.item.source.stat().st_size if self.item.source.exists() else 0
         return {
             "plan_run_id": self.plan_run_id,
@@ -172,6 +179,8 @@ class FinishedPlanState:
             "duration_seconds": probe_source_duration(self.item.source),
             "output": str(output_path),
             "output_size": output_size,
+            "fastpass_output": str(fastpass_output_path),
+            "fastpass_output_size": fastpass_output_size,
             "workdir": str(self.item.workdir),
             "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -265,6 +274,10 @@ class QueueItem:
     @property
     def name(self) -> str:
         return self.resolved.plan.meta.name or self.source.stem
+
+
+def fastpass_output_path_for_item(item: QueueItem) -> Path:
+    return autoboost_fastpass_output(item)
 
 
 def normalize_mode(value: str) -> str:
@@ -1298,6 +1311,8 @@ class SessionController:
                 auto_boost_cmd.extend(["--max-positive-dev", str(primary.ab_pos_dev)])
             if str(primary.ab_neg_dev).strip():
                 auto_boost_cmd.extend(["--max-negative-dev", str(primary.ab_neg_dev)])
+            if str(primary.avg_func).strip():
+                auto_boost_cmd.extend(["--avg-func", str(primary.avg_func).strip()])
             if details.fastpass_filter:
                 auto_boost_cmd.extend(["-f", str(details.fastpass_filter)])
 
@@ -1321,30 +1336,6 @@ class SessionController:
                 commands.append((STAGE_SSIMU2, auto_boost_cmd_for("ssimu2", "base-scenes")))
 
             if item.mode == "full":
-                hdr_cmd = [
-                    self.toolchain.vs_python_exe,
-                    str(UTILS_DIR / "av1an_hdr_metadata_patch_v2.py"),
-                    "--source",
-                    str(paths.source),
-                    "--scenes",
-                    str(workdir / "video" / "scenes.json"),
-                    "--output",
-                    str(workdir / "video" / "scenes-hdr.json"),
-                    "--workdir",
-                    str(workdir / "video" / "hdr_tmp"),
-                    "--encoder",
-                    str(primary.encoder),
-                    "--log",
-                    str(log_dir / "04_hdr_patch.log"),
-                ]
-                if primary.strict_sdr_8bit:
-                    hdr_cmd.append("--no-hdr10")
-                if primary.no_hdr10plus or primary.strict_sdr_8bit:
-                    hdr_cmd.append("--no-hdr10plus")
-                if primary.no_dolby_vision or primary.strict_sdr_8bit:
-                    hdr_cmd.append("--no-dv")
-                commands.append((STAGE_HDR_PATCH, hdr_cmd))
-
                 commands.append(
                     (
                         STAGE_ZONE_EDIT,
@@ -1354,16 +1345,40 @@ class SessionController:
                             "--source",
                             str(paths.source),
                             "--scenes",
-                            str(workdir / "video" / "scenes-hdr.json"),
+                            str(workdir / "video" / "scenes.json"),
                             "--out",
-                            str(workdir / "video" / "scenes-final.json"),
+                            str(workdir / "video" / "scenes-zoned.json"),
                             "--command",
                             str(paths.zone_file),
                             "--log",
-                            str(log_dir / "05_zone_edit.log"),
+                            str(log_dir / "04_zone_edit.log"),
                         ],
                     )
                 )
+
+                hdr_cmd = [
+                    self.toolchain.vs_python_exe,
+                    str(UTILS_DIR / "av1an_hdr_metadata_patch_v2.py"),
+                    "--source",
+                    str(paths.source),
+                    "--scenes",
+                    str(workdir / "video" / "scenes-zoned.json"),
+                    "--output",
+                    str(workdir / "video" / "scenes-final.json"),
+                    "--workdir",
+                    str(workdir / "video" / "hdr_tmp"),
+                    "--encoder",
+                    str(primary.encoder),
+                    "--log",
+                    str(log_dir / "05_hdr_patch.log"),
+                ]
+                if primary.strict_sdr_8bit:
+                    hdr_cmd.append("--no-hdr10")
+                if primary.no_hdr10plus or primary.strict_sdr_8bit:
+                    hdr_cmd.append("--no-hdr10plus")
+                if primary.no_dolby_vision or primary.strict_sdr_8bit:
+                    hdr_cmd.append("--no-dv")
+                commands.append((STAGE_HDR_PATCH, hdr_cmd))
 
                 main_input = mainpass_input_vpy or str(paths.source)
                 mainpass_cmd = [
@@ -1606,7 +1621,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-interactive", action="store_true")
     parser.add_argument("--exit-when-idle", action="store_true")
     parser.add_argument("--session-id", default="")
-    parser.add_argument(
+    discord_group = parser.add_mutually_exclusive_group()
+    discord_group.add_argument(
+        "--discord",
+        dest="discord_verbose",
+        action="store_true",
+        default=False,
+        help="Enable Discord integration and print Discord connection errors.",
+    )
+    discord_group.add_argument(
         "--no-discord",
         dest="discord_enabled",
         action="store_false",
@@ -1664,9 +1687,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 snapshot_provider=lambda sd=source_dir, sid=discord_session_id: controller.snapshot(sd, session_id=sid),
                 command_handler=lambda command, sd=source_dir: controller.handle_command(command, source_dir=sd),
             )
-            bridge.set_error_callback(
-                lambda message, sd=source_dir: print(f"[discord] bridge unavailable for {sd}: {message}", flush=True)
-            )
+            if args.discord_verbose:
+                bridge.set_error_callback(
+                    lambda message, sd=source_dir: print(f"[discord] bridge unavailable for {sd}: {message}", flush=True)
+                )
             bridges.append((source_dir, bridge))
 
         bridge_by_source = {source_dir: bridge for source_dir, bridge in bridges}
@@ -1707,7 +1731,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         connected_count = sum(1 for _, bridge in bridges if bridge.connected)
         if connected_count == len(bridges):
             print("[discord] runner registered in bot service", flush=True)
-        else:
+        elif args.discord_verbose:
             print(f"[discord] registered {connected_count}/{len(bridges)} folder sessions; runner will keep working locally", flush=True)
 
     if args.no_interactive:

@@ -46,7 +46,7 @@ def display_stage_plan(item: Any) -> List[str]:
         if not item.resolved.plan.video.primary.no_fastpass:
             stages.extend([STAGE_FASTPASS, STAGE_SSIMU2])
         if item.mode == "full":
-            stages.extend([STAGE_HDR_PATCH, STAGE_ZONE_EDIT, STAGE_MAINPASS])
+            stages.extend([STAGE_ZONE_EDIT, STAGE_HDR_PATCH, STAGE_MAINPASS])
     if item.mode == "full":
         stages.extend([STAGE_AUDIO, STAGE_VERIFY, STAGE_MUX])
     return stages
@@ -150,6 +150,21 @@ def autoboost_stage4_scenes(item: Any) -> Path:
     return autoboost_project_dir(item) / name
 
 
+def zone_edit_scenes(item: Any) -> Path:
+    return autoboost_project_dir(item) / "scenes-zoned.json"
+
+
+def final_scenes(item: Any) -> Path:
+    return autoboost_project_dir(item) / "scenes-final.json"
+
+
+def file_not_older_than(path: Path, dependency: Path) -> bool:
+    try:
+        return path.stat().st_mtime >= dependency.stat().st_mtime
+    except Exception:
+        return False
+
+
 def stage_marker_path(item: Any, stage: str) -> Optional[Path]:
     workdir = item.workdir
     state_dir = workdir / ".state"
@@ -192,9 +207,15 @@ def stage_marker_artifacts_valid(item: Any, stage: str) -> bool:
     if stage == STAGE_SSIMU2:
         return valid_ssimu2_log(autoboost_ssimu2_log(item))
     if stage == STAGE_HDR_PATCH:
-        return valid_scenes_json(item.workdir / "video" / "scenes-hdr.json", require_zone_overrides=True)
+        zoned = zone_edit_scenes(item)
+        final = final_scenes(item)
+        return (
+            valid_scenes_json(zoned, require_zone_overrides=True)
+            and valid_scenes_json(final, require_zone_overrides=True)
+            and file_not_older_than(final, zoned)
+        )
     if stage == STAGE_ZONE_EDIT:
-        return valid_scenes_json(item.workdir / "video" / "scenes-final.json", require_zone_overrides=True)
+        return valid_scenes_json(zone_edit_scenes(item), require_zone_overrides=True)
     if stage == STAGE_AUDIO:
         return valid_audio_manifest(item)
     if stage == STAGE_VERIFY:

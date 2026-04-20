@@ -32,15 +32,30 @@ def apply_avg_func(avg_total: float, avg_func: str) -> float:
             raise ValueError(f"Invalid --avg-func value: {avg_func!r}") from exc
         return target
     if "%" in s:
-        left, right = s.split("%", 1)
-        if not left or not right:
-            raise ValueError(f"Invalid --avg-func value: {avg_func!r}")
-        try:
-            target = float(left)
-            pct = float(right)
-        except ValueError as exc:
-            raise ValueError(f"Invalid --avg-func value: {avg_func!r}") from exc
-        return avg_total + (target - avg_total) * (pct / 100.0)
+        parts = s.split("%")
+        if len(parts) == 2:
+            left, right = parts
+            if not left or not right:
+                raise ValueError(f"Invalid --avg-func value: {avg_func!r}")
+            try:
+                target = float(left)
+                pct = float(right)
+            except ValueError as exc:
+                raise ValueError(f"Invalid --avg-func value: {avg_func!r}") from exc
+            return avg_total + (target - avg_total) * (pct / 100.0)
+        if len(parts) == 3:
+            down_pct_text, target_text, up_pct_text = parts
+            if not down_pct_text or not target_text or not up_pct_text:
+                raise ValueError(f"Invalid --avg-func value: {avg_func!r}")
+            try:
+                down_pct = float(down_pct_text)
+                target = float(target_text)
+                up_pct = float(up_pct_text)
+            except ValueError as exc:
+                raise ValueError(f"Invalid --avg-func value: {avg_func!r}") from exc
+            pct = down_pct if avg_total < target else up_pct
+            return avg_total + (target - avg_total) * (pct / 100.0)
+        raise ValueError(f"Invalid --avg-func value: {avg_func!r}")
     raise ValueError(f"Invalid --avg-func value: {avg_func!r}")
 
 

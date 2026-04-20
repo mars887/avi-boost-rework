@@ -276,7 +276,7 @@ def main() -> int:
     parser.add_argument("--neg-dev-multiplier", type=float, default=None,
                         help="Multiplier used when adj is negative (requires --pos-dev-multiplier if set).")
     parser.add_argument("--avg-func", default="",
-                        help="Adjust metric avg: +N/-N (shift), !N (set), or target%%percent (move toward target by percent).")
+                        help="Adjust metric avg: +N/-N (shift), !N (set), target%%percent, or downpercent%%target%%uppercent.")
 
     args = parser.parse_args()
     args.encoder = normalize_encoder(args.encoder)

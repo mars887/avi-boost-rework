@@ -66,6 +66,7 @@ def gui_defaults_from_file_plan(plan: FilePlan) -> Dict[str, Any]:
         "ab_neg_dev": format_value(primary.ab_neg_dev),
         "ab_pos_multiplier": str(primary.ab_pos_multiplier or ""),
         "ab_neg_multiplier": str(primary.ab_neg_multiplier or ""),
+        "avg_func": str(primary.avg_func or ""),
         "attach_encode_info": primary.attach_encode_info,
         "fastpass": details.fastpass_filter,
         "mainpass": details.mainpass_filter,
@@ -181,6 +182,13 @@ def file_plan_from_gui_result(
         ab_neg_dev=float(defaults.get("ab_neg_dev") or 4.0),
         ab_pos_multiplier=str(defaults.get("ab_pos_multiplier") or ""),
         ab_neg_multiplier=str(defaults.get("ab_neg_multiplier") or ""),
+        avg_func=str(
+            defaults.get("avg_func")
+            or defaults.get("avgFunc")
+            or defaults.get("ab_avg_func")
+            or defaults.get("abAvgFunc")
+            or ""
+        ),
     )
     video_details = VideoDetails(
         fastpass_filter=str(defaults.get("fastpass_filter") or ""),

@@ -127,6 +127,7 @@ class DefaultSettings:
         ab_neg_dev="",
         ab_pos_multiplier="",
         ab_neg_multiplier="",
+        avg_func="",
         main_vpy="",
         fast_vpy="",
         proxy_vpy="",
@@ -164,6 +165,7 @@ class DefaultSettings:
         self.ab_neg_dev = ab_neg_dev or ""
         self.ab_pos_multiplier = ab_pos_multiplier or ""
         self.ab_neg_multiplier = ab_neg_multiplier or ""
+        self.avg_func = avg_func or ""
         self.main_vpy = main_vpy or ""
         self.fast_vpy = fast_vpy or ""
         self.proxy_vpy = proxy_vpy or ""
@@ -452,6 +454,7 @@ def build_results(files, tracks_by_file, settings, defaults):
     default_ab_neg_dev = defaults.ab_neg_dev
     default_ab_pos_multiplier = defaults.ab_pos_multiplier
     default_ab_neg_multiplier = defaults.ab_neg_multiplier
+    default_avg_func = defaults.avg_func
     default_main_vpy = defaults.main_vpy
     default_fast_vpy = defaults.fast_vpy
     default_proxy_vpy = defaults.proxy_vpy
@@ -607,6 +610,7 @@ def build_results(files, tracks_by_file, settings, defaults):
                 track_mux["abNegDev"] = default_ab_neg_dev
                 track_mux["abPosMultiplier"] = default_ab_pos_multiplier
                 track_mux["abNegMultiplier"] = default_ab_neg_multiplier
+                track_mux["avgFunc"] = default_avg_func
                 track_mux["mainVpy"] = default_main_vpy
                 track_mux["fastVpy"] = default_fast_vpy
                 track_mux["proxyVpy"] = default_proxy_vpy
@@ -692,6 +696,7 @@ def build_default_defaults_dict():
         "ab_neg_dev": "4",
         "ab_pos_multiplier": "",
         "ab_neg_multiplier": "",
+        "avg_func": "",
         "main_vpy": "",
         "fast_vpy": "",
         "proxy_vpy": "",

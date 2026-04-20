@@ -484,7 +484,7 @@ def update_scene_bitrates(
 ) -> None:
     video_dir = workdir / "video"
     scenes_path = None
-    for name in ("scenes-final.json", "scenes-hdr.json", "scenes.json"):
+    for name in ("scenes-final.json", "scenes-zoned.json", "scenes-hdr.json", "scenes.json"):
         p = video_dir / name
         if p.exists():
             scenes_path = p

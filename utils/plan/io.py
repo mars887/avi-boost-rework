@@ -410,6 +410,13 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
                 ab_neg_dev=to_float(video_primary_data.get("ab_neg_dev"), 4.0),
                 ab_pos_multiplier=str(video_primary_data.get("ab_pos_multiplier") or ""),
                 ab_neg_multiplier=str(video_primary_data.get("ab_neg_multiplier") or ""),
+                avg_func=str(
+                    video_primary_data.get("avg_func")
+                    or video_primary_data.get("avgFunc")
+                    or video_primary_data.get("ab_avg_func")
+                    or video_primary_data.get("abAvgFunc")
+                    or ""
+                ),
             ),
             details=VideoDetails(
                 fastpass_filter=str(video_pipe_data.get("fastpass_filter") or video_details_data.get("fastpass_filter") or ""),
@@ -540,6 +547,7 @@ def _dump_file_plan(plan: FilePlan) -> str:
             f"ab_multiplier = {_toml_scalar(plan.video.primary.ab_multiplier)}",
             f"ab_neg_multiplier = {_toml_string(str(plan.video.primary.ab_neg_multiplier or ''))}",
             f"ab_neg_dev = {_toml_scalar(plan.video.primary.ab_neg_dev)}",
+            f"avg_func = {_toml_string(str(plan.video.primary.avg_func or ''))}",
             f"fastpass_preset = {_toml_scalar(coerce_scalar(plan.video.primary.fastpass_preset))}",
             "",
             "[video.pipeline]",

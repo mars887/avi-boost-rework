@@ -79,6 +79,7 @@ DEFAULT_GROUP_KEYS: Dict[str, Tuple[str, ...]] = {
         "ab_neg_dev",
         "ab_pos_multiplier",
         "ab_neg_multiplier",
+        "avg_func",
     ),
 }
 

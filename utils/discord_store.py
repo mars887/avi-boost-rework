@@ -39,6 +39,7 @@ class StateStore:
                 major_interval_seconds integer not null default 15,
                 progress_interval_seconds integer not null default 60,
                 startup_delay_seconds integer not null default 5,
+                inactive_message_id integer not null default 0,
                 updated_at real not null
             );
             create table if not exists sessions (
@@ -74,6 +75,7 @@ class StateStore:
         self._ensure_column("folders", "major_interval_seconds", "integer not null default 15")
         self._ensure_column("folders", "progress_interval_seconds", "integer not null default 60")
         self._ensure_column("folders", "startup_delay_seconds", "integer not null default 5")
+        self._ensure_column("folders", "inactive_message_id", "integer not null default 0")
         self._ensure_column("commands", "sent_at", "real")
         self.db.commit()
 
@@ -152,6 +154,17 @@ class StateStore:
             where source_dir=?
             """,
             (1 if paused else 0, time.time(), source_dir),
+        )
+        self.db.commit()
+
+    def set_inactive_message(self, source_dir: str, message_id: int) -> None:
+        self.db.execute(
+            """
+            update folders
+            set inactive_message_id=?, updated_at=?
+            where source_dir=?
+            """,
+            (int(message_id), time.time(), source_dir),
         )
         self.db.commit()
 

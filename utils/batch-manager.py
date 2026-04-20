@@ -503,7 +503,9 @@ def clear_stage_mainpass(group: SourceGroup) -> None:
 def clear_stage_zoning(group: SourceGroup) -> None:
     clear_stage_mainpass(group)
     remove_path(group.workdir / "video" / "scenes-final.json")
+    remove_path(group.workdir / "video" / "scenes-zoned.json")
     remove_path(group.workdir / "video" / ".state" / "FINAL_SCENES_COMPLETED")
+    remove_path(group.workdir / ".state" / "HDR_PATCH_DONE")
     remove_path(group.workdir / ".state" / "ZONE_EDIT_DONE")
 
 def clear_stage_crf_calc(group: SourceGroup) -> None:

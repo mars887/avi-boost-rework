@@ -47,6 +47,7 @@ MAX_EMBED_FIELD = 1024
 MAX_UPLOAD_MB_DEFAULT = 25
 LOADER_FILE_TTL_SECONDS = 600.0
 ADMINS_ONLY = False
+INACTIVE_MESSAGE_TEXT = "Runner is not connected for this folder. This message will be removed when a runner registers again."
 
 COMMANDS = {
     "pause_after_current": "Pause",
@@ -114,6 +115,8 @@ def channel_base_name_for_source(source_dir: str, alias: str = "") -> str:
 
 
 def channel_status_key(snapshot: Dict[str, Any], *, updates_paused: bool = False) -> str:
+    if str(snapshot.get("state") or "").strip().lower() == "offline":
+        return "idle"
     if list(snapshot.get("failed") or []):
         return "error"
     if updates_paused or bool(snapshot.get("paused")) or bool(snapshot.get("pause_after_current")):
@@ -185,6 +188,38 @@ def fmt_size_pair(source_size: Any, output_size: Any) -> str:
     except Exception:
         output = 0.0
     return f"{fmt_size(source_size)} -> {fmt_size(output)}" if output > 0 else f"{fmt_size(source_size)} -> -"
+
+
+def fastpass_output_size(item: Dict[str, Any]) -> int:
+    try:
+        size = int(float(item.get("fastpass_output_size") or 0))
+        if size > 0:
+            return size
+    except Exception:
+        pass
+    raw_path = str(item.get("fastpass_output") or "").strip()
+    candidates: List[Path] = []
+    if raw_path:
+        candidates.append(Path(raw_path))
+    workdir = str(item.get("workdir") or "").strip()
+    source = str(item.get("source") or "").strip()
+    if workdir and source:
+        candidates.append(Path(workdir) / "video" / "fastpass" / f"{Path(source).stem}.fastpass.mkv")
+    for path in candidates:
+        try:
+            if path.exists() and path.is_file():
+                return int(path.stat().st_size)
+        except Exception:
+            continue
+    return 0
+
+
+def fmt_plan_size_summary(item: Dict[str, Any]) -> str:
+    base = fmt_size_pair(item.get("source_size"), item.get("output_size"))
+    if str(item.get("mode") or "").strip().lower() != "fastpass":
+        return base
+    fp_size = fastpass_output_size(item)
+    return f"{base}  {fmt_size(fp_size) if fp_size > 0 else '-'}"
 
 
 def mode_label(value: Any) -> str:
@@ -473,7 +508,7 @@ def render_overview_embed(snapshot: Dict[str, Any]) -> Any:
             IDLE_SQUARE if skipped else DONE_SQUARE,
             item,
             f"{fmt_duration(item.get('duration_seconds')):<7}",
-            f"{fmt_size_pair(item.get('source_size'), item.get('output_size')):<20}",
+            plan_size_overview_field(item),
             "skipped" if skipped else fmt_seconds(item.get("elapsed_seconds")),
         )
     for item in list(snapshot.get("failed") or [])[-6:]:
@@ -499,6 +534,12 @@ def render_overview_embed(snapshot: Dict[str, Any]) -> Any:
     body = "\n".join(lines) if lines else "No plans yet."
     embed.description = "```text\n" + truncate(body, 3900) + "\n```"
     return embed
+
+
+def plan_size_overview_field(item: Dict[str, Any]) -> str:
+    summary = fmt_plan_size_summary(item)
+    width = 29 if str(item.get("mode") or "").strip().lower() == "fastpass" else 20
+    return f"{summary:<{width}}"
 
 
 def render_current_embed(snapshot: Dict[str, Any]) -> Any:
@@ -678,6 +719,7 @@ async def run_bot(config: BotConfig) -> None:
     dashboard_locks: Dict[str, Any] = {}
     loader_files: Dict[str, Tuple[Path, float]] = {}
     last_channel_rename_at: Dict[str, float] = {}
+    startup_reconciled = False
 
     def is_authorized(interaction: Any) -> bool:
         user = getattr(interaction, "user", None)
@@ -863,6 +905,46 @@ async def run_bot(config: BotConfig) -> None:
             store.set_channel(source_dir, int(channel.id), channel_name)
             return channel
 
+    async def find_existing_channel(source_dir: str, channel_id: int) -> Any:
+        await client.wait_until_ready()
+        guild = client.get_guild(config.guild_id)
+        if guild is None:
+            return None
+        if channel_id:
+            channel = client.get_channel(channel_id)
+            if channel is None:
+                try:
+                    channel = await guild.fetch_channel(channel_id)
+                except Exception:
+                    channel = None
+            if channel is not None:
+                return channel
+        category = guild.get_channel(config.category_id)
+        if category is None:
+            try:
+                category = await guild.fetch_channel(config.category_id)
+            except Exception:
+                category = None
+        candidates = list(getattr(category, "channels", []) or []) if category is not None else []
+        try:
+            fetched_channels = await guild.fetch_channels()
+            for channel in fetched_channels:
+                parent_id = int(getattr(channel, "category_id", 0) or getattr(channel, "parent_id", 0) or 0)
+                if parent_id == int(config.category_id):
+                    candidates.append(channel)
+        except Exception:
+            pass
+        seen_ids: set[int] = set()
+        for channel in candidates:
+            candidate_id = int(getattr(channel, "id", 0) or 0)
+            if not candidate_id or candidate_id in seen_ids:
+                continue
+            seen_ids.add(candidate_id)
+            if str(getattr(channel, "topic", "") or "") == f"PBBatch source: {source_dir}":
+                store.set_channel(source_dir, candidate_id, str(getattr(channel, "name", "") or ""))
+                return channel
+        return None
+
     async def update_channel_name(channel: Any, source_dir: str, snapshot: Dict[str, Any], *, force: bool = False) -> None:
         settings = store.folder_settings(source_dir)
         status = channel_status_key(snapshot, updates_paused=bool(settings.get("updates_paused")))
@@ -880,6 +962,54 @@ async def run_bot(config: BotConfig) -> None:
             store.set_channel(source_dir, int(channel.id), desired)
         except Exception as exc:
             print(f"[discord-bot] channel rename failed for {source_dir}: {exc}", flush=True)
+
+    async def ensure_inactive_message(channel: Any, source_dir: str) -> None:
+        row = store.get_folder(source_dir)
+        message_id = int(row["inactive_message_id"] or 0) if row is not None else 0
+        if message_id:
+            try:
+                message = await channel.fetch_message(message_id)
+                if str(getattr(message, "content", "") or "") != INACTIVE_MESSAGE_TEXT:
+                    await message.edit(content=INACTIVE_MESSAGE_TEXT)
+                return
+            except Exception:
+                pass
+        try:
+            message = await channel.send(INACTIVE_MESSAGE_TEXT)
+            store.set_inactive_message(source_dir, int(message.id))
+        except Exception as exc:
+            print(f"[discord-bot] inactive message failed for {source_dir}: {exc}", flush=True)
+
+    async def clear_inactive_message(channel: Any, source_dir: str) -> None:
+        row = store.get_folder(source_dir)
+        message_id = int(row["inactive_message_id"] or 0) if row is not None else 0
+        if not message_id:
+            return
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.delete()
+        except Exception:
+            pass
+        store.set_inactive_message(source_dir, 0)
+
+    async def reconcile_existing_channels() -> None:
+        rows = store.folder_rows()
+        if not rows:
+            return
+        print(f"[discord-bot] reconciling {len(rows)} known folder channel(s)", flush=True)
+        for folder in rows:
+            source_dir = str(folder["source_dir"] or "")
+            if not source_dir:
+                continue
+            channel = await find_existing_channel(source_dir, int(folder["channel_id"] or 0))
+            if channel is None:
+                continue
+            row = store.latest_session_for_source_dir(source_dir)
+            snapshot = snapshot_for_row(row) if row is not None else {"source_dir": source_dir, "state": "offline"}
+            await update_channel_name(channel, source_dir, snapshot, force=True)
+            await ensure_inactive_message(channel, source_dir)
+            if row is not None:
+                await update_dashboard(snapshot, force=True)
 
     async def delayed_dashboard_update(session_id: str, generation: int, delay: float) -> None:
         try:
@@ -931,6 +1061,10 @@ async def run_bot(config: BotConfig) -> None:
             channel = await ensure_channel(source_dir)
             store.upsert_session(snapshot, int(channel.id))
             await update_channel_name(channel, source_dir, snapshot, force=force or takeover)
+            if live:
+                await clear_inactive_message(channel, source_dir)
+            elif str(snapshot.get("state") or "").strip().lower() == "offline":
+                await ensure_inactive_message(channel, source_dir)
 
             settings = store.folder_settings(source_dir)
             if not render_messages:
@@ -1025,6 +1159,8 @@ async def run_bot(config: BotConfig) -> None:
             await enqueue_from_interaction(interaction, self.session_id, self.command)
 
     def build_control_view(session_id: str, snapshot: Dict[str, Any]) -> Any:
+        if str(snapshot.get("state") or "").strip().lower() == "offline":
+            return None
         view = discord.ui.View(timeout=None)
         if bool(snapshot.get("paused")) or bool(snapshot.get("pause_after_current")):
             view.add_item(CommandButton(session_id=session_id, command="resume", label="Resume", style=discord.ButtonStyle.success))
@@ -1392,7 +1528,11 @@ async def run_bot(config: BotConfig) -> None:
 
     @client.event
     async def on_ready() -> None:
+        nonlocal startup_reconciled
         await tree.sync(guild=guild_object)
+        if not startup_reconciled:
+            startup_reconciled = True
+            await reconcile_existing_channels()
         print(f"[discord-bot] logged in as {client.user}", flush=True)
 
     @tree.command(name="panel", description="Refresh the PBBatch dashboard in this channel.", guild=guild_object)
