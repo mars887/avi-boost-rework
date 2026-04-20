@@ -24,6 +24,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.discord_config import discord_config_int, discord_config_value, read_discord_config
+from utils.discord_store import (
+    DEFAULT_DASHBOARD_MAJOR_INTERVAL_SECONDS,
+    DEFAULT_DASHBOARD_PROGRESS_INTERVAL_SECONDS,
+    DEFAULT_RUNNER_STARTUP_DELAY_SECONDS,
+    StateStore,
+)
 
 try:
     import discord  # type: ignore[import-not-found]
@@ -39,7 +45,6 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8794
 MAX_EMBED_FIELD = 1024
 MAX_UPLOAD_MB_DEFAULT = 25
-COMMAND_LEASE_SECONDS_DEFAULT = 30.0
 LOADER_FILE_TTL_SECONDS = 600.0
 ADMINS_ONLY = False
 
@@ -48,8 +53,6 @@ COMMANDS = {
     "resume": "Resume",
 }
 
-DEFAULT_DASHBOARD_MAJOR_INTERVAL_SECONDS = 15.0
-DEFAULT_DASHBOARD_PROGRESS_INTERVAL_SECONDS = 60.0
 DONE_SQUARE = "\U0001F7E9"
 RUNNING_SQUARE = "\U0001F7E6"
 PENDING_SQUARE = "\u2B1B"
@@ -76,270 +79,6 @@ class BotConfig:
     operator_role_id: int = 0
     admins_only: bool = False
     shared_secret: str = ""
-
-
-class StateStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path.expanduser().resolve()
-        if not str(self.path):
-            raise RuntimeError("Discord state database path is empty.")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.db = sqlite3.connect(str(self.path), check_same_thread=False)
-        except sqlite3.OperationalError as exc:
-            raise RuntimeError(f"Unable to open Discord state database: {self.path} ({exc})") from exc
-        self.db.row_factory = sqlite3.Row
-        self._init_schema()
-
-    def _init_schema(self) -> None:
-        self.db.executescript(
-            """
-            create table if not exists folders (
-                source_dir text primary key,
-                channel_id integer not null,
-                channel_name text not null,
-                alias text not null default '',
-                updates_paused integer not null default 0,
-                major_interval_seconds integer not null default 15,
-                progress_interval_seconds integer not null default 60,
-                updated_at real not null
-            );
-            create table if not exists sessions (
-                session_id text primary key,
-                source_dir text not null,
-                channel_id integer not null,
-                snapshot_json text not null,
-                history_message_id integer,
-                current_message_id integer,
-                queue_message_id integer,
-                updated_at real not null
-            );
-            create table if not exists commands (
-                command_id text primary key,
-                session_id text not null,
-                name text not null,
-                status text not null,
-                message text not null,
-                created_at real not null,
-                sent_at real,
-                acked_at real
-            );
-            create table if not exists events (
-                id integer primary key autoincrement,
-                session_id text not null,
-                payload_json text not null,
-                created_at real not null
-            );
-            """
-        )
-        self._ensure_column("folders", "alias", "text not null default ''")
-        self._ensure_column("folders", "updates_paused", "integer not null default 0")
-        self._ensure_column("folders", "major_interval_seconds", "integer not null default 15")
-        self._ensure_column("folders", "progress_interval_seconds", "integer not null default 60")
-        self._ensure_column("commands", "sent_at", "real")
-        self.db.commit()
-
-    def _ensure_column(self, table: str, column: str, definition: str) -> None:
-        rows = self.db.execute(f"pragma table_info({table})").fetchall()
-        if any(str(row["name"]) == column for row in rows):
-            return
-        self.db.execute(f"alter table {table} add column {column} {definition}")
-
-    def get_channel_id(self, source_dir: str) -> int:
-        row = self.db.execute("select channel_id from folders where source_dir = ?", (source_dir,)).fetchone()
-        return int(row["channel_id"]) if row else 0
-
-    def get_folder(self, source_dir: str) -> Optional[sqlite3.Row]:
-        return self.db.execute("select * from folders where source_dir = ?", (source_dir,)).fetchone()
-
-    def folder_settings(self, source_dir: str) -> Dict[str, Any]:
-        row = self.get_folder(source_dir)
-        if row is None:
-            return {
-                "alias": "",
-                "updates_paused": False,
-                "major_interval_seconds": int(DEFAULT_DASHBOARD_MAJOR_INTERVAL_SECONDS),
-                "progress_interval_seconds": int(DEFAULT_DASHBOARD_PROGRESS_INTERVAL_SECONDS),
-            }
-        return {
-            "alias": str(row["alias"] or ""),
-            "updates_paused": bool(int(row["updates_paused"] or 0)),
-            "major_interval_seconds": int(row["major_interval_seconds"] or DEFAULT_DASHBOARD_MAJOR_INTERVAL_SECONDS),
-            "progress_interval_seconds": int(row["progress_interval_seconds"] or DEFAULT_DASHBOARD_PROGRESS_INTERVAL_SECONDS),
-        }
-
-    def set_channel(self, source_dir: str, channel_id: int, channel_name: str) -> None:
-        self.db.execute(
-            """
-            insert into folders(source_dir, channel_id, channel_name, updated_at)
-            values(?, ?, ?, ?)
-            on conflict(source_dir) do update set
-                channel_id=excluded.channel_id,
-                channel_name=excluded.channel_name,
-                updated_at=excluded.updated_at
-            """,
-            (source_dir, int(channel_id), channel_name, time.time()),
-        )
-        self.db.commit()
-
-    def set_folder_alias(self, source_dir: str, alias: str) -> None:
-        cur = self.db.execute(
-            """
-            update folders
-            set alias=?, updated_at=?
-            where source_dir=?
-            """,
-            (alias, time.time(), source_dir),
-        )
-        if cur.rowcount == 0:
-            self.db.execute(
-                """
-                insert into folders(source_dir, channel_id, channel_name, alias, updated_at)
-                values(?, 0, '', ?, ?)
-                """,
-                (source_dir, alias, time.time()),
-            )
-        self.db.commit()
-
-    def set_updates_paused(self, source_dir: str, paused: bool) -> None:
-        self.db.execute(
-            """
-            update folders
-            set updates_paused=?, updated_at=?
-            where source_dir=?
-            """,
-            (1 if paused else 0, time.time(), source_dir),
-        )
-        self.db.commit()
-
-    def set_update_intervals(self, source_dir: str, *, major: int, progress: int) -> None:
-        self.db.execute(
-            """
-            update folders
-            set major_interval_seconds=?, progress_interval_seconds=?, updated_at=?
-            where source_dir=?
-            """,
-            (int(major), int(progress), time.time(), source_dir),
-        )
-        self.db.commit()
-
-    def upsert_session(self, snapshot: Dict[str, Any], channel_id: int) -> None:
-        session_id = str(snapshot.get("session_id") or "")
-        source_dir = str(snapshot.get("source_dir") or "")
-        row = self.db.execute("select * from sessions where session_id = ?", (session_id,)).fetchone()
-        if row:
-            self.db.execute(
-                """
-                update sessions set source_dir=?, channel_id=?, snapshot_json=?, updated_at=?
-                where session_id=?
-                """,
-                (source_dir, int(channel_id), json.dumps(snapshot, ensure_ascii=False), time.time(), session_id),
-            )
-        else:
-            previous = self.latest_session_for_source_dir(source_dir)
-            self.db.execute(
-                """
-                insert into sessions(
-                    session_id,
-                    source_dir,
-                    channel_id,
-                    snapshot_json,
-                    history_message_id,
-                    current_message_id,
-                    queue_message_id,
-                    updated_at
-                )
-                values(?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session_id,
-                    source_dir,
-                    int(channel_id),
-                    json.dumps(snapshot, ensure_ascii=False),
-                    int(previous["history_message_id"] or 0) if previous else 0,
-                    int(previous["current_message_id"] or 0) if previous else 0,
-                    int(previous["queue_message_id"] or 0) if previous else 0,
-                    time.time(),
-                ),
-            )
-        self.db.commit()
-
-    def set_session_messages(self, session_id: str, *, history: int, current: int, queue_message: int) -> None:
-        self.db.execute(
-            """
-            update sessions
-            set history_message_id=?, current_message_id=?, queue_message_id=?, updated_at=?
-            where session_id=?
-            """,
-            (int(history), int(current), int(queue_message), time.time(), session_id),
-        )
-        self.db.commit()
-
-    def get_session(self, session_id: str) -> Optional[sqlite3.Row]:
-        return self.db.execute("select * from sessions where session_id = ?", (session_id,)).fetchone()
-
-    def latest_session_for_channel(self, channel_id: int) -> Optional[sqlite3.Row]:
-        return self.db.execute(
-            "select * from sessions where channel_id = ? order by updated_at desc limit 1",
-            (int(channel_id),),
-        ).fetchone()
-
-    def latest_session_for_source_dir(self, source_dir: str) -> Optional[sqlite3.Row]:
-        return self.db.execute(
-            "select * from sessions where source_dir = ? order by updated_at desc limit 1",
-            (source_dir,),
-        ).fetchone()
-
-    def add_event(self, session_id: str, payload: Dict[str, Any]) -> None:
-        self.db.execute(
-            "insert into events(session_id, payload_json, created_at) values(?, ?, ?)",
-            (session_id, json.dumps(payload, ensure_ascii=False), time.time()),
-        )
-        self.db.commit()
-
-    def enqueue_command(self, session_id: str, name: str) -> str:
-        command_id = uuid.uuid4().hex
-        self.db.execute(
-            """
-            insert into commands(command_id, session_id, name, status, message, created_at)
-            values(?, ?, ?, 'pending', '', ?)
-            """,
-            (command_id, session_id, name, time.time()),
-        )
-        self.db.commit()
-        return command_id
-
-    def pending_commands(self, session_id: str, *, lease_seconds: float = COMMAND_LEASE_SECONDS_DEFAULT) -> List[Dict[str, str]]:
-        now = time.time()
-        lease_before = now - max(1.0, float(lease_seconds))
-        rows = self.db.execute(
-            """
-            select command_id, name from commands
-            where session_id = ?
-              and (
-                status = 'pending'
-                or (status = 'sent' and coalesce(sent_at, 0) <= ?)
-              )
-            order by created_at asc
-            """,
-            (session_id, lease_before),
-        ).fetchall()
-        self.db.executemany(
-            "update commands set status='sent', sent_at=? where command_id=?",
-            [(now, str(row["command_id"])) for row in rows],
-        )
-        self.db.commit()
-        return [{"command_id": str(row["command_id"]), "name": str(row["name"])} for row in rows]
-
-    def ack_command(self, command_id: str, status: str, message: str) -> None:
-        self.db.execute(
-            "update commands set status=?, message=?, acked_at=? where command_id=?",
-            (status, message, time.time(), command_id),
-        )
-        self.db.commit()
-
-    def folder_rows(self) -> List[sqlite3.Row]:
-        return list(self.db.execute("select * from folders order by updated_at desc").fetchall())
 
 
 def load_config(args: argparse.Namespace) -> BotConfig:
@@ -933,6 +672,7 @@ async def run_bot(config: BotConfig) -> None:
     pending_tasks: Dict[str, Any] = {}
     pending_due_at: Dict[str, float] = {}
     pending_generation: Dict[str, int] = {}
+    startup_render_block_until: Dict[str, float] = {}
     latest_session_by_source: Dict[str, str] = {}
     channel_locks: Dict[str, Any] = {}
     dashboard_locks: Dict[str, Any] = {}
@@ -963,6 +703,33 @@ async def run_bot(config: BotConfig) -> None:
             return display_stage_name(dict(completed[-1]))
         return "-"
 
+    def is_live_session_row(row: Optional[sqlite3.Row]) -> bool:
+        if row is None:
+            return False
+        source_dir = str(row["source_dir"] or "")
+        session_id = str(row["session_id"] or "")
+        if not source_dir or not session_id or latest_session_by_source.get(source_dir) != session_id:
+            return False
+        state = str(snapshot_from_row(row).get("state") or "").strip().lower()
+        return state not in ("finished", "offline")
+
+    def offline_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(snapshot)
+        out["state"] = "offline"
+        out["paused"] = False
+        out["pause_after_current"] = False
+        out["active"] = []
+        out["queue"] = []
+        counts = dict(out.get("counts") or {})
+        counts["active"] = 0
+        counts["queued"] = 0
+        out["counts"] = counts
+        return out
+
+    def snapshot_for_row(row: sqlite3.Row) -> Dict[str, Any]:
+        snapshot = snapshot_from_row(row)
+        return snapshot if is_live_session_row(row) else offline_snapshot(snapshot)
+
     async def print_console_status() -> None:
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         rows = store.folder_rows()
@@ -977,41 +744,44 @@ async def run_bot(config: BotConfig) -> None:
             settings = store.folder_settings(source_dir)
             row = store.latest_session_for_source_dir(source_dir)
             snapshot = snapshot_from_row(row) if row else {}
-            status = channel_status_key(snapshot, updates_paused=bool(settings.get("updates_paused")))
+            live = is_live_session_row(row)
+            display_snapshot = snapshot if live else offline_snapshot(snapshot)
+            status = channel_status_key(display_snapshot, updates_paused=bool(settings.get("updates_paused")))
             channel = client.get_channel(channel_id) if channel_id else None
             channel_name = str(getattr(channel, "name", "") or stored_name or "-")
             session_id = str(row["session_id"] or "-") if row else "-"
-            counts = dict(snapshot.get("counts") or {})
+            counts = dict(display_snapshot.get("counts") or {})
             print("", flush=True)
             print(f"[folder] {source_dir}", flush=True)
             print(f"  channel: {channel_name} ({channel_id or '-'})", flush=True)
             print(f"  status: {status}", flush=True)
-            print(f"  session: {session_id}", flush=True)
+            print(f"  session: {session_id}{'' if live else ' (offline/stale)'}", flush=True)
             print(f"  bot_updates_paused: {bool(settings.get('updates_paused'))}", flush=True)
             print(
                 "  intervals: "
                 f"major={int(settings.get('major_interval_seconds') or 0)}s, "
-                f"progress={int(settings.get('progress_interval_seconds') or 0)}s",
+                f"progress={int(settings.get('progress_interval_seconds') or 0)}s, "
+                f"startup_delay={int(settings.get('startup_delay_seconds') or 0)}s",
                 flush=True,
             )
             print(
                 "  runner: "
-                f"state={snapshot.get('state', '-')}, "
-                f"paused={bool(snapshot.get('paused'))}, "
-                f"pause_after_current={bool(snapshot.get('pause_after_current'))}, "
+                f"state={display_snapshot.get('state', '-')}, "
+                f"paused={bool(display_snapshot.get('paused'))}, "
+                f"pause_after_current={bool(display_snapshot.get('pause_after_current'))}, "
                 f"active={counts.get('active', 0)}, "
                 f"queued={counts.get('queued', 0)}, "
                 f"completed={counts.get('completed', 0)}, "
                 f"failed={counts.get('failed', 0)}",
                 flush=True,
             )
-            for index, plan in enumerate(list(snapshot.get("active") or []), start=1):
+            for index, plan in enumerate(list(display_snapshot.get("active") or []), start=1):
                 print(
                     f"  active {index}: {display_filename(dict(plan))} | "
                     f"{active_stage_label(dict(plan))} | elapsed {fmt_seconds(dict(plan).get('elapsed_seconds'))}",
                     flush=True,
                 )
-            queue = list(snapshot.get("queue") or [])
+            queue = list(display_snapshot.get("queue") or [])
             for index, item in enumerate(queue[:5], start=1):
                 print(f"  queue {index}: {display_filename(dict(item))} | {fmt_duration(dict(item).get('duration_seconds'))}", flush=True)
             if len(queue) > 5:
@@ -1139,7 +909,14 @@ async def run_bot(config: BotConfig) -> None:
         pending_due_at[session_id] = due_at
         pending_tasks[session_id] = asyncio.create_task(delayed_dashboard_update(session_id, generation, delay))
 
-    async def update_dashboard(snapshot: Dict[str, Any], *, force: bool = False, takeover: bool = False) -> None:
+    async def update_dashboard(
+        snapshot: Dict[str, Any],
+        *,
+        force: bool = False,
+        takeover: bool = False,
+        live: bool = False,
+        render_messages: bool = True,
+    ) -> None:
         session_id = str(snapshot.get("session_id") or "")
         source_dir = str(snapshot.get("source_dir") or "")
         if not session_id or not source_dir:
@@ -1147,17 +924,27 @@ async def run_bot(config: BotConfig) -> None:
         lock = dashboard_locks.setdefault(source_dir, asyncio.Lock())
         async with lock:
             owner_session_id = latest_session_by_source.get(source_dir)
-            if takeover or not owner_session_id:
+            if takeover or (live and not owner_session_id):
                 latest_session_by_source[source_dir] = session_id
-            elif owner_session_id != session_id:
+            elif owner_session_id and owner_session_id != session_id:
                 return
             channel = await ensure_channel(source_dir)
             store.upsert_session(snapshot, int(channel.id))
             await update_channel_name(channel, source_dir, snapshot, force=force or takeover)
 
             settings = store.folder_settings(source_dir)
+            if not render_messages:
+                return
             if bool(settings.get("updates_paused")) and not force and not takeover:
                 return
+
+            block_until = startup_render_block_until.get(session_id, 0.0)
+            if block_until and not force:
+                remaining = block_until - time.monotonic()
+                if remaining > 0:
+                    schedule_dashboard_update(session_id, snapshot, remaining)
+                    return
+                startup_render_block_until.pop(session_id, None)
 
             signature = dashboard_major_signature(snapshot)
             last_at = last_render_at.get(session_id, 0.0)
@@ -1219,6 +1006,9 @@ async def run_bot(config: BotConfig) -> None:
         row = store.get_session(session_id)
         if row is None:
             await interaction.response.send_message("Session not found.", ephemeral=True)
+            return
+        if not is_live_session_row(row):
+            await interaction.response.send_message("No active runner is connected for this folder.", ephemeral=True)
             return
         if str(command or "").strip().lower().replace("-", "_").replace(" ", "_") == "resume":
             store.set_updates_paused(str(row["source_dir"]), False)
@@ -1305,7 +1095,7 @@ async def run_bot(config: BotConfig) -> None:
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
             return
-        snapshot = snapshot_from_row(row)
+        snapshot = snapshot_for_row(row)
         try:
             ensure_inactive_folder(snapshot)
             kind, plan = select_plan(snapshot, selector)
@@ -1324,7 +1114,7 @@ async def run_bot(config: BotConfig) -> None:
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
             return
-        snapshot = snapshot_from_row(row)
+        snapshot = snapshot_for_row(row)
         try:
             ensure_inactive_folder(snapshot)
             kind, plan = select_plan(snapshot, selector)
@@ -1350,7 +1140,7 @@ async def run_bot(config: BotConfig) -> None:
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
             return
-        snapshot = snapshot_from_row(row)
+        snapshot = snapshot_for_row(row)
         try:
             ensure_inactive_folder(snapshot)
             await send_path_response(interaction, safe_relative_path(Path(str(row["source_dir"])), path), ephemeral=True)
@@ -1362,6 +1152,7 @@ async def run_bot(config: BotConfig) -> None:
         interaction: Any,
         major_interval_seconds: Optional[int] = None,
         progress_interval_seconds: Optional[int] = None,
+        startup_delay_seconds: Optional[int] = None,
         updates_paused: Optional[bool] = None,
     ) -> None:
         if not is_authorized(interaction):
@@ -1376,6 +1167,7 @@ async def run_bot(config: BotConfig) -> None:
         settings = store.folder_settings(source_dir)
         major = int(settings.get("major_interval_seconds") or DEFAULT_DASHBOARD_MAJOR_INTERVAL_SECONDS)
         progress = int(settings.get("progress_interval_seconds") or DEFAULT_DASHBOARD_PROGRESS_INTERVAL_SECONDS)
+        startup_delay = int(settings.get("startup_delay_seconds", DEFAULT_RUNNER_STARTUP_DELAY_SECONDS))
         changed = False
         if major_interval_seconds is not None:
             major = max(5, min(int(major_interval_seconds), 3600))
@@ -1383,8 +1175,11 @@ async def run_bot(config: BotConfig) -> None:
         if progress_interval_seconds is not None:
             progress = max(15, min(int(progress_interval_seconds), 7200))
             changed = True
+        if startup_delay_seconds is not None:
+            startup_delay = max(0, min(int(startup_delay_seconds), 120))
+            changed = True
         if changed:
-            store.set_update_intervals(source_dir, major=major, progress=progress)
+            store.set_update_settings(source_dir, major=major, progress=progress, startup_delay=startup_delay)
         if updates_paused is not None:
             store.set_updates_paused(source_dir, bool(updates_paused))
             settings["updates_paused"] = bool(updates_paused)
@@ -1393,10 +1188,12 @@ async def run_bot(config: BotConfig) -> None:
         body = (
             f"updates_paused: {bool(settings.get('updates_paused'))}\n"
             f"major_interval_seconds: {int(settings.get('major_interval_seconds'))}\n"
-            f"progress_interval_seconds: {int(settings.get('progress_interval_seconds'))}"
+            f"progress_interval_seconds: {int(settings.get('progress_interval_seconds'))}\n"
+            f"startup_delay_seconds: {int(settings.get('startup_delay_seconds'))}"
         )
         if changed:
-            await update_channel_name(interaction.channel, source_dir, snapshot_from_row(row), force=True)
+            snapshot = snapshot_for_row(row)
+            await update_channel_name(interaction.channel, source_dir, snapshot, force=True)
         await interaction.followup.send(f"```text\n{body}\n```", ephemeral=True)
 
     @bot_group.command(name="status", description="Show runner and bot status for this folder.")
@@ -1408,14 +1205,17 @@ async def run_bot(config: BotConfig) -> None:
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
             return
-        snapshot = snapshot_from_row(row)
+        live = is_live_session_row(row)
+        display_snapshot = snapshot_for_row(row)
         settings = store.folder_settings(str(row["source_dir"]))
-        counts = dict(snapshot.get("counts") or {})
+        counts = dict(display_snapshot.get("counts") or {})
         body = (
-            f"state: {snapshot.get('state')}\n"
-            f"runner_paused: {bool(snapshot.get('paused'))}\n"
-            f"pause_after_current: {bool(snapshot.get('pause_after_current'))}\n"
+            f"state: {display_snapshot.get('state')}\n"
+            f"runner_connected: {live}\n"
+            f"runner_paused: {bool(display_snapshot.get('paused'))}\n"
+            f"pause_after_current: {bool(display_snapshot.get('pause_after_current'))}\n"
             f"bot_updates_paused: {bool(settings.get('updates_paused'))}\n"
+            f"startup_delay_seconds: {int(settings.get('startup_delay_seconds') or 0)}\n"
             f"active: {counts.get('active', 0)}\n"
             f"queued: {counts.get('queued', 0)}\n"
             f"completed: {counts.get('completed', 0)}\n"
@@ -1434,7 +1234,7 @@ async def run_bot(config: BotConfig) -> None:
             return
         await interaction.response.defer(ephemeral=True)
         store.set_updates_paused(str(row["source_dir"]), True)
-        await update_channel_name(interaction.channel, str(row["source_dir"]), snapshot_from_row(row), force=True)
+        await update_channel_name(interaction.channel, str(row["source_dir"]), snapshot_for_row(row), force=True)
         await interaction.followup.send("Dashboard updates paused for this folder.", ephemeral=True)
 
     @bot_group.command(name="resume", description="Resume dashboard message updates in this folder.")
@@ -1449,7 +1249,8 @@ async def run_bot(config: BotConfig) -> None:
         await interaction.response.defer(ephemeral=True)
         source_dir = str(row["source_dir"])
         store.set_updates_paused(source_dir, False)
-        await update_dashboard(snapshot_from_row(row), force=True)
+        snapshot = snapshot_for_row(row)
+        await update_dashboard(snapshot, force=True)
         await interaction.followup.send("Dashboard updates resumed for this folder.", ephemeral=True)
 
     @workdir_group.command(name="alias", description="Set channel alias for this folder.")
@@ -1465,7 +1266,7 @@ async def run_bot(config: BotConfig) -> None:
         source_dir = str(row["source_dir"])
         alias = sanitize_channel_component(name, fallback=Path(source_dir).name, limit=70)
         store.set_folder_alias(source_dir, alias)
-        await update_channel_name(interaction.channel, source_dir, snapshot_from_row(row), force=True)
+        await update_channel_name(interaction.channel, source_dir, snapshot_for_row(row), force=True)
         await interaction.followup.send(f"Alias set to `{alias}`.", ephemeral=True)
 
     @batch_group.command(name="edit-text", description="Replace matching text lines through batch-manager edit logic.")
@@ -1492,7 +1293,7 @@ async def run_bot(config: BotConfig) -> None:
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
             return
-        snapshot = snapshot_from_row(row)
+        snapshot = snapshot_for_row(row)
         try:
             ensure_inactive_folder(snapshot)
         except Exception as exc:
@@ -1518,7 +1319,7 @@ async def run_bot(config: BotConfig) -> None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
             return
         try:
-            _, plan = select_plan(snapshot_from_row(row), selector)
+            _, plan = select_plan(snapshot_for_row(row), selector)
             workdir = Path(str(plan.get("workdir") or ""))
             body = tree_listing(workdir)
             await interaction.response.send_message(f"```text\n{truncate(body, 1900)}\n```", ephemeral=True)
@@ -1535,7 +1336,7 @@ async def run_bot(config: BotConfig) -> None:
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            _, plan = select_plan(snapshot_from_row(row), selector or "active")
+            _, plan = select_plan(snapshot_for_row(row), selector or "active")
             files = list_ivf_files(plan, pass_name, count=count, sort_mode=sort_mode)
             if not files:
                 await interaction.followup.send(f"No `{pass_name}pass` ivf files found.", ephemeral=True)
@@ -1603,7 +1404,8 @@ async def run_bot(config: BotConfig) -> None:
         if row is None:
             await interaction.response.send_message("No PBBatch session is known for this channel.", ephemeral=True)
             return
-        await update_dashboard(snapshot_from_row(row), force=True)
+        snapshot = snapshot_for_row(row)
+        await update_dashboard(snapshot, force=True)
         await interaction.response.send_message("Panel refreshed.", ephemeral=True)
 
     @tree.command(name="pbbatch_command", description="Queue a command for the latest runner session in this channel.", guild=guild_object)
@@ -1633,7 +1435,7 @@ async def run_bot(config: BotConfig) -> None:
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
             return
-        snapshot = snapshot_from_row(row)
+        snapshot = snapshot_for_row(row)
         active = list(snapshot.get("active") or [])
         source = active[0] if active else None
         if source is None:
@@ -1691,7 +1493,7 @@ async def run_bot(config: BotConfig) -> None:
         if row is None:
             await interaction.response.send_message("No session in this channel.", ephemeral=True)
             return
-        snapshot = snapshot_from_row(row)
+        snapshot = snapshot_for_row(row)
         if snapshot.get("active"):
             await interaction.response.send_message("Batch tools are disabled while runner is active in this folder.", ephemeral=True)
             return
@@ -1709,13 +1511,21 @@ async def run_bot(config: BotConfig) -> None:
         source_dir = str(snapshot.get("source_dir") or "")
         if session_id and source_dir:
             latest_session_by_source[source_dir] = session_id
-        asyncio.create_task(update_dashboard(snapshot, force=True, takeover=True))
+        settings = store.folder_settings(source_dir) if source_dir else {}
+        startup_delay = max(0.0, float(settings.get("startup_delay_seconds", DEFAULT_RUNNER_STARTUP_DELAY_SECONDS)))
+        if session_id and startup_delay > 0:
+            startup_render_block_until[session_id] = time.monotonic() + startup_delay
+        await update_dashboard(snapshot, force=True, takeover=True, live=True, render_messages=False)
+        if session_id and startup_delay > 0:
+            schedule_dashboard_update(session_id, snapshot, startup_delay)
+        else:
+            await update_dashboard(snapshot, force=True, takeover=True, live=True)
         return web.json_response({"status": "ok"})
 
     async def http_snapshot(request: Any) -> Any:
         payload = await request.json()
         snapshot = dict(payload.get("snapshot") or {})
-        await update_dashboard(snapshot)
+        await update_dashboard(snapshot, live=True)
         return web.json_response({"status": "ok"})
 
     async def http_event(request: Any) -> Any:
@@ -1724,7 +1534,7 @@ async def run_bot(config: BotConfig) -> None:
         event = dict(payload.get("event") or {})
         snapshot = dict(payload.get("snapshot") or {})
         store.add_event(session_id, event)
-        await update_dashboard(snapshot)
+        await update_dashboard(snapshot, live=True)
         if event.get("status") == "failed":
             row = store.get_session(session_id)
             if row:
@@ -1745,7 +1555,7 @@ async def run_bot(config: BotConfig) -> None:
         store.ack_command(command_id, str(payload.get("status") or ""), str(payload.get("message") or ""))
         snapshot = dict(payload.get("snapshot") or {})
         if snapshot:
-            await update_dashboard(snapshot, force=True)
+            await update_dashboard(snapshot, force=True, live=True)
         return web.json_response({"status": "ok"})
 
     @web.middleware
