@@ -5,7 +5,7 @@ import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 
 ZONED_COMMAND_NAME = "zoned_command.txt"
@@ -170,11 +170,50 @@ def split_zoned_command_line(line: str) -> ZonedCommandSplit:
     return ZonedCommandSplit(selectors_part, sep, payload_tokens)
 
 
+def _is_preset_selector(selectors_part: str) -> bool:
+    text = str(selectors_part or "").strip()
+    return bool(text.startswith("@") and text != "@default" and not any(ch.isspace() for ch in text))
+
+
+def _collect_preset_tokens(lines: Iterable[str]) -> Dict[str, Tuple[str, ...]]:
+    presets: Dict[str, Tuple[str, ...]] = {}
+    for raw in lines:
+        line = _strip_line(raw)
+        if not line:
+            continue
+        try:
+            split = split_zoned_command_line(line)
+        except ValueError:
+            continue
+        if _is_preset_selector(split.selectors_part):
+            presets[split.selectors_part] = split.payload_tokens
+    return presets
+
+
+def _expand_preset_tokens(
+    tokens: Sequence[str],
+    presets: Dict[str, Tuple[str, ...]],
+    *,
+    _stack: Tuple[str, ...] = (),
+) -> Tuple[str, ...]:
+    out: List[str] = []
+    for token in tokens:
+        text = str(token)
+        if text.startswith("@") and text in presets:
+            if text in _stack:
+                cycle = " -> ".join(_stack + (text,))
+                raise ValueError(f"preset cycle detected: {cycle}")
+            out.extend(_expand_preset_tokens(presets[text], presets, _stack=_stack + (text,)))
+        else:
+            out.append(text)
+    return tuple(out)
+
+
 def _is_marker(token: str) -> bool:
     return str(token or "").strip().upper() in (_EXPLICIT_CROP, _EXPLICIT_VPY)
 
 
-def is_crop_token(token: str) -> bool:
+def _is_single_crop_token(token: str) -> bool:
     text = str(token or "").strip()
     if not text:
         return False
@@ -188,9 +227,35 @@ def is_crop_token(token: str) -> bool:
     )
 
 
+def is_crop_token(token: str) -> bool:
+    text = str(token or "").strip()
+    if _is_single_crop_token(text):
+        return True
+    if "->" not in text:
+        return False
+    left, right = (part.strip() for part in text.split("->", 1))
+    return bool(left and right and _is_single_crop_token(left) and _is_single_crop_token(right))
+
+
 def is_vpy_function_token(token: str) -> bool:
     text = str(token or "").strip()
     return bool(text and text.isidentifier() and not keyword.iskeyword(text))
+
+
+def _consume_crop_value(tokens: Sequence[str], start: int) -> Tuple[str, int]:
+    if start >= len(tokens):
+        return "", start
+    token = str(tokens[start]).strip()
+    if not is_crop_token(token):
+        return "", start
+    if "->" in token:
+        return token, start + 1
+    if start + 2 < len(tokens):
+        arrow = str(tokens[start + 1]).strip()
+        right = str(tokens[start + 2]).strip()
+        if arrow == "->" and is_crop_token(right):
+            return f"{token} -> {right}", start + 3
+    return token, start + 1
 
 
 def parse_zoned_payload(tokens: Sequence[str]) -> ZonedPayload:
@@ -203,10 +268,9 @@ def parse_zoned_payload(tokens: Sequence[str]) -> ZonedPayload:
         token = str(tokens[i]).strip()
         upper = token.upper()
         if upper == _EXPLICIT_CROP:
-            if i + 1 >= len(tokens):
+            crop, i = _consume_crop_value(tokens, i + 1)
+            if not crop:
                 raise ValueError("_CROP requires a value")
-            crop = str(tokens[i + 1]).strip()
-            i += 2
             continue
         if upper == _EXPLICIT_VPY:
             if i + 1 >= len(tokens):
@@ -226,8 +290,7 @@ def parse_zoned_payload(tokens: Sequence[str]) -> ZonedPayload:
                 i += 1
             continue
         if not crop and is_crop_token(token):
-            crop = token
-            i += 1
+            crop, i = _consume_crop_value(tokens, i)
             continue
         if not function and is_vpy_function_token(token):
             if i + 1 < len(tokens):
@@ -267,14 +330,17 @@ def _format_simple_line(selectors_part: str, payload: str) -> str:
 
 
 def project_zone_command_lines(lines: Iterable[str]) -> List[str]:
+    source_lines = list(lines)
+    presets = _collect_preset_tokens(source_lines)
     out: List[str] = []
-    for raw in lines:
+    for raw in source_lines:
         line = _strip_line(raw)
         if not line:
             continue
         try:
             split = split_zoned_command_line(line)
-            payload = parse_zoned_payload(split.payload_tokens)
+            tokens = _expand_preset_tokens(split.payload_tokens, presets)
+            payload = parse_zoned_payload(tokens)
         except ValueError:
             out.append(line)
             continue
@@ -284,14 +350,19 @@ def project_zone_command_lines(lines: Iterable[str]) -> List[str]:
 
 
 def project_crop_resize_command_lines(lines: Iterable[str]) -> List[str]:
+    source_lines = list(lines)
+    presets = _collect_preset_tokens(source_lines)
     out: List[str] = []
-    for raw in lines:
+    for raw in source_lines:
         line = _strip_line(raw)
         if not line:
             continue
         try:
             split = split_zoned_command_line(line)
-            payload = parse_zoned_payload(split.payload_tokens)
+            if _is_preset_selector(split.selectors_part):
+                continue
+            tokens = _expand_preset_tokens(split.payload_tokens, presets)
+            payload = parse_zoned_payload(tokens)
         except ValueError:
             continue
         if payload.crop:
@@ -300,14 +371,19 @@ def project_crop_resize_command_lines(lines: Iterable[str]) -> List[str]:
 
 
 def project_vpy_function_lines(lines: Iterable[str]) -> List[str]:
+    source_lines = list(lines)
+    presets = _collect_preset_tokens(source_lines)
     out: List[str] = []
-    for raw in lines:
+    for raw in source_lines:
         line = _strip_line(raw)
         if not line:
             continue
         try:
             split = split_zoned_command_line(line)
-            payload = parse_zoned_payload(split.payload_tokens)
+            if _is_preset_selector(split.selectors_part):
+                continue
+            tokens = _expand_preset_tokens(split.payload_tokens, presets)
+            payload = parse_zoned_payload(tokens)
         except ValueError:
             continue
         if payload.vpy_function:

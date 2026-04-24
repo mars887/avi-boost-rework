@@ -393,6 +393,12 @@ def _run_pre_pipeline(args: SimpleNamespace, user_ns: Dict[str, Any], clip: Any)
         return pre_pipeline(args, clip)
     return clip
 
+def _run_post_pipeline(args: SimpleNamespace, user_ns: Dict[str, Any], clip: Any) -> Any:
+    post_pipeline = user_ns.get("post_pipeline")
+    if callable(post_pipeline):
+        return post_pipeline(args, clip)
+    return clip
+
 
 def build_clip(raw_globals: Dict[str, Any]) -> Any:
     args = build_args(raw_globals)
@@ -414,6 +420,7 @@ def build_clip(raw_globals: Dict[str, Any]) -> Any:
 
     clip = _run_pre_pipeline(args, user_ns, clip)
     clip = _run_pipeline_zones(args, user_ns, clip)
+    clip = _run_post_pipeline(args, user_ns, clip)
     return clip
 
 

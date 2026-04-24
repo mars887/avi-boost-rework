@@ -40,6 +40,11 @@ class CropResizeRule:
     selectors: Tuple[str, ...]
     ops: Tuple[CropResizeOp, ...]
     raw_line: str
+    end_ops: Optional[Tuple[CropResizeOp, ...]] = None
+
+    @property
+    def is_transition(self) -> bool:
+        return self.end_ops is not None
 
 
 @dataclass(frozen=True)
@@ -171,6 +176,57 @@ def _expand_short_rule(size_text: str, target_width: int, target_height: int) ->
     )
 
 
+def _parse_rule_chain(chain_text: str, target_width: int, target_height: int) -> Tuple[CropResizeOp, ...]:
+    text = str(chain_text or "").strip()
+    if _RX_SIZE.match(text):
+        return _expand_short_rule(text, target_width, target_height)
+    return _parse_chain(text)
+
+
+def _validate_transition_ops(
+    start_ops: Sequence[CropResizeOp],
+    end_ops: Sequence[CropResizeOp],
+    *,
+    raw_line: str,
+) -> None:
+    if len(start_ops) != len(end_ops):
+        raise ValueError(
+            f"transition requires matching crop/resize chains on both sides of '->': {raw_line}"
+        )
+    for index, (start_op, end_op) in enumerate(zip(start_ops, end_ops), start=1):
+        if start_op.kind != end_op.kind:
+            raise ValueError(
+                f"transition requires matching operation kinds at step {index}: {raw_line}"
+            )
+        if start_op.kind != "crop" and start_op != end_op:
+            raise ValueError(
+                f"transition currently supports animating crop sizes only; step {index} must stay unchanged: {raw_line}"
+            )
+        if start_op.kind == "crop" and (start_op.x != end_op.x or start_op.y != end_op.y):
+            raise ValueError(
+                f"transition currently supports crop size changes only; x/y offsets must match: {raw_line}"
+            )
+
+
+def _parse_rule_ops(
+    chain_text: str,
+    *,
+    target_width: int,
+    target_height: int,
+    raw_line: str,
+) -> Tuple[Tuple[CropResizeOp, ...], Optional[Tuple[CropResizeOp, ...]]]:
+    text = str(chain_text or "").strip()
+    if "->" not in text:
+        return _parse_rule_chain(text, target_width, target_height), None
+    left, right = (part.strip() for part in text.split("->", 1))
+    if not left or not right:
+        raise ValueError(f"invalid transition syntax: {raw_line}")
+    start_ops = _parse_rule_chain(left, target_width, target_height)
+    end_ops = _parse_rule_chain(right, target_width, target_height)
+    _validate_transition_ops(start_ops, end_ops, raw_line=raw_line)
+    return start_ops, end_ops
+
+
 def parse_crop_resize_lines(lines: Iterable[str]) -> CropResizePlan:
     default_ops: Optional[Tuple[CropResizeOp, ...]] = None
     raw_rules: List[Tuple[Tuple[str, ...], str, str]] = []
@@ -198,11 +254,13 @@ def parse_crop_resize_lines(lines: Iterable[str]) -> CropResizePlan:
     target_width, target_height = _target_from_ops(default_ops)
     rules: List[CropResizeRule] = []
     for selectors, chain_text, raw_line in raw_rules:
-        if _RX_SIZE.match(chain_text.strip()):
-            ops = _expand_short_rule(chain_text.strip(), target_width, target_height)
-        else:
-            ops = _parse_chain(chain_text)
-        rules.append(CropResizeRule(selectors=selectors, ops=ops, raw_line=raw_line))
+        ops, end_ops = _parse_rule_ops(
+            chain_text,
+            target_width=target_width,
+            target_height=target_height,
+            raw_line=raw_line,
+        )
+        rules.append(CropResizeRule(selectors=selectors, ops=ops, raw_line=raw_line, end_ops=end_ops))
 
     return CropResizePlan(
         default_ops=default_ops,
@@ -277,7 +335,7 @@ def resolve_selector(selector: str, *, fps: Fraction, total_frames: int, chapter
         if end < start:
             start, end = end, start
         start = max(0, min(start, total_frames))
-        end = max(0, min(end, total_frames))
+        end = max(0, min(end + 1, total_frames))
         return [FrameRange(start, end)] if end > start else []
 
     m = _RX_TIME.match(raw)
@@ -387,6 +445,42 @@ def normalize_canvas(clip: Any, width: int, height: int) -> Any:
     return clip
 
 
+def _lerp_even(start: int, end: int, t: float) -> int:
+    value = float(start) + (float(end) - float(start)) * float(t)
+    return max(2, int(round(value / 2.0)) * 2)
+
+
+def _interpolate_ops(
+    start_ops: Sequence[CropResizeOp],
+    end_ops: Sequence[CropResizeOp],
+    *,
+    t: float,
+) -> Tuple[CropResizeOp, ...]:
+    out: List[CropResizeOp] = []
+    for start_op, end_op in zip(start_ops, end_ops):
+        if start_op == end_op:
+            out.append(start_op)
+            continue
+        out.append(
+            CropResizeOp(
+                start_op.kind,
+                _lerp_even(start_op.width, end_op.width, t),
+                _lerp_even(start_op.height, end_op.height, t),
+                start_op.x,
+                start_op.y,
+            )
+        )
+    return tuple(out)
+
+
+def _transition_progress(frame_no: int, frame_range: FrameRange) -> float:
+    span = int(frame_range.end) - int(frame_range.start)
+    if span <= 1:
+        return 0.0
+    pos = max(0, min(int(frame_no) - int(frame_range.start), span - 1))
+    return float(pos) / float(span - 1)
+
+
 def apply_ops_to_clip(clip: Any, ops: Sequence[CropResizeOp], *, target_width: int, target_height: int) -> Any:
     out = clip
     for op in ops:
@@ -421,23 +515,44 @@ def apply_crop_resize_to_clip(clip: Any, plan: CropResizePlan, *, source: Option
     variants: List[Any] = [
         apply_ops_to_clip(clip, plan.default_ops, target_width=plan.target_width, target_height=plan.target_height)
     ]
-    variant_indexes = [0] * total_frames
-    variant_by_ops: Dict[Tuple[CropResizeOp, ...], int] = {}
+    frame_actions: List[Any] = [0] * total_frames
+    variant_by_ops: Dict[Tuple[CropResizeOp, ...], int] = {plan.default_ops: 0}
+    transition_entries: List[Tuple[CropResizeRule, FrameRange]] = []
 
     for rule, ranges in zip(plan.rules, rule_ranges):
+        if rule.is_transition:
+            for frame_range in ranges:
+                transition_index = len(transition_entries)
+                transition_entries.append((rule, frame_range))
+                for frame_no in range(frame_range.start, frame_range.end):
+                    frame_actions[frame_no] = (transition_index,)
+            continue
         if rule.ops not in variant_by_ops:
             variant_by_ops[rule.ops] = len(variants)
             variants.append(apply_ops_to_clip(clip, rule.ops, target_width=plan.target_width, target_height=plan.target_height))
         variant_index = variant_by_ops[rule.ops]
         for frame_range in ranges:
             for frame_no in range(frame_range.start, frame_range.end):
-                variant_indexes[frame_no] = variant_index
+                frame_actions[frame_no] = variant_index
 
-    if len(variants) == 1:
+    if len(variants) == 1 and not transition_entries:
         return variants[0]
 
+    interpolated_variants: Dict[Tuple[CropResizeOp, ...], Any] = {}
+
     def select_frame(n: int) -> Any:
-        return variants[variant_indexes[n]]
+        action = frame_actions[n]
+        if isinstance(action, int):
+            return variants[action]
+        transition_index = int(action[0])
+        rule, frame_range = transition_entries[transition_index]
+        end_ops = rule.end_ops or rule.ops
+        ops = _interpolate_ops(rule.ops, end_ops, t=_transition_progress(n, frame_range))
+        cached = interpolated_variants.get(ops)
+        if cached is None:
+            cached = apply_ops_to_clip(clip, ops, target_width=plan.target_width, target_height=plan.target_height)
+            interpolated_variants[ops] = cached
+        return cached
 
     return vs.core.std.FrameEval(variants[0], select_frame)
 
