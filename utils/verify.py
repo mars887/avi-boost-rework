@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from utils.media_helpers import normalize_track_type as norm_type
 from utils.plan_model import resolve_file_plan
 
 
@@ -32,10 +33,6 @@ MIN_BYTES_ATTACHMENT = 16
 MIN_BYTES_AUDIO = 1024
 MIN_BYTES_VIDEO = 1024 * 256  # 256 KiB; adjust if you want stricter
 DURATION_TOLERANCE_MS = 5000
-STATE_DIR_NAME = ".state"
-VERIFY_MARKER = "VERIFY_DONE"
-RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
-
 
 def eprint(*a: Any) -> None:
     print(*a, file=sys.stderr)
@@ -127,20 +124,6 @@ def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
         tee_err.close_log()
 
     atexit.register(_cleanup)
-
-
-def marker_path(workdir: Path) -> Path:
-    return workdir / STATE_DIR_NAME / VERIFY_MARKER
-
-
-def write_marker(workdir: Path) -> None:
-    p = marker_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
-
-
-def runner_managed_state() -> bool:
-    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def sanitize_error_id(s: str) -> str:
@@ -363,17 +346,6 @@ def check_file_exists(p: Path, min_bytes: int, err_id: str) -> None:
         raise RuntimeError(err_id)
 
 
-def norm_type(t: str) -> str:
-    v = (t or "").strip().lower()
-    if v.startswith("sub") or v == "subtitle":
-        return "sub"
-    if v.startswith("aud") or v == "audio":
-        return "audio"
-    if v.startswith("vid") or v == "video":
-        return "video"
-    return v
-
-
 def is_skip(status: str) -> bool:
     return (status or "").strip().upper() == "SKIP"
 
@@ -579,10 +551,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     tracks = resolved_plan.runtime_tracks()
 
     setup_logging(args.log, workdir)
-    marker = marker_path(workdir)
-    if marker.exists() and not runner_managed_state():
-        print(f"[verify] skip: marker exists: {marker}")
-        return 0
 
     try:
         if not source.exists():
@@ -623,8 +591,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass
 
         print("[verify] OK")
-        if not runner_managed_state():
-            write_marker(workdir)
         return 0
 
     except Exception as ex:

@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -44,7 +43,6 @@ from utils.runner_state import (
     STAGE_SSIMU2,
     STAGE_VERIFY,
     STAGE_ZONE_EDIT,
-    autoboost_fastpass_output,
     autoboost_scene_stage,
     clear_stage_marker,
     display_stage_plan,
@@ -54,6 +52,17 @@ from utils.runner_state import (
     stage_resume_info,
     stage_resume_marker_exists,
     write_stage_marker,
+)
+from utils.runner_lock import SourceDirLock
+from utils.runner_source_info import (
+    fastpass_output_path_for_item,
+    item_inputs_changed,
+    item_source_duration,
+    item_source_size,
+    mark_source_info_clean,
+    output_path_for_item,
+    prepare_source_info,
+    safe_file_size,
 )
 from utils.zoned_commands import ensure_zoned_command_file
 
@@ -72,10 +81,7 @@ AV1AN_PROGRESS_RE = re.compile(
     re.IGNORECASE,
 )
 AV1AN_CHUNK_RE = re.compile(r"\[(?P<done>\d+)\s*/\s*(?P<total>\d+)\s+Chunks\]", re.IGNORECASE)
-_DURATION_CACHE: Dict[str, float] = {}
 _AV1AN_PROGRESS_JSONL_SUPPORT: Dict[str, bool] = {}
-_SOURCE_INFO_CACHE: Dict[str, Dict[str, Any]] = {}
-_STALE_INPUT_KEYS: set[str] = set()
 
 CHILD_EVENT_ENV = "PBBATCH_RUNNER_CHILD_EVENTS_JSONL"
 SESSION_ID_ENV = "PBBATCH_RUNNER_SESSION_ID"
@@ -195,66 +201,6 @@ class FinishedPlanState:
         }
 
 
-class SourceDirLock:
-    def __init__(self, *, source_dir: str, session_id: str, enabled: bool) -> None:
-        self.enabled = bool(enabled and source_dir)
-        self.session_id = session_id
-        self.path = Path(source_dir) / ".pbbatch_runner.lock" if source_dir else Path()
-        self.token = uuid.uuid4().hex
-
-    def acquire(self) -> None:
-        if not self.enabled:
-            return
-        payload = {
-            "session_id": self.session_id,
-            "pid": os.getpid(),
-            "token": self.token,
-            "started_at": time.time(),
-        }
-        while True:
-            try:
-                with self.path.open("x", encoding="utf-8", newline="\n") as fh:
-                    fh.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-                return
-            except FileExistsError:
-                existing = self._read_existing()
-                pid = int(existing.get("pid") or 0)
-                if pid and self._pid_alive(pid):
-                    other_session = str(existing.get("session_id") or "")
-                    raise RuntimeError(f"source folder is already locked by active runner session {other_session or pid}")
-                try:
-                    self.path.unlink()
-                except FileNotFoundError:
-                    continue
-
-    def release(self) -> None:
-        if not self.enabled:
-            return
-        existing = self._read_existing()
-        if str(existing.get("token") or "") != self.token:
-            return
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            return
-
-    def _read_existing(self) -> Dict[str, Any]:
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-
-    @staticmethod
-    def _pid_alive(pid: int) -> bool:
-        if pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-            return True
-        except OSError:
-            return False
-
-
 @dataclass(frozen=True)
 class QueueItem:
     resolved: ResolvedFilePlan
@@ -281,231 +227,6 @@ class QueueItem:
         return self.resolved.plan.meta.name or self.source.stem
 
 
-def item_identity_key(item: QueueItem) -> str:
-    return f"{item.plan_path.resolve()}|{item.source.resolve()}|{item.workdir.resolve()}".lower()
-
-
-def source_info_path(item: QueueItem) -> Path:
-    return item.workdir / "00_meta" / "source_info.json"
-
-
-def output_path_for_item(item: QueueItem) -> Path:
-    return item.source.parent / f"{item.source.stem}-av1.mkv"
-
-
-def fastpass_output_path_for_item(item: QueueItem) -> Path:
-    return autoboost_fastpass_output(item)
-
-
-def safe_file_size(path: Path) -> int:
-    try:
-        return int(path.stat().st_size) if path.exists() and path.is_file() else 0
-    except Exception:
-        return 0
-
-
-def file_sha256(path: Path) -> str:
-    try:
-        h = hashlib.sha256()
-        with path.open("rb") as fh:
-            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return ""
-
-
-def file_sample_sha256(path: Path, sample_size: int = 1024 * 1024) -> str:
-    try:
-        size = path.stat().st_size
-        h = hashlib.sha256()
-        with path.open("rb") as fh:
-            h.update(fh.read(sample_size))
-            if size > sample_size:
-                fh.seek(max(0, size - sample_size))
-                h.update(fh.read(sample_size))
-        return h.hexdigest()
-    except Exception:
-        return ""
-
-
-def source_signature(source: Path) -> Dict[str, Any]:
-    try:
-        stat = source.stat()
-    except Exception:
-        return {
-            "path": str(source),
-            "exists": False,
-            "suffix": source.suffix.lower(),
-        }
-    return {
-        "path": str(source),
-        "exists": True,
-        "name": source.name,
-        "suffix": source.suffix.lower(),
-        "size": int(stat.st_size),
-        "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
-        "sample_sha256": file_sample_sha256(source),
-    }
-
-
-def _duration_from_ffprobe(payload: Dict[str, Any]) -> float:
-    try:
-        return max(0.0, float(dict(payload.get("format") or {}).get("duration") or 0.0))
-    except Exception:
-        return 0.0
-
-
-def build_source_info(item: QueueItem) -> Dict[str, Any]:
-    signature = source_signature(item.source)
-    plan_hash = file_sha256(item.plan_path)
-    ffprobe_payload: Dict[str, Any] = {}
-    ffprobe_error = ""
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe and signature.get("exists"):
-        cmd = [
-            ffprobe,
-            "-v",
-            "error",
-            "-show_format",
-            "-show_streams",
-            "-of",
-            "json",
-            str(item.source),
-        ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-                check=False,
-            )
-            if proc.returncode == 0:
-                parsed = json.loads(str(proc.stdout or "{}"))
-                ffprobe_payload = parsed if isinstance(parsed, dict) else {}
-            else:
-                ffprobe_error = str(proc.stderr or proc.stdout or "").strip()[:4000]
-        except Exception as exc:
-            ffprobe_error = str(exc)
-    duration = _duration_from_ffprobe(ffprobe_payload)
-    key = str(item.source.resolve()).lower()
-    _DURATION_CACHE[key] = duration
-    return {
-        "schema": 1,
-        "cache_state": "clean",
-        "generated_at": time.time(),
-        "source": str(item.source),
-        "source_signature": signature,
-        "plan": str(item.plan_path),
-        "plan_sha256": plan_hash,
-        "duration_seconds": duration,
-        "ffprobe": ffprobe_payload,
-        "ffprobe_error": ffprobe_error,
-    }
-
-
-def read_source_info(item: QueueItem) -> Dict[str, Any]:
-    path = source_info_path(item)
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def source_info_current(item: QueueItem, info: Dict[str, Any]) -> bool:
-    return (
-        dict(info.get("source_signature") or {}) == source_signature(item.source)
-        and str(info.get("plan_sha256") or "") == file_sha256(item.plan_path)
-    )
-
-
-def item_has_resume_state(item: QueueItem) -> bool:
-    if output_path_for_item(item).exists():
-        return True
-    return any(stage_resume_marker_exists(item, stage) for stage in display_stage_plan(item))
-
-
-def clear_item_stage_markers(item: QueueItem) -> None:
-    for stage in display_stage_plan(item):
-        clear_stage_marker(item, stage)
-
-
-def prepare_source_info(item: QueueItem) -> None:
-    existing = read_source_info(item)
-    stale_reason = ""
-    if existing:
-        if str(existing.get("cache_state") or "").strip().lower() == "invalidated":
-            stale_reason = str(existing.get("invalidate_reason") or "previous_invalidated_run_incomplete")
-        elif not source_info_current(item, existing):
-            stale_reason = "source_or_plan_changed"
-    elif item_has_resume_state(item):
-        stale_reason = "missing_source_info_for_existing_state"
-
-    if stale_reason:
-        _STALE_INPUT_KEYS.add(item_identity_key(item))
-        clear_item_stage_markers(item)
-        print(f"[runner] {item.name} | source info changed | invalidated cached stages ({stale_reason})", flush=True)
-
-    info = build_source_info(item) if stale_reason or not existing else existing
-    if stale_reason:
-        info["cache_state"] = "invalidated"
-        info["invalidate_reason"] = stale_reason
-        info["invalidated_at"] = time.time()
-    path = source_info_path(item)
-    ensure_dir(path.parent)
-    if stale_reason or not existing:
-        path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
-    _SOURCE_INFO_CACHE[item_identity_key(item)] = info
-
-
-def mark_source_info_clean(item: QueueItem) -> None:
-    info = item_source_info(item)
-    if not info:
-        return
-    info = dict(info)
-    info["cache_state"] = "clean"
-    info.pop("invalidate_reason", None)
-    info["completed_at"] = time.time()
-    path = source_info_path(item)
-    ensure_dir(path.parent)
-    path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
-    _SOURCE_INFO_CACHE[item_identity_key(item)] = info
-
-
-def item_source_info(item: QueueItem) -> Dict[str, Any]:
-    key = item_identity_key(item)
-    info = _SOURCE_INFO_CACHE.get(key)
-    if info is None:
-        info = read_source_info(item)
-        if info:
-            _SOURCE_INFO_CACHE[key] = info
-    return info or {"source_signature": source_signature(item.source), "duration_seconds": 0.0}
-
-
-def item_inputs_changed(item: QueueItem) -> bool:
-    return item_identity_key(item) in _STALE_INPUT_KEYS
-
-
-def item_source_size(item: QueueItem) -> int:
-    signature = dict(item_source_info(item).get("source_signature") or {})
-    try:
-        return int(signature.get("size") or 0)
-    except Exception:
-        return 0
-
-
-def item_source_duration(item: QueueItem) -> float:
-    try:
-        return max(0.0, float(item_source_info(item).get("duration_seconds") or 0.0))
-    except Exception:
-        return 0.0
-
-
 def normalize_mode(value: str) -> str:
     return "fastpass" if str(value or "").strip().lower() == "fastpass" else "full"
 
@@ -526,42 +247,6 @@ def resolve_optional_path(raw_value: str, plan_path: Path) -> str:
 
 def bool_arg(value: bool) -> str:
     return "1" if bool(value) else "0"
-
-
-def probe_source_duration(source: Path) -> float:
-    key = str(source.resolve()).lower()
-    if key in _DURATION_CACHE:
-        return _DURATION_CACHE[key]
-    duration = 0.0
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe and source.exists():
-        cmd = [
-            ffprobe,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(source),
-        ]
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
-                check=False,
-            )
-            if proc.returncode == 0:
-                duration = max(0.0, float(str(proc.stdout or "0").strip() or "0"))
-        except Exception:
-            duration = 0.0
-    _DURATION_CACHE[key] = duration
-    return duration
 
 
 def av1an_supports_progress_jsonl(av1an_exe: str) -> bool:
@@ -1788,7 +1473,6 @@ class SessionController:
                     ]
                     self.completed.append(item)
                 mark_source_info_clean(item)
-                _STALE_INPUT_KEYS.discard(item_identity_key(item))
             finally:
                 ended_at = time.time()
                 with self.lock:

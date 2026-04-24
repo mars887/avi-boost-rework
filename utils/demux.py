@@ -4,7 +4,6 @@
 import argparse
 import atexit
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -18,14 +17,13 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from utils.media_helpers import (
+    find_track_info,
+    normalize_track_type as normalize_type,
+    sanitize_component,
+    subtitle_extension_from_codec as sub_ext_from_codec,
+)
 from utils.plan_model import resolve_file_plan
-
-
-WIN_BAD = r'<>:"/\|?*'
-WIN_BAD_RE = re.compile(rf"[{re.escape(WIN_BAD)}]")
-STATE_DIR_NAME = ".state"
-DEMUX_MARKER = "DEMUX_DONE"
-RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 
 
 def eprint(*args: Any) -> None:
@@ -124,36 +122,12 @@ def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
 
-def marker_path(workdir: Path) -> Path:
-    return workdir / STATE_DIR_NAME / DEMUX_MARKER
-
-
-def write_marker(workdir: Path) -> None:
-    p = marker_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
-
-
-def runner_managed_state() -> bool:
-    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
-
-
 def which_or(name: str, fallback: str) -> str:
     return shutil.which(name) or fallback
 
 
 def safe_filename(name: str, max_len: int = 180) -> str:
-    name = (name or "").strip()
-    if not name:
-        return "unnamed"
-    name = WIN_BAD_RE.sub("_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    name = name.rstrip(". ")
-    if not name:
-        name = "unnamed"
-    if len(name) > max_len:
-        name = name[:max_len].rstrip(". ")
-    return name
+    return sanitize_component(name, default="unnamed", max_len=max_len)
 
 
 PROGRESS_RE = re.compile(r"^(progress|processed)\s*[:\-]?\s*\d+%\s*$", re.IGNORECASE)
@@ -229,17 +203,6 @@ class TrackEntry:
     fileBase: str
 
 
-def normalize_type(raw: str) -> str:
-    v = (raw or "").strip().lower()
-    if v.startswith("sub") or v == "subtitle":
-        return "sub"
-    if v.startswith("aud") or v == "audio":
-        return "audio"
-    if v.startswith("vid") or v == "video":
-        return "video"
-    return v
-
-
 def is_skip(status: str) -> bool:
     return (status or "").strip().upper() == "SKIP"
 
@@ -264,37 +227,7 @@ def get_mkvmerge_json(mkvmerge: str, source: Path) -> Dict[str, Any]:
         raise RuntimeError(f"Failed to parse mkvmerge JSON: {ex}\nOutput:\n{p.stdout}")
 
 
-def find_track_info(mkvj: Dict[str, Any], track_id: int) -> Optional[Dict[str, Any]]:
-    for t in mkvj.get("tracks", []) or []:
-        if int(t.get("id", -1)) == int(track_id):
-            return t
-    return None
-
-
-def sub_ext_from_codec(codec_id: str) -> str:
-    c = (codec_id or "").upper()
-    if "S_TEXT/ASS" in c:
-        return ".ass"
-    if "S_TEXT/SSA" in c:
-        return ".ssa"
-    if "S_TEXT/UTF8" in c:
-        return ".srt"
-    if "S_TEXT/WEBVTT" in c:
-        return ".vtt"
-    if "S_TEXT/USF" in c:
-        return ".usf"
-    if "S_TEXT/TIMEDTEXT" in c or "S_TEXT/TTML" in c:
-        return ".ttml"
-    if "S_HDMV/PGS" in c:
-        return ".sup"
-    if "S_VOBSUB" in c:
         # может быть пара idx+sub; оставляем .sub как базовый
-        return ".sub"
-    if "S_DVBSUB" in c:
-        return ".sub"
-    return ".sub"
-
-
 def extract_subtitles(
     mkvextract: str,
     source: Path,
@@ -548,10 +481,6 @@ def main() -> int:
     entries = parse_tracks(resolved_plan.runtime_tracks())
 
     setup_logging(args.log, workdir)
-    marker = marker_path(workdir)
-    if marker.exists() and not args.overwrite and not runner_managed_state():
-        print(f"[demux] skip: marker exists: {marker}")
-        return 0
 
     if not source.exists():
         eprint(f"[demux] Source not found: {source}")
@@ -619,9 +548,6 @@ def main() -> int:
             "chapters": chapters_info,
         }
         write_json(workdir / "00_meta" / "demux_manifest.json", manifest)
-        if not runner_managed_state():
-            write_marker(workdir)
-
         print("[demux] OK")
         return 0
 

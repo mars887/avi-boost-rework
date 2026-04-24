@@ -40,12 +40,6 @@ if str(ROOT) not in sys.path:
 
 from utils.zoned_commands import project_zone_command_lines
 
-# ------------------------- state markers -------------------------
-
-STATE_DIR_NAME = ".state"
-ZONE_MARKER = "ZONE_EDIT_DONE"
-RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
-
 
 class TeeStream:
     def __init__(self, stream, log_file) -> None:
@@ -126,28 +120,6 @@ def setup_logging(log_path: str, base_dir: Optional[Path] = None) -> None:
         tee_err.close_log()
 
     atexit.register(_cleanup)
-
-
-def state_root_from_out(out_path: Path) -> Path:
-    p = out_path.resolve()
-    if p.parent.name.lower() == "video" and p.parent.parent.exists():
-        return p.parent.parent
-    return p.parent
-
-
-def marker_path(out_path: Path) -> Path:
-    root = state_root_from_out(out_path)
-    return root / STATE_DIR_NAME / ZONE_MARKER
-
-
-def write_marker(out_path: Path) -> None:
-    p = marker_path(out_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
-
-
-def runner_managed_state() -> bool:
-    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # Можно заполнить позже: {"--crf": Decimal("0.25"), "--someparam": Decimal("2")}
@@ -1614,10 +1586,6 @@ def main(argv: Sequence[str]) -> int:
 
     out_path = Path(args.out).resolve()
     setup_logging(args.log, out_path.parent)
-    marker = marker_path(out_path)
-    if marker.exists() and not runner_managed_state():
-        print(f"[skip] marker exists: {marker}")
-        return 0
 
     # Load scenes json
     with open(args.scenes, "r", encoding="utf-8") as f:
@@ -1648,8 +1616,6 @@ def main(argv: Sequence[str]) -> int:
     # Save
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(scenes_data, f, ensure_ascii=False, indent=2)
-    if not runner_managed_state():
-        write_marker(out_path)
 
     return 0
 

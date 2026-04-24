@@ -25,7 +25,7 @@ if ROOT not in sys.path:
 
 from ab_fastpass import run_fastpass_av1an
 from ab_encoder import normalize_encoder, resolve_preset
-from ab_fs import ensure_dir, ensure_exists, load_json, save_json, safe_unlink, touch, which_or_none
+from ab_fs import ensure_dir, ensure_exists, load_json, save_json, safe_unlink, which_or_none
 from ab_logging import eprint, setup_logging
 from ab_nvof import (
     build_nvof_schedule,
@@ -55,7 +55,6 @@ from ab_state import (
     is_valid_base_scenes,
     is_valid_final_scenes,
     is_valid_ssimu2_log,
-    marker_paths,
 )
 
 
@@ -338,7 +337,6 @@ def main() -> int:
     if av1an_progress_jsonl is not None and not av1an_progress_jsonl.is_absolute():
         av1an_progress_jsonl = project_dir / av1an_progress_jsonl
 
-    marks = marker_paths(project_dir)
     run_stages = resolve_run_stages([str(item) for item in (args.run_stages or [])], int(args.stage))
 
     def should_run(*stage_numbers: int) -> bool:
@@ -370,9 +368,7 @@ def main() -> int:
             eprint("[warn] --rules-required-metrics specified without --rules/--rules-inline; ignoring.")
 
     if args.force:
-        print("[force] clearing state markers and generated outputs...")
-        for mp in marks.values():
-            safe_unlink(mp)
+        print("[force] clearing generated outputs...")
 
         # Remove generated artifacts (do not remove user-provided --base-scenes).
         if not args.base_scenes:
@@ -405,10 +401,9 @@ def main() -> int:
                 print(f"[skip] using existing base scenes: {base_scenes_path}")
                 if not is_valid_base_scenes(base_scenes_path):
                     raise RuntimeError("--base-scenes provided but is not a valid scenes.json (or cannot be sanitized).")
-                touch(marks["psd"])
                 emit_runner_child_event("Auto-Boost: PSD Scene Detection", "completed", message="using_existing_base_scenes", source=input_file, workdir=project_dir)
             else:
-                if marks["psd"].exists() and is_valid_base_scenes(base_scenes_path):
+                if is_valid_base_scenes(base_scenes_path):
                     print(f"[resume] PSD already completed: {base_scenes_path}")
                     emit_runner_child_event("Auto-Boost: PSD Scene Detection", "completed", message="resume", source=input_file, workdir=project_dir)
                 else:
@@ -425,7 +420,6 @@ def main() -> int:
                     except Exception as exc:
                         emit_runner_child_event("Auto-Boost: PSD Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
                         raise
-                    touch(marks["psd"])
                     emit_runner_child_event("Auto-Boost: PSD Scene Detection", "completed", source=input_file, workdir=project_dir)
 
     # -----------------
@@ -438,7 +432,7 @@ def main() -> int:
         else:
             if args.no_fastpass and args.sdm == "av1an":
                 scenes_hint = av1an_temp / "scenes.json"
-                if marks["fastpass"].exists() and scenes_hint.exists():
+                if scenes_hint.exists():
                     print(f"[resume] scene-only already completed: {scenes_hint}")
                     emit_runner_child_event("Auto-Boost: Scene Detection", "completed", message="resume", source=input_file, workdir=project_dir)
                 else:
@@ -483,10 +477,9 @@ def main() -> int:
                     except Exception as exc:
                         emit_runner_child_event("Auto-Boost: Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
                         raise
-                    touch(marks["fastpass"])
                     emit_runner_child_event("Auto-Boost: Scene Detection", "completed", source=input_file, workdir=project_dir)
             else:
-                if marks["fastpass"].exists() and fastpass_out.exists() and fastpass_out.stat().st_size > 0:
+                if fastpass_out.exists() and fastpass_out.stat().st_size > 0:
                     print(f"[resume] fast-pass already completed: {fastpass_out}")
                     if args.sdm == "av1an":
                         emit_runner_child_event("Auto-Boost: Scene Detection", "completed", message="resume", source=input_file, workdir=project_dir)
@@ -537,7 +530,6 @@ def main() -> int:
                             emit_runner_child_event("Auto-Boost: Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
                         emit_runner_child_event("Fastpass", "failed", message=str(exc), source=input_file, workdir=project_dir)
                         raise
-                    touch(marks["fastpass"])
                     if args.sdm == "av1an":
                         emit_runner_child_event("Auto-Boost: Scene Detection", "completed", source=input_file, workdir=project_dir)
                     emit_runner_child_event("Fastpass", "completed", source=input_file, workdir=project_dir)
@@ -573,7 +565,7 @@ def main() -> int:
         else:
             ensure_exists(fastpass_out, "Fast-pass output")
 
-            if marks["ssimu2"].exists() and is_valid_ssimu2_log(ssimu2_log):
+            if is_valid_ssimu2_log(ssimu2_log):
                 print(f"[resume] SSIMU2 already completed: {ssimu2_log}")
                 emit_runner_child_event("SSIMU2 Metrics", "completed", message="resume", source=input_file, workdir=project_dir)
             else:
@@ -593,7 +585,6 @@ def main() -> int:
                 except Exception as exc:
                     emit_runner_child_event("SSIMU2 Metrics", "failed", message=str(exc), source=input_file, workdir=project_dir)
                     raise
-                touch(marks["ssimu2"])
                 emit_runner_child_event("SSIMU2 Metrics", "completed", source=input_file, workdir=project_dir)
 
     # -----------------
@@ -605,7 +596,7 @@ def main() -> int:
             if args.stop_before_stage4:
                 stage4_ready = is_valid_final_scenes(stage4_out_scenes_path)
             else:
-                stage4_ready = marks["final"].exists() and is_valid_final_scenes(stage4_out_scenes_path)
+                stage4_ready = is_valid_final_scenes(stage4_out_scenes_path)
 
             if stage4_ready:
                 if args.stop_before_stage4:
@@ -670,8 +661,6 @@ def main() -> int:
                     )
                 if args.stop_before_stage4:
                     print(f"[ok] preview scenes written: {stage4_out_scenes_path}")
-                else:
-                    touch(marks["final"])
         except Exception as exc:
             emit_runner_child_event(
                 "SSIMU2 Metrics",
@@ -701,7 +690,7 @@ def main() -> int:
             if only_stage(5):
                 print("[skip] no rules provided for stage 5.")
         else:
-            if marks["rules"].exists() and is_valid_final_scenes(out_scenes_path):
+            if is_valid_final_scenes(out_scenes_path):
                 print(f"[resume] rules already applied: {out_scenes_path}")
             else:
                 ensure_exists(out_scenes_path, "Base scenes.json (Stage 4 output)")
@@ -788,7 +777,6 @@ def main() -> int:
                     return 0
 
                 save_json(out_scenes_path, updated_obj)
-                touch(marks["rules"])
                 print(f"[ok] rules applied: {out_scenes_path}")
 
     print("\nDone.")

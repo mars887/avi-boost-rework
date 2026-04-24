@@ -4,7 +4,6 @@
 import argparse
 import atexit
 import json
-import os
 import re
 import sys
 from datetime import datetime
@@ -17,11 +16,6 @@ try:
     FONTTOOLS_OK = True
 except Exception:
     FONTTOOLS_OK = False
-
-STATE_DIR_NAME = ".state"
-ATTACH_MARKER = "ATTACHMENTS_CLEAN_DONE"
-RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
-
 
 # -----------------------------
 # Logging
@@ -124,20 +118,6 @@ def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
         tee_err.close_log()
 
     atexit.register(_cleanup)
-
-
-def marker_path(workdir: Path) -> Path:
-    return workdir / STATE_DIR_NAME / ATTACH_MARKER
-
-
-def write_marker(workdir: Path) -> None:
-    p = marker_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
-
-
-def runner_managed_state() -> bool:
-    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # -----------------------------
@@ -410,11 +390,6 @@ def main() -> int:
     subs_dir = Path(args.subs)
     att_dir = Path(args.attachments)
     setup_logging(args.log, subs_dir.parent)
-    workdir = subs_dir.parent
-    marker = marker_path(workdir)
-    if marker.exists() and not runner_managed_state():
-        log(f"[skip] marker exists: {marker}")
-        return 0
 
     if not subs_dir.exists() or not subs_dir.is_dir():
         return die(f"Subs dir not found: {subs_dir}", 2)
@@ -451,8 +426,6 @@ def main() -> int:
     #     }
     #     report_path = Path(args.report) if args.report else (att_dir / "attachments_cleaner_report.json")
     #     report_path.write_text(json.dumps(report_obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    #     if not args.dry_run:
-    #         write_marker(workdir)
     #     return 0
 
     log(f"Used font tokens (normalized): {len(used_fonts)}")
@@ -508,8 +481,6 @@ def main() -> int:
         warn(f"Failed to write report '{report_path}': {ex}")
 
     log("[ok]")
-    if not args.dry_run and not runner_managed_state():
-        write_marker(workdir)
     return 0
 
 

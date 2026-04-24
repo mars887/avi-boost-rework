@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import subprocess
 import sys
@@ -10,9 +9,16 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-WIN_BAD = r'<>:"/\|?*'
-WIN_BAD_RE = re.compile(rf"[{re.escape(WIN_BAD)}]")
+from utils.media_helpers import (
+    find_track_info,
+    normalize_track_type as normalize_type,
+    sanitize_component,
+    subtitle_extension_from_codec as sub_ext_from_codec,
+)
 
 
 def eprint(*args: Any) -> None:
@@ -42,31 +48,6 @@ def run_mkvmerge_json(mkvmerge: str, source: Path) -> Dict[str, Any]:
         raise RuntimeError(f"mkvmerge JSON parse failed for {source}: {ex}")
 
 
-def normalize_type(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    if text.startswith("sub"):
-        return "sub"
-    if text.startswith("aud"):
-        return "audio"
-    if text.startswith("vid"):
-        return "video"
-    return text
-
-
-def sanitize_component(name: str, *, default: str, max_len: int = 120) -> str:
-    text = (name or "").strip()
-    text = WIN_BAD_RE.sub("_", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    text = text.rstrip(". ")
-    if not text:
-        text = default
-    if len(text) > max_len:
-        text = text[:max_len].rstrip(". ")
-    if not text:
-        text = default
-    return text
-
-
 def pick_track_name(track: Dict[str, Any]) -> str:
     mux = track.get("trackMux") if isinstance(track.get("trackMux"), dict) else {}
     candidate = str((mux or {}).get("name") or "").strip()
@@ -93,38 +74,6 @@ def pick_track_lang(track: Dict[str, Any]) -> str:
 
 def default_track_name(track_type: str, track_id: Any) -> str:
     return f"{track_type}_{track_id}"
-
-
-def find_track_info(mkv_json: Dict[str, Any], track_id: int) -> Optional[Dict[str, Any]]:
-    for track in mkv_json.get("tracks", []) or []:
-        try:
-            tid = int(track.get("id"))
-        except Exception:
-            continue
-        if tid == track_id:
-            return track
-    return None
-
-
-def sub_ext_from_codec(codec_id: str) -> Optional[str]:
-    c = (codec_id or "").upper()
-    if "S_TEXT/ASS" in c:
-        return ".ass"
-    if "S_TEXT/SSA" in c:
-        return ".ssa"
-    if "S_TEXT/UTF8" in c:
-        return ".srt"
-    if "S_TEXT/WEBVTT" in c:
-        return ".vtt"
-    if "S_TEXT/USF" in c:
-        return ".usf"
-    if "S_TEXT/TIMEDTEXT" in c or "S_TEXT/TTML" in c:
-        return ".ttml"
-    if "S_HDMV/PGS" in c:
-        return ".sup"
-    if "S_VOBSUB" in c or "S_DVBSUB" in c:
-        return ".sub"
-    return None
 
 
 def audio_ext_from_codec(codec_id: str) -> Optional[str]:

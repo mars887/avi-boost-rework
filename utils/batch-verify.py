@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from utils.param_utils import apply_override
 from utils.plan_model import format_value, normalize_track_type, resolve_file_plan
 from utils.crop_resize import load_crop_resize_plan, validate_crop_resize_plan
 from utils.zoned_commands import ZONED_COMMAND_NAME, project_zone_command_lines
@@ -185,51 +186,6 @@ def parse_zone_actions(line: str) -> List[str]:
         v = action_tokens[i + 1]
         out.extend([k, v])
     return out
-
-
-def is_param_key(tok: str) -> bool:
-    t = tok.strip()
-    return t.startswith("--") or t.startswith("-")
-
-
-def apply_override(base_tokens: List[str], override_tokens: List[str]) -> List[str]:
-    i = 0
-    while i < len(override_tokens):
-        tok = override_tokens[i]
-        if not is_param_key(tok):
-            i += 1
-            continue
-
-        key = tok
-        has_val = (i + 1 < len(override_tokens)) and (not is_param_key(override_tokens[i + 1]))
-        val = override_tokens[i + 1] if has_val else None
-
-        # Find last occurrence in base
-        loc = None
-        for j in range(len(base_tokens) - 1, -1, -1):
-            if base_tokens[j] == key:
-                base_has_val = (j + 1 < len(base_tokens)) and (not is_param_key(base_tokens[j + 1]))
-                loc = (j, base_has_val)
-                break
-
-        if loc is None:
-            base_tokens.append(key)
-            if val is not None:
-                base_tokens.append(val)
-        else:
-            k_idx, base_has_val = loc
-            if val is None:
-                if base_has_val:
-                    del base_tokens[k_idx + 1]
-            else:
-                if base_has_val:
-                    base_tokens[k_idx + 1] = val
-                else:
-                    base_tokens.insert(k_idx + 1, val)
-
-        i += 2 if has_val else 1
-
-    return base_tokens
 
 
 def load_zone_lines(path: Path) -> List[str]:

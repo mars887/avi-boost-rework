@@ -11,12 +11,15 @@ from utils.plan_model import (
     CHUNK_ORDER_OPTIONS,
     DEFAULT_CHUNK_ORDER,
     DEFAULT_SOURCE_LOADER,
+    DEFAULT_VIDEO_ENCODER,
     SOURCE_LOADER_OPTIONS,
     build_summary_rows,
     file_plan_from_gui_result,
     gui_defaults_from_file_plan,
     gui_settings_from_file_plan,
     load_file_plan,
+    normalize_encoder,
+    normalize_track_type,
     plan_path_for_source,
     probe_source_tracks,
     resolve_paths,
@@ -39,7 +42,6 @@ SUB_MODE_OPTIONS = ["COPY", "SKIP"]
 DEFAULT_OPTIONS = ["auto", "true", "false"]
 VIDEO_ENCODER_OPTIONS = ["svt-av1", "libx265"]
 TYPE_ORDER = {"video": 0, "audio": 1, "sub": 2}
-DEFAULT_VIDEO_ENCODER = "svt-av1"
 APP_BG = "#07111a"
 APP_SURFACE = "#0d1a29"
 APP_SURFACE_ALT = "#122334"
@@ -187,17 +189,7 @@ class DefaultSettings:
         self.note = note or ""
 
 
-def normalize_type(value):
-    if not value:
-        return ""
-    val = value.strip().lower()
-    if val.startswith("sub"):
-        return "sub"
-    if val.startswith("vid"):
-        return "video"
-    if val.startswith("aud"):
-        return "audio"
-    return val
+normalize_type = normalize_track_type
 
 
 def parse_id_rule(raw_value):
@@ -247,15 +239,6 @@ def parse_params_string(raw_value):
             result[key] = value
         idx += 1
     return result
-
-
-def normalize_encoder(value):
-    raw = str(value or "").strip().lower().replace("_", "-")
-    if raw in ("", "auto", "default", "svt-av1"):
-        return "svt-av1"
-    if raw in ("x265", "libx265"):
-        return "libx265"
-    return DEFAULT_VIDEO_ENCODER
 
 
 def get_param_value(params_map, key):

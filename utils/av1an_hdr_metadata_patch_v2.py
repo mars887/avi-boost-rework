@@ -45,7 +45,6 @@ import argparse
 import atexit
 import json
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -57,9 +56,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 LOG = logging.getLogger("av1an_hdrmeta_patch")
-STATE_DIR_NAME = ".state"
-HDR_PATCH_MARKER = "HDR_PATCH_DONE"
-RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 DEFAULT_ENCODER = "svt-av1"
 _MASTER_DISPLAY_PATTERN = re.compile(
     r"^G\((?P<gx>[0-9.]+),(?P<gy>[0-9.]+)\)"
@@ -237,27 +233,6 @@ def setup_logging(log_path: str, verbose: bool, workdir: Optional[Path] = None) 
     LOG.handlers.clear()
     LOG.addHandler(handler)
     LOG.setLevel(level)
-
-
-def state_root_from_workdir(workdir: Path) -> Path:
-    if workdir.name.lower() == "hdr_tmp" and workdir.parent.name.lower() == "video":
-        return workdir.parent.parent
-    return workdir
-
-
-def marker_path(workdir: Path) -> Path:
-    root = state_root_from_workdir(workdir)
-    return root / STATE_DIR_NAME / HDR_PATCH_MARKER
-
-
-def write_marker(workdir: Path) -> None:
-    p = marker_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
-
-
-def runner_managed_state() -> bool:
-    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def require_tool(name: str) -> None:
@@ -524,6 +499,58 @@ def build_x265_hdr10_static_params(
     if static.content_light:
         params.extend(["--max-cll", static.content_light])
     return params
+
+
+def _hdr10_static_from_payload(payload: Dict[str, Any]) -> Hdr10Static:
+    static = payload.get("static") or {}
+    if not isinstance(static, dict):
+        static = {}
+    return Hdr10Static(
+        color_primaries=static.get("color_primaries"),
+        transfer_characteristics=static.get("transfer_characteristics"),
+        matrix_coefficients=static.get("matrix_coefficients"),
+        color_range=static.get("color_range"),
+        chroma_sample_position=static.get("chroma_sample_position"),
+        mastering_display=static.get("mastering_display"),
+        content_light=static.get("content_light"),
+    )
+
+
+def build_x265_hdr10_params(payload: Dict[str, Any]) -> List[str]:
+    static = _hdr10_static_from_payload(payload)
+    params: List[str] = []
+    if bool(payload.get("has_hdr_signal")):
+        params.append("--hdr10")
+    if static.color_primaries:
+        value = normalize_x265_colorprim(static.color_primaries)
+        if value:
+            params.extend(["--colorprim", value])
+    if static.transfer_characteristics:
+        value = normalize_x265_transfer(static.transfer_characteristics)
+        if value:
+            params.extend(["--transfer", value])
+    if static.matrix_coefficients:
+        value = normalize_x265_matrix(static.matrix_coefficients)
+        if value:
+            params.extend(["--colormatrix", value])
+    if static.color_range:
+        value = normalize_x265_range(static.color_range)
+        if value:
+            params.extend(["--range", value])
+    master_display = convert_mastering_display_to_x265(static.mastering_display)
+    if master_display:
+        params.extend(["--master-display", master_display])
+    if static.content_light:
+        params.extend(["--max-cll", static.content_light])
+    return params
+
+
+def build_fastpass_hdr10_params(payload: Dict[str, Any], *, encoder: str) -> List[str]:
+    normalized = normalize_encoder(encoder)
+    if normalized == "svt-av1":
+        raw_params = payload.get("video_params") or []
+        return [str(item).strip() for item in raw_params if str(item).strip()]
+    return build_x265_hdr10_params(payload)
 
 
 def build_hdr10_static_params_for_encoder(
@@ -1108,10 +1135,6 @@ def main() -> None:
     scenes_in = Path(args.scenes).resolve()
     workdir = Path(args.workdir).resolve()
     setup_logging(args.log, args.verbose, workdir)
-    marker = marker_path(workdir)
-    if marker.exists() and not runner_managed_state():
-        LOG.info("Skip: marker exists: %s", marker)
-        return
     workdir.mkdir(parents=True, exist_ok=True)
 
     if not scenes_in.exists():
@@ -1240,8 +1263,6 @@ def main() -> None:
     # Save patched scenes
     out_path = (workdir / args.output).resolve()
     dump_json(out_path, scenes_data)
-    if not runner_managed_state():
-        write_marker(workdir)
 
     LOG.info("---------------------------------------------------")
     LOG.info("Done.")

@@ -3,29 +3,22 @@
 from __future__ import annotations
 
 import re
-from typing import Any, List, Optional, Sequence, Tuple
+import sys
+from pathlib import Path
+from typing import Any, List, Optional, Sequence
 
 from ab_logging import eprint
+
+PARENT_DIR = Path(__file__).resolve().parent.parent
+if str(PARENT_DIR) not in sys.path:
+    sys.path.insert(0, str(PARENT_DIR))
+
+from utils.param_utils import apply_override, find_last_option, is_param_key, strip_param_tokens
 
 _NUMBER_RE = re.compile(r"^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
 def strip_params_tokens(tokens: List[str], *, keys: Sequence[str]) -> List[str]:
-    keyset = set(keys)
-    out: List[str] = []
-    skip_next = False
-    for t in tokens:
-        if skip_next:
-            skip_next = False
-            continue
-        if t in keyset:
-            skip_next = True
-            continue
-        out.append(t)
-    return out
-
-def is_param_key(tok: str) -> bool:
-    # Treat only long options as keys to avoid breaking values like -1
-    return tok.startswith("--")
+    return strip_param_tokens(tokens, [str(key) for key in keys])
 
 def normalize_param_key(name: str) -> str:
     s = str(name).strip()
@@ -36,14 +29,6 @@ def normalize_param_key(name: str) -> str:
     if s.startswith("-"):
         return "--" + s.lstrip("-")
     return "--" + s
-
-def find_last_option(tokens: List[str], key: str) -> Optional[Tuple[int, bool]]:
-    # Returns (index_of_key, has_value_after_key)
-    for i in range(len(tokens) - 1, -1, -1):
-        if tokens[i] == key:
-            has_val = (i + 1 < len(tokens)) and (not is_param_key(tokens[i + 1]))
-            return i, has_val
-    return None
 
 def coerce_param_value(token: str) -> Any:
     if _NUMBER_RE.fullmatch(token):

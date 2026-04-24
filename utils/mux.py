@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
-import os
 import re
 import shlex
 import shutil
@@ -41,6 +40,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from utils.media_helpers import normalize_track_type as norm_type
+from utils.param_utils import apply_override, find_last_option, is_param_key, strip_param_tokens
 from utils.plan_model import resolve_file_plan
 
 
@@ -48,9 +49,6 @@ from utils.plan_model import resolve_file_plan
 # utils
 # ---------------------------
 
-STATE_DIR_NAME = ".state"
-MUX_MARKER = "MUX_DONE"
-RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 CRF_METADATA_STEP = 1.0
 SOURCE_BITRATE_TIMEOUT_SEC = 30.0
 SOURCE_BITRATE_TIMEOUT_CHECK_EVERY = 2048
@@ -141,17 +139,6 @@ def eprint(*a: Any) -> None:
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
-def marker_path(workdir: Path) -> Path:
-    return workdir / STATE_DIR_NAME / MUX_MARKER
-
-def write_marker(workdir: Path) -> None:
-    p = marker_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
-
-def runner_managed_state() -> bool:
-    return os.environ.get(RUNNER_MANAGED_STATE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
-
 def read_json(p: Path) -> Any:
     return json.loads(p.read_text(encoding="utf-8"))
 
@@ -161,16 +148,6 @@ def write_json(p: Path, obj: Any) -> None:
 
 def which_or(name: str) -> str:
     return shutil.which(name) or name
-
-def norm_type(t: str) -> str:
-    v = (t or "").strip().lower()
-    if v.startswith("vid") or v == "video":
-        return "video"
-    if v.startswith("aud") or v == "audio":
-        return "audio"
-    if v.startswith("sub") or v == "subtitle":
-        return "sub"
-    return v
 
 def is_skip(status: str) -> bool:
     return (status or "").strip().upper() == "SKIP"
@@ -630,64 +607,6 @@ def split_cmd_tokens(value: Any) -> List[str]:
     except ValueError:
         tokens = text.split()
     return [strip_outer_quotes(tok) for tok in tokens if str(tok).strip()]
-
-def is_param_key(tok: str) -> bool:
-    t = str(tok or "").strip()
-    return t.startswith("--") or t.startswith("-")
-
-def find_last_option(tokens: List[str], key: str) -> Optional[Tuple[int, bool]]:
-    for idx in range(len(tokens) - 1, -1, -1):
-        if tokens[idx] != key:
-            continue
-        has_value = (idx + 1 < len(tokens)) and (not is_param_key(tokens[idx + 1]))
-        return idx, has_value
-    return None
-
-def apply_override(base_tokens: List[str], override_tokens: List[str]) -> List[str]:
-    i = 0
-    while i < len(override_tokens):
-        tok = override_tokens[i]
-        if not is_param_key(tok):
-            i += 1
-            continue
-
-        key = tok
-        has_value = (i + 1 < len(override_tokens)) and (not is_param_key(override_tokens[i + 1]))
-        val = override_tokens[i + 1] if has_value else None
-
-        loc = find_last_option(base_tokens, key)
-        if loc is None:
-            base_tokens.append(key)
-            if val is not None:
-                base_tokens.append(val)
-        else:
-            key_idx, base_has_value = loc
-            if val is None:
-                if base_has_value:
-                    del base_tokens[key_idx + 1]
-            else:
-                if base_has_value:
-                    base_tokens[key_idx + 1] = val
-                else:
-                    base_tokens.insert(key_idx + 1, val)
-
-        i += 2 if has_value else 1
-
-    return base_tokens
-
-def strip_param_tokens(tokens: List[str], keys: List[str]) -> List[str]:
-    keys_set = {str(key) for key in keys}
-    out: List[str] = []
-    idx = 0
-    while idx < len(tokens):
-        tok = tokens[idx]
-        if tok in keys_set:
-            has_value = (idx + 1 < len(tokens)) and (not is_param_key(tokens[idx + 1]))
-            idx += 2 if has_value else 1
-            continue
-        out.append(tok)
-        idx += 1
-    return out
 
 def parse_decimal_value(value: Any) -> Optional[Decimal]:
     text = str(value or "").strip()
@@ -1197,10 +1116,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     mkvmerge = which_or(args.mkvmerge)
     setup_logging(args.log, workdir)
-    marker = marker_path(workdir)
-    if marker.exists() and not runner_managed_state():
-        print(f"[mux] skip: marker exists: {marker}")
-        return 0
 
     try:
         if not source.exists():
@@ -1246,8 +1161,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         run_cmd(cmd)
 
         print("[mux] OK")
-        if not runner_managed_state():
-            write_marker(workdir)
         return 0
 
     except Exception as ex:

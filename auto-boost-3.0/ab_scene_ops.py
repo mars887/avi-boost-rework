@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ab_encoder import normalize_encoder, scene_encoder_name
-from ab_params import find_last_option, is_param_key, strip_params_tokens
+from ab_params import apply_override, strip_params_tokens
 from ab_ssimu2 import calc_stats, parse_ssimu2_log, slice_samples_for_scene
 
 
@@ -92,38 +92,6 @@ def build_zone_overrides(
 ) -> Dict[str, Any]:
     """Build zone_overrides payload for a scene."""
     normalized_encoder = normalize_encoder(encoder)
-
-    def apply_override(base_tokens: List[str], override_tokens: List[str]) -> List[str]:
-        i = 0
-        while i < len(override_tokens):
-            tok = override_tokens[i]
-            if not is_param_key(tok):
-                i += 1
-                continue
-
-            key = tok
-            has_val = (i + 1 < len(override_tokens)) and (not is_param_key(override_tokens[i + 1]))
-            val = override_tokens[i + 1] if has_val else None
-
-            loc = find_last_option(base_tokens, key)
-            if loc is None:
-                base_tokens.append(key)
-                if val is not None:
-                    base_tokens.append(val)
-            else:
-                k_idx, base_has_val = loc
-                if val is None:
-                    if base_has_val:
-                        del base_tokens[k_idx + 1]
-                else:
-                    if base_has_val:
-                        base_tokens[k_idx + 1] = val
-                    else:
-                        base_tokens.insert(k_idx + 1, val)
-
-            i += 2 if has_val else 1
-
-        return base_tokens
 
     tokens = shlex.split(video_params_str) if video_params_str else []
     tokens = strip_params_tokens(tokens, keys=["--crf", "--preset"])
