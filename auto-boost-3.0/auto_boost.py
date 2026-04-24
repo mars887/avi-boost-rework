@@ -350,6 +350,7 @@ def main() -> int:
     required_metrics: List[str] = []
     if should_run(5):
         if args.rules or args.rules_inline:
+            eprint("[warn] rules execute as trusted Python code; do not run untrusted rule files.")
             if args.rules:
                 rules_path = Path(args.rules).expanduser().resolve()
                 ensure_exists(rules_path, "Rules file")

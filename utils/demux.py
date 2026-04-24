@@ -2,16 +2,14 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import atexit
 import json
 import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -23,6 +21,7 @@ from utils.media_helpers import (
     sanitize_component,
     subtitle_extension_from_codec as sub_ext_from_codec,
 )
+from utils.pipeline_runtime import setup_stage_logging, write_json as write_json_file
 from utils.plan_model import resolve_file_plan
 
 
@@ -30,92 +29,8 @@ def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
-class TeeStream:
-    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
-        self._stream = stream
-        self._log: Optional[TextIO] = log_file
-
-    def write(self, s: str) -> int:
-        try:
-            self._stream.write(s)
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.write(s)
-                self._log.flush()
-            except Exception:
-                self._log = None
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.flush()
-            except Exception:
-                self._log = None
-
-    def close_log(self) -> None:
-        if self._log is None:
-            return
-        try:
-            self._log.flush()
-        except Exception:
-            pass
-        try:
-            self._log.close()
-        except Exception:
-            pass
-        self._log = None
-
-    def isatty(self) -> bool:
-        return bool(getattr(self._stream, "isatty", lambda: False)())
-
-    @property
-    def encoding(self) -> str:
-        return getattr(self._stream, "encoding", "utf-8")
-
-
 def setup_logging(log_path: Optional[str], workdir: Optional[Path] = None) -> None:
-    if not log_path:
-        return
-    p = Path(log_path)
-    if not p.is_absolute() and workdir is not None:
-        p = workdir / p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    log_fh = p.open("a", encoding=enc, errors="replace")
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        log_fh.write(f"=== START demux {ts} ===\n")
-        log_fh.flush()
-    except Exception:
-        pass
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    tee_out = TeeStream(orig_stdout, log_fh)
-    tee_err = TeeStream(orig_stderr, log_fh)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-
-    def _cleanup() -> None:
-        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            log_fh.write(f"=== END demux {ts_end} ===\n")
-            log_fh.flush()
-        except Exception:
-            pass
-        sys.stdout = orig_stdout
-        sys.stderr = orig_stderr
-        tee_out.close_log()
-        tee_err.close_log()
-
-    atexit.register(_cleanup)
+    setup_stage_logging(log_path or "", stage_name="demux", base_dir=workdir)
 
 
 def ensure_dir(p: Path) -> None:
@@ -190,9 +105,7 @@ def run_cmd(cmd: List[str]) -> None:
 
 
 def write_json(p: Path, obj: Any) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+    write_json_file(p, obj)
 
 
 @dataclass

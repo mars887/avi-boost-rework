@@ -54,6 +54,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.pipeline_runtime import TeeStream, read_json as read_json_file, write_json as write_json_file
+
 
 LOG = logging.getLogger("av1an_hdrmeta_patch")
 DEFAULT_ENCODER = "svt-av1"
@@ -130,54 +136,6 @@ def normalize_x265_range(value: Any) -> Optional[str]:
         "full": "full",
     }
     return mapping.get(v, v)
-
-
-# --------------------------
-# Utilities
-# --------------------------
-
-class TeeStream:
-    def __init__(self, stream, log_file) -> None:
-        self._stream = stream
-        self._log = log_file
-
-    def write(self, s: str) -> int:
-        try:
-            self._stream.write(s)
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.write(s)
-                self._log.flush()
-            except Exception:
-                self._log = None
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.flush()
-            except Exception:
-                self._log = None
-
-    def close_log(self) -> None:
-        if self._log is None:
-            return
-        try:
-            self._log.flush()
-        except Exception:
-            pass
-        try:
-            self._log.close()
-        except Exception:
-            pass
-        self._log = None
 
 
 def setup_logging(log_path: str, verbose: bool, workdir: Optional[Path] = None) -> None:
@@ -330,11 +288,11 @@ def to_int(value: Any) -> Optional[int]:
 
 
 def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return read_json_file(path)
 
 
 def dump_json(path: Path, obj: Any) -> None:
-    path.write_text(json.dumps(obj, indent=4, ensure_ascii=False), encoding="utf-8")
+    write_json_file(path, obj, indent=4)
 
 
 def normalize_encoder(value: Optional[str], *, default: str = DEFAULT_ENCODER) -> str:

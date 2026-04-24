@@ -72,8 +72,8 @@ class TrackConfigGui:
             params=defaults_raw.get("params") or "",
             last_params=defaults_raw.get("lastParams") or defaults_raw.get("last_params") or "",
             zoning=defaults_raw.get("zoning") or "",
-            fastpass=defaults_raw.get("fastpass") or "",
-            mainpass=defaults_raw.get("mainpass") or "",
+            fastpass=defaults_raw.get("fastpass") or defaults_raw.get("fastpass_filter") or "",
+            mainpass=defaults_raw.get("mainpass") or defaults_raw.get("mainpass_filter") or "",
             scene_detection=defaults_raw.get("sceneDetection") or defaults_raw.get("scene_detection") or "",
             chunk_order=defaults_raw.get("chunkOrder") or defaults_raw.get("chunk_order") or DEFAULT_CHUNK_ORDER,
             encoder_path=defaults_raw.get("encoderPath") or defaults_raw.get("encoder_path") or "",
@@ -328,7 +328,7 @@ class TrackConfigGui:
         if mode == "int":
             return proposed.isdigit()
         if mode == "float":
-            return bool(re.fullmatch(r"\d*(?:\.\d*)?", proposed))
+            return bool(re.fullmatch(r"(?:\d+(?:\.\d*)?|\.\d+)", proposed))
         return True
 
     def _validate_avg_func_value(self, value):
@@ -1519,6 +1519,8 @@ class TrackConfigGui:
             "params": self.defaults.params,
             "last_params": self.defaults.last_params,
             "zoning": self.defaults.zoning,
+            "fastpass": self.defaults.fastpass,
+            "mainpass": self.defaults.mainpass,
             "fastpass_filter": self.defaults.fastpass,
             "mainpass_filter": self.defaults.mainpass,
             "scene_detection": self.defaults.scene_detection,

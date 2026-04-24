@@ -10,6 +10,9 @@ if str(ROOT) not in sys.path:
 from utils.plan_model import (
     CHUNK_ORDER_OPTIONS,
     DEFAULT_CHUNK_ORDER,
+    DEFAULT_FASTPASS_PARAMS,
+    DEFAULT_MAINPASS_PARAMS,
+    DEFAULT_QUALITY,
     DEFAULT_SOURCE_LOADER,
     DEFAULT_VIDEO_ENCODER,
     SOURCE_LOADER_OPTIONS,
@@ -20,6 +23,7 @@ from utils.plan_model import (
     load_file_plan,
     normalize_encoder,
     normalize_track_type,
+    params_map_to_tokens,
     plan_path_for_source,
     probe_source_tracks,
     resolve_paths,
@@ -657,9 +661,13 @@ def build_results(files, tracks_by_file, settings, defaults):
 
 
 def build_default_defaults_dict():
+    fastpass_tokens = params_map_to_tokens(DEFAULT_FASTPASS_PARAMS)
+    fastpass_tokens.extend(["--crf", str(int(DEFAULT_QUALITY) if float(DEFAULT_QUALITY).is_integer() else DEFAULT_QUALITY)])
+    mainpass_tokens = params_map_to_tokens(DEFAULT_MAINPASS_PARAMS)
+    mainpass_tokens.extend(["--crf", str(int(DEFAULT_QUALITY) if float(DEFAULT_QUALITY).is_integer() else DEFAULT_QUALITY)])
     return {
-        "params": "--variance-boost-strength 2 --variance-octile 6 --variance-boost-curve 3 --tune 0 --qm-min 7 --chroma-qm-min 10 --scm 0 --enable-dlf 2 --sharp-tx 1 --enable-restoration 0 --lp 3 --sharpness 1 --hbd-mds 1 --ac-bias 2.00 --crf 30",
-        "last_params": "--film-grain 14 --complex-hvs 1 --crf 30",
+        "params": " ".join(str(token) for token in fastpass_tokens),
+        "last_params": " ".join(str(token) for token in mainpass_tokens),
         "zoning": "",
         "fastpass": "",
         "mainpass": "",

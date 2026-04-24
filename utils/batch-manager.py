@@ -314,6 +314,46 @@ def remove_path(p: Path) -> None:
         print(f"[err] failed to remove {p}: {e}")
 
 
+def path_is_within(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def confirm_external_workdir_delete(group: SourceGroup) -> bool:
+    workdir = group.workdir.resolve()
+    source_dir = group.source_dir.resolve()
+    if path_is_within(workdir, source_dir):
+        return True
+    print("[warn] Workdir is outside the source directory:")
+    print(f"  source_dir: {source_dir}")
+    print(f"  workdir:    {workdir}")
+    print("Type the full workdir path to confirm deletion.")
+    return input("> ").strip().casefold() == str(workdir).casefold()
+
+
+def safe_to_delete_workdir(group: SourceGroup) -> bool:
+    workdir = group.workdir.resolve()
+    source_dir = group.source_dir.resolve()
+    if not workdir.exists():
+        return True
+    if not workdir.is_dir():
+        print(f"[err] refusing to delete non-directory workdir: {workdir}")
+        return False
+    if workdir == source_dir:
+        print(f"[err] refusing to delete source directory as workdir: {workdir}")
+        return False
+    if workdir == Path(workdir.anchor):
+        print(f"[err] refusing to delete filesystem root: {workdir}")
+        return False
+    if not is_workdir(workdir):
+        print(f"[err] refusing to delete path that does not look like a pbbatch workdir: {workdir}")
+        return False
+    return confirm_external_workdir_delete(group)
+
+
 def move_if_exists(src: Path, dst: Path) -> None:
     if not src.exists():
         return
@@ -540,6 +580,8 @@ def clear_stage_fastpass(group: SourceGroup) -> None:
 def full_clear_workdir(group: SourceGroup) -> None:
     workdir = group.workdir
     if not workdir.exists():
+        return
+    if not safe_to_delete_workdir(group):
         return
     remove_path(workdir)
 

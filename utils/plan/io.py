@@ -330,20 +330,27 @@ def resolve_batch_plan(batch_path: Path) -> List[ResolvedFilePlan]:
     plan_file = Path(batch_path).absolute()
     resolved: List[ResolvedFilePlan] = []
     seen: set[str] = set()
+    visiting: set[str] = set()
 
     def visit_plan(path: Path) -> None:
+        key = str(path.absolute()).lower()
+        if key in visiting:
+            raise RuntimeError(f"batch plan cycle detected at {path}")
         plan = load_plan(path)
         if isinstance(plan, FilePlan):
-            key = str(path.absolute()).lower()
             if key in seen:
                 return
             seen.add(key)
             resolved.append(ResolvedFilePlan(plan=plan, paths=resolve_paths(plan, path)))
             return
 
-        for item in plan.items:
-            nested = _resolve_path(item.plan, path.parent)
-            visit_plan(nested)
+        visiting.add(key)
+        try:
+            for item in plan.items:
+                nested = _resolve_path(item.plan, path.parent)
+                visit_plan(nested)
+        finally:
+            visiting.remove(key)
 
     batch = load_batch_plan(plan_file)
     for item in batch.items:

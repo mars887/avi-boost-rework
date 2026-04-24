@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import subprocess
 import sys
+import atexit
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Any, Iterable, List, Optional, Sequence, TextIO
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -112,6 +115,135 @@ def list_portable_encoder_binaries(encoder: str, *, portable_dir: Optional[Path]
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def final_output_path_for_source(source: Path) -> Path:
+    return source.parent / f"{source.stem}-av1.mkv"
+
+
+class TeeStream:
+    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
+        self._stream = stream
+        self._log: Optional[TextIO] = log_file
+
+    def write(self, s: str) -> int:
+        try:
+            self._stream.write(s)
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.write(s)
+                self._log.flush()
+            except Exception:
+                self._log = None
+        return len(s)
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._log is not None:
+            try:
+                self._log.flush()
+            except Exception:
+                self._log = None
+
+    def close_log(self) -> None:
+        if self._log is None:
+            return
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+        try:
+            self._log.close()
+        except Exception:
+            pass
+        self._log = None
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._stream, "isatty", lambda: False)())
+
+    @property
+    def encoding(self) -> str:
+        return getattr(self._stream, "encoding", "utf-8")
+
+
+def setup_stage_logging(log_path: str | Path, *, stage_name: str, base_dir: Optional[Path] = None) -> None:
+    if not log_path:
+        return
+    path = Path(log_path)
+    if not path.is_absolute() and base_dir is not None:
+        path = base_dir / path
+    ensure_dir(path.parent)
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    log_fh = path.open("a", encoding=enc, errors="replace")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        log_fh.write(f"=== START {stage_name} {ts} ===\n")
+        log_fh.flush()
+    except Exception:
+        pass
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    tee_out = TeeStream(orig_stdout, log_fh)
+    tee_err = TeeStream(orig_stderr, log_fh)
+    sys.stdout = tee_out
+    sys.stderr = tee_err
+
+    def _cleanup() -> None:
+        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            log_fh.write(f"=== END {stage_name} {ts_end} ===\n")
+            log_fh.flush()
+        except Exception:
+            pass
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
+        tee_out.close_log()
+        tee_err.close_log()
+
+    atexit.register(_cleanup)
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_json(path: Path, obj: Any, *, indent: int = 2) -> None:
+    ensure_dir(path.parent)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=indent), encoding="utf-8")
+
+
+def which_or(name: str, fallback: str = "") -> str:
+    return shutil.which(name) or fallback or name
+
+
+def run_cmd(
+    cmd: List[str],
+    *,
+    check: bool = False,
+    capture: bool = False,
+    cwd: Optional[Path] = None,
+    text: bool = True,
+    encoding: str = "utf-8",
+) -> subprocess.CompletedProcess:
+    kwargs: dict[str, Any] = {
+        "check": check,
+        "text": text,
+    }
+    if cwd is not None:
+        kwargs["cwd"] = str(cwd)
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    if text:
+        kwargs["encoding"] = encoding
+        kwargs["errors"] = "replace"
+    return subprocess.run(cmd, **kwargs)
 
 
 def windows_bat_lines(lines: Iterable[str]) -> str:

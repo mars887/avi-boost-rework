@@ -1,0 +1,9 @@
+# Core Python dependencies for GUI, font attachment analysis, metrics helpers, and plotting.
+# External binaries still need to be installed separately and available in PATH:
+# ffmpeg, ffprobe, mkvmerge/mkvextract, av1an, opusenc, hdr10plus_tool, dovi_tool.
+fonttools
+matplotlib
+numpy
+opencv-python
+tkinterdnd2
+tqdm

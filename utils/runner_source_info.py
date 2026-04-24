@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from utils.pipeline_runtime import ensure_dir
+from utils.pipeline_runtime import ensure_dir, final_output_path_for_source
 from utils.runner_state import (
     autoboost_fastpass_output,
     clear_stage_marker,
@@ -29,7 +29,7 @@ def source_info_path(item: Any) -> Path:
 
 
 def output_path_for_item(item: Any) -> Path:
-    return item.source.parent / f"{item.source.stem}-av1.mkv"
+    return final_output_path_for_source(item.source)
 
 
 def fastpass_output_path_for_item(item: Any) -> Path:
@@ -97,6 +97,9 @@ def _duration_from_ffprobe(payload: Dict[str, Any]) -> float:
 
 def build_source_info(item: Any) -> Dict[str, Any]:
     signature = source_signature(item.source)
+    # TODO: Replace this coarse disabled hash with per-stage plan signatures.
+    # The runner should invalidate only the affected stage groups, e.g. audio
+    # bitrate changes must not force video/autoboost stages to rerun.
     # plan_hash = file_sha256(item.plan_path)   temporarily disabled
     plan_hash = "0"
     ffprobe_payload: Dict[str, Any] = {}

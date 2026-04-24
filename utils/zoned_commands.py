@@ -52,10 +52,14 @@ def read_text_guess(path: Path) -> str:
     raw = Path(path).read_bytes()
     for encoding in ("utf-8-sig", "utf-8", "cp1251"):
         try:
-            return raw.decode(encoding)
+            return normalize_zoned_text(raw.decode(encoding))
         except Exception:
             continue
-    return raw.decode("utf-8", errors="replace")
+    return normalize_zoned_text(raw.decode("utf-8", errors="replace"))
+
+
+def normalize_zoned_text(text: str) -> str:
+    return str(text or "").replace("\u00c2\u00a0", " ").replace("\u00a0", " ")
 
 
 def merge_legacy_zoned_text(zone_text: str, crop_resize_text: str) -> str:

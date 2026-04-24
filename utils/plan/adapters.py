@@ -191,8 +191,8 @@ def file_plan_from_gui_result(
         ),
     )
     video_details = VideoDetails(
-        fastpass_filter=str(defaults.get("fastpass_filter") or ""),
-        mainpass_filter=str(defaults.get("mainpass_filter") or ""),
+        fastpass_filter=str(defaults.get("fastpass_filter") or defaults.get("fastpass") or ""),
+        mainpass_filter=str(defaults.get("mainpass_filter") or defaults.get("mainpass") or ""),
         main_vpy=str(defaults.get("main_vpy") or ""),
         fast_vpy=str(defaults.get("fast_vpy") or ""),
         proxy_vpy=str(defaults.get("proxy_vpy") or ""),

@@ -805,8 +805,8 @@ class SessionController:
             for sink in list(self.event_sinks):
                 try:
                     sink(payload, snapshot)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"[runner] event sink failed: {exc}", file=sys.stderr, flush=True)
 
     def _ingest_child_event(self, item: QueueItem, payload: Dict[str, Any]) -> None:
         plan_run_id = str(payload.get("plan_run_id") or "")
@@ -874,7 +874,8 @@ class SessionController:
                         continue
                     self._ingest_child_event(item, payload)
                 return fh.tell()
-        except Exception:
+        except Exception as exc:
+            print(f"[runner] failed to forward child events from {path}: {exc}", file=sys.stderr, flush=True)
             return offset
 
     @staticmethod

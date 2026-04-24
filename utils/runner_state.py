@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils.pipeline_runtime import final_output_path_for_source
+
 
 STAGE_ITEM = "Item"
 STAGE_DEMUX = "Demux"
@@ -232,7 +234,7 @@ def stage_marker_artifacts_valid(item: Any, stage: str) -> bool:
             return False
         return True
     if stage == STAGE_MUX:
-        return file_has_bytes(item.source.parent / f"{item.source.stem}-av1.mkv", MIN_VALID_MEDIA_BYTES)
+        return file_has_bytes(final_output_path_for_source(item.source), MIN_VALID_MEDIA_BYTES)
     return True
 
 

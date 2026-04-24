@@ -9,22 +9,21 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.media_helpers import normalize_track_type as norm_type
+from utils.pipeline_runtime import read_json as read_json_file, setup_stage_logging
 from utils.plan_model import resolve_file_plan
 
 
@@ -38,92 +37,8 @@ def eprint(*a: Any) -> None:
     print(*a, file=sys.stderr)
 
 
-class TeeStream:
-    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
-        self._stream = stream
-        self._log: Optional[TextIO] = log_file
-
-    def write(self, s: str) -> int:
-        try:
-            self._stream.write(s)
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.write(s)
-                self._log.flush()
-            except Exception:
-                self._log = None
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.flush()
-            except Exception:
-                self._log = None
-
-    def close_log(self) -> None:
-        if self._log is None:
-            return
-        try:
-            self._log.flush()
-        except Exception:
-            pass
-        try:
-            self._log.close()
-        except Exception:
-            pass
-        self._log = None
-
-    def isatty(self) -> bool:
-        return bool(getattr(self._stream, "isatty", lambda: False)())
-
-    @property
-    def encoding(self) -> str:
-        return getattr(self._stream, "encoding", "utf-8")
-
-
 def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
-    if not log_path:
-        return
-    p = Path(log_path)
-    if not p.is_absolute() and workdir is not None:
-        p = workdir / p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    log_fh = p.open("a", encoding=enc, errors="replace")
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        log_fh.write(f"=== START verify {ts} ===\n")
-        log_fh.flush()
-    except Exception:
-        pass
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    tee_out = TeeStream(orig_stdout, log_fh)
-    tee_err = TeeStream(orig_stderr, log_fh)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-
-    def _cleanup() -> None:
-        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            log_fh.write(f"=== END verify {ts_end} ===\n")
-            log_fh.flush()
-        except Exception:
-            pass
-        sys.stdout = orig_stdout
-        sys.stderr = orig_stderr
-        tee_out.close_log()
-        tee_err.close_log()
-
-    atexit.register(_cleanup)
+    setup_stage_logging(log_path, stage_name="verify", base_dir=workdir)
 
 
 def sanitize_error_id(s: str) -> str:
@@ -145,7 +60,7 @@ def resolve_rel_to_workdir(workdir: Path, p: str) -> Path:
 
 
 def read_json(p: Path) -> Any:
-    return json.loads(p.read_text(encoding="utf-8"))
+    return read_json_file(p)
 
 
 def which_or(path_or_name: str) -> Optional[str]:
