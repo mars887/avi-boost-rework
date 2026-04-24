@@ -31,6 +31,7 @@ from utils.discord_ui import (
     channel_status_key,
     dashboard_major_signature,
     display_filename,
+    display_stage_name,
     ensure_uploadable,
     fmt_duration,
     fmt_seconds,
@@ -221,6 +222,8 @@ async def run_bot(config: BotConfig) -> None:
     last_channel_rename_at: Dict[str, float] = {}
     sent_failed_event_keys: Dict[str, float] = {}
     startup_reconciled = False
+    stale_monitor_started = False
+    stale_sessions_marked: set[str] = set()
 
     def is_authorized(interaction: Any) -> bool:
         user = getattr(interaction, "user", None)
@@ -253,12 +256,14 @@ async def run_bot(config: BotConfig) -> None:
         session_id = str(row["session_id"] or "")
         if not source_dir or not session_id or latest_session_by_source.get(source_dir) != session_id:
             return False
+        snapshot = snapshot_from_row(row)
         try:
-            if time.time() - float(row["updated_at"] or 0.0) > SESSION_STALE_SECONDS:
+            heartbeat_at = float(snapshot.get("snapshot_at") or row["updated_at"] or 0.0)
+            if time.time() - heartbeat_at > SESSION_STALE_SECONDS:
                 return False
         except Exception:
             return False
-        state = str(snapshot_from_row(row).get("state") or "").strip().lower()
+        state = str(snapshot.get("state") or "").strip().lower()
         return state not in ("finished", "offline")
 
     def offline_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -517,6 +522,32 @@ async def run_bot(config: BotConfig) -> None:
             if row is not None:
                 await update_dashboard(snapshot, force=True)
 
+    async def mark_stale_sessions_offline_once() -> None:
+        for folder in store.folder_rows():
+            source_dir = str(folder["source_dir"] or "")
+            if not source_dir:
+                continue
+            row = store.latest_session_for_source_dir(source_dir)
+            if row is None:
+                continue
+            session_id = str(row["session_id"] or "")
+            if not session_id or session_id in stale_sessions_marked or is_live_session_row(row):
+                continue
+            snapshot = snapshot_from_row(row)
+            if str(snapshot.get("state") or "").strip().lower() in ("finished", "offline"):
+                continue
+            stale_sessions_marked.add(session_id)
+            print(f"[discord-bot] runner session stale, marking offline: {session_id}", flush=True)
+            await update_dashboard(offline_snapshot(snapshot), force=True)
+
+    async def stale_session_monitor() -> None:
+        while True:
+            await asyncio.sleep(max(5.0, min(15.0, SESSION_STALE_SECONDS / 3.0)))
+            try:
+                await mark_stale_sessions_offline_once()
+            except Exception as exc:
+                print(f"[discord-bot] stale monitor failed: {exc}", flush=True)
+
     async def delayed_dashboard_update(session_id: str, generation: int, delay: float) -> None:
         try:
             await asyncio.sleep(max(0.0, delay))
@@ -557,6 +588,8 @@ async def run_bot(config: BotConfig) -> None:
         source_dir = str(snapshot.get("source_dir") or "")
         if not session_id or not source_dir:
             return
+        if live and not snapshot.get("snapshot_at"):
+            snapshot["snapshot_at"] = time.time()
         lock = dashboard_locks.setdefault(source_dir, asyncio.Lock())
         async with lock:
             owner_session_id = latest_session_by_source.get(source_dir)
@@ -1038,11 +1071,14 @@ async def run_bot(config: BotConfig) -> None:
 
     @client.event
     async def on_ready() -> None:
-        nonlocal startup_reconciled
+        nonlocal startup_reconciled, stale_monitor_started
         await tree.sync(guild=guild_object)
         if not startup_reconciled:
             startup_reconciled = True
             await reconcile_existing_channels()
+        if not stale_monitor_started:
+            stale_monitor_started = True
+            asyncio.create_task(stale_session_monitor())
         print(f"[discord-bot] logged in as {client.user}", flush=True)
 
     @tree.command(name="panel", description="Refresh the PBBatch dashboard in this channel.", guild=guild_object)
@@ -1160,6 +1196,7 @@ async def run_bot(config: BotConfig) -> None:
         source_dir = str(snapshot.get("source_dir") or "")
         if session_id and source_dir:
             latest_session_by_source[source_dir] = session_id
+            stale_sessions_marked.discard(session_id)
         settings = store.folder_settings(source_dir) if source_dir else {}
         startup_delay = max(0.0, float(settings.get("startup_delay_seconds", DEFAULT_RUNNER_STARTUP_DELAY_SECONDS)))
         if session_id and startup_delay > 0:

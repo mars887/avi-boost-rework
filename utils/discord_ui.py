@@ -24,6 +24,8 @@ STAGE_DISPLAY_NAMES = {
     "Auto-Boost: Scene Detection": "Auto-Boost: SCD",
     "Auto-Boost: PSD Scene Detection": "PSD Scene Detect",
 }
+AUTOBOOST_PARENT_STAGES = {"Auto-Boost: Scene Detection", "Auto-Boost: PSD Scene Detection"}
+AUTOBOOST_CHILD_STAGES = {"Fastpass", "SSIMU2 Metrics"}
 
 
 def sanitize_channel_component(value: str, *, fallback: str = "folder", limit: int = 70) -> str:
@@ -174,7 +176,18 @@ def display_stage_name(stage: Dict[str, Any]) -> str:
 
 def is_cached_stage(stage: Dict[str, Any]) -> bool:
     message = str(stage.get("message") or "").strip().lower()
-    return message in ("cached", "resume", "using_existing_base_scenes")
+    if message in ("cached", "resume", "using_existing_base_scenes"):
+        return True
+    status = str(stage.get("status") or "").strip().lower()
+    if status not in ("completed", "skipped"):
+        return False
+    try:
+        elapsed = float(stage.get("elapsed_seconds") or 0.0)
+        started_at = float(stage.get("started_at") or 0.0)
+        ended_at = float(stage.get("ended_at") or 0.0)
+    except Exception:
+        return False
+    return elapsed <= 0.0 and started_at <= 0.0 and ended_at <= 0.0
 
 
 def progress_bar(progress: Any, width: int = 23) -> str:
@@ -212,10 +225,18 @@ def render_stage_table(stages: List[Dict[str, Any]]) -> str:
     if not stages:
         return ""
     name_width = max(10, min(max(len(display_stage_name(stage)) for stage in stages), 36))
+    autoboost_child_started = any(
+        str(stage.get("name") or "") in AUTOBOOST_CHILD_STAGES
+        and str(stage.get("status") or "").lower() == "started"
+        for stage in stages
+    )
     lines: List[str] = []
     for stage in stages:
+        raw_name = str(stage.get("name") or "")
         name = clip_field(display_stage_name(stage), name_width)
         status = str(stage.get("status") or "pending").lower()
+        if raw_name in AUTOBOOST_PARENT_STAGES and status == "started" and autoboost_child_started:
+            status = "completed"
         cached = is_cached_stage(stage)
         icon = PENDING_SQUARE
         if status == "failed":
@@ -421,6 +442,17 @@ def render_plan_detail(plan: Dict[str, Any]) -> str:
     return f"{header}\n\n{elapsed}\n```text\n{table}\n```"
 
 
+def plan_overview_elapsed_label(item: Dict[str, Any]) -> str:
+    status = str(item.get("status") or "").lower()
+    if status == "skipped":
+        return "skipped"
+    try:
+        elapsed = float(item.get("elapsed_seconds") or 0.0)
+    except Exception:
+        elapsed = 0.0
+    return "cached" if status == "completed" and elapsed < 1.0 else fmt_seconds(elapsed)
+
+
 def render_overview_embed(discord_module: Any, snapshot: Dict[str, Any]) -> Any:
     embed = discord_module.Embed(title="Plans", color=0x2B2D31)
     lines: List[str] = []
@@ -437,7 +469,7 @@ def render_overview_embed(discord_module: Any, snapshot: Dict[str, Any]) -> Any:
             item,
             f"{fmt_duration(item.get('duration_seconds')):<7}",
             plan_size_overview_field(item),
-            "skipped" if skipped else fmt_seconds(item.get("elapsed_seconds")),
+            plan_overview_elapsed_label(item),
         )
     for item in list(snapshot.get("failed") or [])[-6:]:
         row(

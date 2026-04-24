@@ -480,6 +480,7 @@ class SessionController:
                 "session_id": session_id or self.session_id,
                 "runner_session_id": self.session_id,
                 "source_dir": selected_source,
+                "snapshot_at": time.time(),
                 "state": state,
                 "paused": paused,
                 "pause_after_current": pause_after_current,
@@ -703,7 +704,7 @@ class SessionController:
                 stage_state = active.stage(stage)
                 if (
                     stage in (STAGE_FASTPASS, STAGE_SSIMU2)
-                    and status in ("completed", "failed")
+                    and status in ("started", "completed", "failed")
                 ):
                     for parent_name in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE):
                         parent_state = next((item for item in active.stages if item.name == parent_name), None)
@@ -753,6 +754,16 @@ class SessionController:
                         stage_state.ended_at = 0.0
                     else:
                         stage_state.ended_at = timestamp
+                if (
+                    stage in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE)
+                    and stage_state.status == "started"
+                    and any(
+                        child.name in (STAGE_FASTPASS, STAGE_SSIMU2) and child.status == "started"
+                        for child in active.stages
+                    )
+                ):
+                    stage_state.status = "completed"
+                    stage_state.ended_at = timestamp
                 if progress is not None and progress >= 0:
                     stage_state.progress = progress
                 started_at = stage_state.started_at
