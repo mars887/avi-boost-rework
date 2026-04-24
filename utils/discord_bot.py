@@ -32,9 +32,14 @@ from utils.discord_store import (
 )
 from utils.zoned_commands import ZONED_COMMAND_NAME
 
-import discord  # type: ignore[import-not-found]
-from aiohttp import web  # type: ignore[import-not-found]
-from discord import app_commands  # type: ignore[import-not-found]
+try:
+    import discord  # type: ignore[import-not-found]
+    from aiohttp import web  # type: ignore[import-not-found]
+    from discord import app_commands  # type: ignore[import-not-found]
+except ImportError:
+    discord = None  # type: ignore[assignment]
+    web = None  # type: ignore[assignment]
+    app_commands = None  # type: ignore[assignment]
 
 
 
@@ -45,6 +50,7 @@ MAX_UPLOAD_MB_DEFAULT = 25
 LOADER_FILE_TTL_SECONDS = 600.0
 ADMINS_ONLY = False
 INACTIVE_MESSAGE_TEXT = "Runner is not connected for this folder. This message will be removed when a runner registers again."
+SESSION_STALE_SECONDS = 45.0
 
 COMMANDS = {
     "pause_after_current": "Pause",
@@ -462,6 +468,11 @@ def probe_media_duration(path: Path) -> str:
     return "-"
 
 
+async def probe_media_duration_async(path: Path) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, probe_media_duration, path)
+
+
 def list_ivf_files(plan: Dict[str, Any], pass_name: str, *, count: int, sort_mode: str) -> List[Path]:
     workdir = Path(str(plan.get("workdir") or "")).resolve()
     folder = workdir / "video" / f"{pass_name}pass" / "encode"
@@ -699,6 +710,8 @@ async def run_bot(config: BotConfig) -> None:
         raise RuntimeError("discord.py and aiohttp are required. Install requirements-discord.txt first.")
     if not config.token or not config.guild_id or not config.category_id:
         raise RuntimeError("PBBATCH_DISCORD_TOKEN, PBBATCH_DISCORD_GUILD_ID and PBBATCH_DISCORD_CATEGORY_ID are required.")
+    if config.host not in ("127.0.0.1", "localhost", "::1") and not config.shared_secret:
+        raise RuntimeError("PBBATCH_DISCORD_SHARED_SECRET is required when the bot service is not bound to localhost.")
 
     store = StateStore(config.db_path)
     intents = discord.Intents.default()
@@ -717,6 +730,7 @@ async def run_bot(config: BotConfig) -> None:
     dashboard_locks: Dict[str, Any] = {}
     loader_files: Dict[str, Tuple[Path, float]] = {}
     last_channel_rename_at: Dict[str, float] = {}
+    sent_failed_event_keys: Dict[str, float] = {}
     startup_reconciled = False
 
     def is_authorized(interaction: Any) -> bool:
@@ -749,6 +763,11 @@ async def run_bot(config: BotConfig) -> None:
         source_dir = str(row["source_dir"] or "")
         session_id = str(row["session_id"] or "")
         if not source_dir or not session_id or latest_session_by_source.get(source_dir) != session_id:
+            return False
+        try:
+            if time.time() - float(row["updated_at"] or 0.0) > SESSION_STALE_SECONDS:
+                return False
+        except Exception:
             return False
         state = str(snapshot_from_row(row).get("state") or "").strip().lower()
         return state not in ("finished", "offline")
@@ -1474,9 +1493,10 @@ async def run_bot(config: BotConfig) -> None:
             if not files:
                 await interaction.followup.send(f"No `{pass_name}pass` ivf files found.", ephemeral=True)
                 return
+            durations = await asyncio.gather(*(probe_media_duration_async(path) for path in files))
             rows = []
-            for index, path in enumerate(files, start=1):
-                rows.append(f"{index:>2} | {probe_media_duration(path):>9} | {fmt_size(path.stat().st_size):>9} | {path.name}")
+            for index, (path, duration) in enumerate(zip(files, durations), start=1):
+                rows.append(f"{index:>2} | {duration:>9} | {fmt_size(path.stat().st_size):>9} | {path.name}")
             await interaction.followup.send(
                 f"```text\n{truncate(chr(10).join(rows), 1900)}\n```",
                 view=build_loader_view(files),
@@ -1672,6 +1692,18 @@ async def run_bot(config: BotConfig) -> None:
         store.add_event(session_id, event)
         await update_dashboard(snapshot, live=True)
         if event.get("status") == "failed":
+            stage = str(event.get("stage") or "")
+            plan_run_id = str(event.get("plan_run_id") or "")
+            if stage == "Item":
+                return web.json_response({"status": "ok"})
+            now = time.monotonic()
+            for key, sent_at in list(sent_failed_event_keys.items()):
+                if now - sent_at > 3600.0:
+                    sent_failed_event_keys.pop(key, None)
+            event_key = f"{session_id}:{plan_run_id}:{stage}"
+            if event_key in sent_failed_event_keys:
+                return web.json_response({"status": "ok"})
+            sent_failed_event_keys[event_key] = now
             row = store.get_session(session_id)
             if row:
                 channel = client.get_channel(int(row["channel_id"]))

@@ -125,8 +125,14 @@ def resolve_paths(plan: FilePlan, plan_path: Path) -> ResolvedPaths:
     plan_file = Path(plan_path).absolute()
     base_dir = plan_file.parent
     source = _resolve_path(plan.paths.source, base_dir)
-    workdir = (base_dir / _workdir_name(plan, source)).resolve()
-    zoned_file = zoned_command_path(workdir).resolve()
+    workdir_raw = str(plan.paths.workdir or "").strip()
+    workdir = _resolve_path(workdir_raw, base_dir) if workdir_raw else (base_dir / _workdir_name(plan, source)).resolve()
+    zone_raw = str(plan.paths.zone_file or "").strip()
+    if zone_raw:
+        zone_path = Path(zone_raw).expanduser()
+        zoned_file = zone_path.resolve() if zone_path.is_absolute() else (workdir / zone_path).resolve()
+    else:
+        zoned_file = zoned_command_path(workdir).resolve()
     return ResolvedPaths(
         plan_path=plan_file,
         source=source,
@@ -206,6 +212,7 @@ def _reorder_file_plan_blocks(lines: List[str]) -> List[str]:
 
     preferred = [
         None,
+        "[paths]",
         "[video]",
         "[video.primary]",
         "[video.pipeline]",
@@ -525,6 +532,13 @@ def _dump_file_plan(plan: FilePlan) -> str:
     lines.append(f"quality = {_toml_scalar(plan.video.primary.quality)}")
     lines.append(f"preset = {_toml_scalar(coerce_scalar(plan.video.primary.preset))}")
     lines.append("")
+    if str(plan.paths.workdir or "").strip() or str(plan.paths.zone_file or "").strip():
+        lines.append("[paths]")
+        if str(plan.paths.workdir or "").strip():
+            lines.append(f"workdir = {_toml_string(plan.paths.workdir)}")
+        if str(plan.paths.zone_file or "").strip():
+            lines.append(f"zone_file = {_toml_string(plan.paths.zone_file)}")
+        lines.append("")
 
     lines.extend(_comment_block("PARAMS"))
     lines.append("[video.fastpass.params]")

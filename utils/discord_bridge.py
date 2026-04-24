@@ -41,6 +41,7 @@ class DiscordBridge:
         self.last_error_at = 0.0
         self.ever_connected = False
         self.error_callback: Optional[Callable[[str], None]] = None
+        self.executed_commands: Dict[str, tuple[str, str]] = {}
 
     def attach(self, *, snapshot_provider: SnapshotProvider, command_handler: CommandHandler) -> None:
         self.snapshot_provider = snapshot_provider
@@ -137,11 +138,18 @@ class DiscordBridge:
                     continue
                 status = "ok"
                 message = ""
-                try:
-                    message = self.command_handler(name)
-                except Exception as exc:
-                    status = "error"
-                    message = str(exc)
+                if command_id in self.executed_commands:
+                    status, message = self.executed_commands[command_id]
+                else:
+                    try:
+                        message = self.command_handler(name)
+                    except Exception as exc:
+                        status = "error"
+                        message = str(exc)
+                    self.executed_commands[command_id] = (status, message)
+                    if len(self.executed_commands) > 500:
+                        for old_id in list(self.executed_commands)[:100]:
+                            self.executed_commands.pop(old_id, None)
                 self._post(
                     f"/api/commands/{command_id}/ack",
                     {
