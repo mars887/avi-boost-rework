@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Tuple
 from utils.zoned_commands import ZONED_COMMAND_NAME
 
 MAX_EMBED_FIELD = 1024
+MAX_ACTIVE_PLAN_DISPLAY = 3
 
 DONE_SQUARE = "\U0001F7E9"
 RUNNING_SQUARE = "\U0001F7E6"
@@ -479,7 +480,7 @@ def render_overview_embed(discord_module: Any, snapshot: Dict[str, Any]) -> Any:
             clip_field(str(item.get("stage") or "-"), 22),
             truncate(str(item.get("message") or "failed"), 80),
         )
-    for item in list(snapshot.get("active") or [])[:6]:
+    for item in list(snapshot.get("active") or [])[:MAX_ACTIVE_PLAN_DISPLAY]:
         row(
             RUNNING_SQUARE,
             item,
@@ -510,12 +511,15 @@ def render_current_embed(discord_module: Any, snapshot: Dict[str, Any]) -> Any:
 
     title = "Active plans" if len(active) > 1 else display_filename(active[0])
     embed = discord_module.Embed(title=title, color=0x5865F2)
-    for index, plan in enumerate(active[:6]):
+    visible = active[:MAX_ACTIVE_PLAN_DISPLAY]
+    for index, plan in enumerate(visible):
         value = truncate(render_plan_detail(plan), 4000 if len(active) == 1 else 1000)
         if len(active) == 1:
             embed.description = value
         else:
             embed.add_field(name=display_filename(plan) or f"plan {index + 1}", value=value, inline=False)
+    if len(active) > len(visible):
+        embed.set_footer(text=f"{len(active) - len(visible)} more active plan(s) not shown")
     return embed
 
 

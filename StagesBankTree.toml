@@ -1,0 +1,64 @@
+[bank]
+capacity = 10
+max_active_plans = 3
+max_running_stages = 5
+
+[stages.Demux]
+cost = 2
+priority = 2
+requires = []
+
+[stages."Attachments cleanup"]
+cost = 1
+priority = 2
+requires = ["Demux"]
+
+[stages."Auto-Boost: Scene Detection"]
+cost = 3
+priority = 2
+requires = ["Demux"]
+
+[stages."Auto-Boost: PSD Scene Detection"]
+cost = 4
+priority = 2
+requires = ["Demux"]
+
+[stages.Fastpass]
+cost = 10
+priority = 3
+requires = ["Auto-Boost: Scene Detection", "Auto-Boost: PSD Scene Detection"]
+
+[stages."SSIMU2 Metrics"]
+cost = 5
+priority = 2
+requires = ["Fastpass"]
+
+[stages."Zone Edit"]
+cost = 2
+priority = 2
+requires = ["SSIMU2 Metrics", "Auto-Boost: Scene Detection", "Auto-Boost: PSD Scene Detection"]
+
+[stages."HDR Patch"]
+cost = 2
+priority = 2
+requires = ["Zone Edit"]
+
+[stages.Mainpass]
+cost = 10
+priority = 3
+requires = ["HDR Patch"]
+
+[stages."Audio Tool"]
+cost = 2
+priority = 2
+requires = ["Demux"]
+
+[stages.Verify]
+cost = 1
+priority = 1
+requires = ["Attachments cleanup", "Audio Tool", "Mainpass"]
+
+[stages.Mux]
+cost = 3
+priority = 1
+requires = ["Verify"]

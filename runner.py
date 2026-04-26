@@ -9,11 +9,12 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from utils.discord_config import discord_config_value
 from utils.discord_bridge import DiscordBridge
@@ -26,7 +27,7 @@ from utils.pipeline_runtime import (
     load_toolchain,
     read_command_output,
 )
-from utils.plan_model import BatchPlan, FilePlan, ResolvedFilePlan, RunnerEvent, load_plan, resolve_file_plan
+from utils.plan_model import FilePlan, ResolvedFilePlan, RunnerEvent, load_plan, resolve_file_plan
 from utils.runner_state import (
     CACHED_STAGE_MESSAGE,
     RUNNER_MANAGED_STATE_ENV,
@@ -43,7 +44,6 @@ from utils.runner_state import (
     STAGE_SSIMU2,
     STAGE_VERIFY,
     STAGE_ZONE_EDIT,
-    autoboost_scene_stage,
     clear_stage_marker,
     display_stage_plan,
     is_cached_stage_message,
@@ -86,6 +86,229 @@ _AV1AN_PROGRESS_JSONL_SUPPORT: Dict[str, bool] = {}
 CHILD_EVENT_ENV = "PBBATCH_RUNNER_CHILD_EVENTS_JSONL"
 SESSION_ID_ENV = "PBBATCH_RUNNER_SESSION_ID"
 PLAN_RUN_ID_ENV = "PBBATCH_RUNNER_PLAN_RUN_ID"
+STAGE_BANK_CONFIG_FILE = ROOT_DIR / "StagesBankTree.toml"
+TERMINAL_STAGE_STATUSES = {"completed", "failed", "skipped"}
+
+
+@dataclass(frozen=True)
+class StageBankStage:
+    cost: int = 1
+    priority: int = 2
+    requires: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class StageBankConfig:
+    capacity: int
+    max_active_plans: int
+    max_running_stages: int
+    stages: Dict[str, StageBankStage]
+
+    def stage_cost(self, stage: str) -> int:
+        return max(1, int(self.stages.get(stage, StageBankStage()).cost))
+
+    def stage_priority(self, stage: str) -> int:
+        return max(1, int(self.stages.get(stage, StageBankStage()).priority))
+
+    def stage_requires(self, stage: str) -> Tuple[str, ...]:
+        return tuple(self.stages.get(stage, StageBankStage()).requires)
+
+
+KNOWN_STAGE_NAMES = {
+    STAGE_DEMUX,
+    STAGE_ATTACHMENTS,
+    STAGE_AUTOBOOST_SCENE,
+    STAGE_AUTOBOOST_PSD_SCENE,
+    STAGE_FASTPASS,
+    STAGE_SSIMU2,
+    STAGE_ZONE_EDIT,
+    STAGE_HDR_PATCH,
+    STAGE_MAINPASS,
+    STAGE_AUDIO,
+    STAGE_VERIFY,
+    STAGE_MUX,
+}
+
+
+DEFAULT_STAGE_BANK = StageBankConfig(
+    capacity=10,
+    max_active_plans=3,
+    max_running_stages=5,
+    stages={
+        STAGE_DEMUX: StageBankStage(cost=2),
+        STAGE_ATTACHMENTS: StageBankStage(cost=1, requires=(STAGE_DEMUX,)),
+        STAGE_AUTOBOOST_SCENE: StageBankStage(cost=3, requires=(STAGE_DEMUX,)),
+        STAGE_AUTOBOOST_PSD_SCENE: StageBankStage(cost=4, requires=(STAGE_DEMUX,)),
+        STAGE_FASTPASS: StageBankStage(
+            cost=10,
+            priority=1,
+            requires=(STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE),
+        ),
+        STAGE_SSIMU2: StageBankStage(cost=5, requires=(STAGE_FASTPASS,)),
+        STAGE_ZONE_EDIT: StageBankStage(
+            cost=2,
+            requires=(STAGE_SSIMU2, STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE),
+        ),
+        STAGE_HDR_PATCH: StageBankStage(cost=2, requires=(STAGE_ZONE_EDIT,)),
+        STAGE_MAINPASS: StageBankStage(cost=10, priority=1, requires=(STAGE_HDR_PATCH,)),
+        STAGE_AUDIO: StageBankStage(cost=2, requires=(STAGE_DEMUX,)),
+        STAGE_VERIFY: StageBankStage(
+            cost=1,
+            priority=3,
+            requires=(STAGE_ATTACHMENTS, STAGE_AUDIO, STAGE_MAINPASS),
+        ),
+        STAGE_MUX: StageBankStage(cost=3, priority=3, requires=(STAGE_VERIFY,)),
+    },
+)
+
+
+def _validated_stage_bank_config(
+    *,
+    capacity: int,
+    max_active_plans: int,
+    max_running_stages: int,
+    stages: Dict[str, StageBankStage],
+) -> StageBankConfig:
+    for stage_name, stage in stages.items():
+        if int(stage.cost) > capacity:
+            raise RuntimeError(f"stage cost exceeds bank capacity: {stage_name}")
+    _validate_stage_bank_acyclic(stages)
+    return StageBankConfig(
+        capacity=capacity,
+        max_active_plans=max_active_plans,
+        max_running_stages=max_running_stages,
+        stages=stages,
+    )
+
+
+def _validate_stage_bank_acyclic(stages: Dict[str, StageBankStage]) -> None:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(stage_name: str, path: List[str]) -> None:
+        if stage_name in visited:
+            return
+        if stage_name in visiting:
+            try:
+                start = path.index(stage_name)
+            except ValueError:
+                start = 0
+            cycle = path[start:] + [stage_name]
+            raise RuntimeError(f"stage bank dependency cycle: {' -> '.join(cycle)}")
+        visiting.add(stage_name)
+        path.append(stage_name)
+        for dependency in stages.get(stage_name, StageBankStage()).requires:
+            if dependency in stages:
+                visit(dependency, path)
+        path.pop()
+        visiting.remove(stage_name)
+        visited.add(stage_name)
+
+    for stage_name in stages:
+        visit(stage_name, [])
+
+
+def load_stage_bank_config(path: Path = STAGE_BANK_CONFIG_FILE) -> StageBankConfig:
+    if not path.exists():
+        return DEFAULT_STAGE_BANK
+    try:
+        with path.open("rb") as fh:
+            payload = tomllib.load(fh)
+    except Exception as exc:
+        raise RuntimeError(f"failed to read stage bank config {path}: {exc}") from exc
+
+    bank = dict(payload.get("bank") or {})
+    try:
+        capacity = int(bank.get("capacity", DEFAULT_STAGE_BANK.capacity))
+    except Exception as exc:
+        raise RuntimeError("stage bank capacity must be an integer") from exc
+    if capacity <= 0:
+        raise RuntimeError("stage bank capacity must be greater than zero")
+    try:
+        max_active_plans = int(bank.get("max_active_plans", DEFAULT_STAGE_BANK.max_active_plans))
+    except Exception as exc:
+        raise RuntimeError("stage bank max_active_plans must be an integer") from exc
+    if max_active_plans <= 0:
+        raise RuntimeError("stage bank max_active_plans must be greater than zero")
+    try:
+        max_running_stages = int(bank.get("max_running_stages", DEFAULT_STAGE_BANK.max_running_stages))
+    except Exception as exc:
+        raise RuntimeError("stage bank max_running_stages must be an integer") from exc
+    if max_running_stages <= 0:
+        raise RuntimeError("stage bank max_running_stages must be greater than zero")
+
+    raw_stages = payload.get("stages")
+    if raw_stages is None:
+        return _validated_stage_bank_config(
+            capacity=capacity,
+            max_active_plans=max_active_plans,
+            max_running_stages=max_running_stages,
+            stages=dict(DEFAULT_STAGE_BANK.stages),
+        )
+    if not isinstance(raw_stages, dict):
+        raise RuntimeError("stage bank [stages] section must be a table")
+
+    stages: Dict[str, StageBankStage] = {}
+    for name, raw_stage in raw_stages.items():
+        stage_name = str(name or "").strip()
+        if stage_name not in KNOWN_STAGE_NAMES:
+            raise RuntimeError(f"unknown stage in stage bank config: {stage_name}")
+        if not isinstance(raw_stage, dict):
+            raise RuntimeError(f"stage config must be a table: {stage_name}")
+        try:
+            cost = int(raw_stage.get("cost", DEFAULT_STAGE_BANK.stage_cost(stage_name)))
+        except Exception as exc:
+            raise RuntimeError(f"stage cost must be an integer: {stage_name}") from exc
+        if cost <= 0:
+            raise RuntimeError(f"stage cost must be greater than zero: {stage_name}")
+        if cost > capacity:
+            raise RuntimeError(f"stage cost exceeds bank capacity: {stage_name}")
+        try:
+            priority = int(raw_stage.get("priority", DEFAULT_STAGE_BANK.stage_priority(stage_name)))
+        except Exception as exc:
+            raise RuntimeError(f"stage priority must be an integer: {stage_name}") from exc
+        if priority <= 0:
+            raise RuntimeError(f"stage priority must be greater than zero: {stage_name}")
+        raw_requires = raw_stage.get("requires", DEFAULT_STAGE_BANK.stage_requires(stage_name))
+        if not isinstance(raw_requires, (list, tuple)):
+            raise RuntimeError(f"stage requires must be an array: {stage_name}")
+        requires = tuple(str(item or "").strip() for item in raw_requires if str(item or "").strip())
+        unknown_requires = [item for item in requires if item not in KNOWN_STAGE_NAMES]
+        if unknown_requires:
+            raise RuntimeError(f"unknown dependency for {stage_name}: {', '.join(unknown_requires)}")
+        stages[stage_name] = StageBankStage(cost=cost, priority=priority, requires=requires)
+
+    for stage_name, default_stage in DEFAULT_STAGE_BANK.stages.items():
+        stages.setdefault(stage_name, default_stage)
+    return _validated_stage_bank_config(
+        capacity=capacity,
+        max_active_plans=max_active_plans,
+        max_running_stages=max_running_stages,
+        stages=stages,
+    )
+
+
+def effective_stage_dependencies(stage: str, stage_names: List[str], config: StageBankConfig) -> List[str]:
+    available = set(stage_names)
+    return [dependency for dependency in config.stage_requires(stage) if dependency in available]
+
+
+def downstream_stage_names(stage: str, stage_names: List[str], config: StageBankConfig) -> List[str]:
+    available = list(stage_names)
+    downstream: List[str] = []
+    queue = [stage]
+    seen = {stage}
+    while queue:
+        dependency = queue.pop(0)
+        for candidate in available:
+            if candidate in seen:
+                continue
+            if dependency not in effective_stage_dependencies(candidate, available, config):
+                continue
+            seen.add(candidate)
+            downstream.append(candidate)
+            queue.append(candidate)
+    return downstream
 
 
 @dataclass
@@ -227,6 +450,37 @@ class QueueItem:
         return self.resolved.plan.meta.name or self.source.stem
 
 
+@dataclass
+class PlanExecution:
+    plan_run_id: str
+    item: QueueItem
+    commands: List[Tuple[str, List[str]]]
+    failed_stages: Dict[str, str] = field(default_factory=dict)
+    blocked_stages: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def stage_names(self) -> List[str]:
+        return [stage for stage, _cmd in self.commands]
+
+    def command_for_stage(self, stage: str) -> List[str]:
+        for name, cmd in self.commands:
+            if name == stage:
+                return cmd
+        raise KeyError(stage)
+
+
+@dataclass
+class RunningStageTask:
+    plan_run_id: str
+    item: QueueItem
+    stage: str
+    cmd: List[str]
+    cost: int
+    thread: Optional[threading.Thread] = None
+    done: threading.Event = field(default_factory=threading.Event)
+    error: Optional[BaseException] = None
+
+
 def normalize_mode(value: str) -> str:
     return "fastpass" if str(value or "").strip().lower() == "fastpass" else "full"
 
@@ -350,6 +604,7 @@ class SessionController:
         self.toolchain = load_toolchain()
         self.av1an_fork_enabled = is_mars_av1an_fork(self.toolchain.av1an_exe)
         self.av1an_progress_jsonl_enabled = av1an_supports_progress_jsonl(self.toolchain.av1an_exe)
+        self.stage_bank = load_stage_bank_config()
         self.queue: Deque[QueueItem] = deque(items)
         self.failed: List[QueueItem] = []
         self.completed: List[QueueItem] = []
@@ -357,6 +612,9 @@ class SessionController:
         self.current_stage = ""
         self.current_plan_run_id = ""
         self.active: Dict[str, ActivePlanState] = {}
+        self.executions: Dict[str, PlanExecution] = {}
+        self.running_stage_tasks: Dict[Tuple[str, str], RunningStageTask] = {}
+        self.running_stage_processes: Dict[Tuple[str, str], Any] = {}
         self.finished_runs: List[FinishedPlanState] = []
         self.last_item: Optional[QueueItem] = None
         self.events_jsonl = Path(events_jsonl).expanduser().resolve() if events_jsonl else None
@@ -366,9 +624,11 @@ class SessionController:
         self.paused_by_source: Dict[str, bool] = {source_dir: False for source_dir in self.source_dirs}
         self.exit_when_idle = bool(exit_when_idle)
         self.rerun_after_current = False
+        self.rerun_after_current_plan_run_id = ""
         self.stop_requested = False
         self.worker_done = False
         self.lock = threading.Lock()
+        self.event_io_lock = threading.RLock()
         self.wake_event = threading.Event()
         self.worker = threading.Thread(target=self._worker_main, name="runner-worker", daemon=True)
         self.source_dir = self._resolve_source_dir(items)
@@ -387,6 +647,8 @@ class SessionController:
             return self.source_dir
         if self.current is not None:
             return self.current.source_dir
+        if self.active:
+            return next(iter(self.active.values())).item.source_dir
         return self.source_dirs[0] if self.source_dirs else ""
 
     def _items_for_source(self, items: List[Any], source_dir: str) -> List[Any]:
@@ -438,7 +700,7 @@ class SessionController:
             exit_idle = "yes" if self.exit_when_idle else "no"
         if active:
             current = "\n".join(
-                f"- {state.item.name} [{self._current_stage_name(state) or 'pending'}]"
+                f"- {state.item.name} [{self._current_stage_names(state) or 'pending'}]"
                 for state in active
             )
         else:
@@ -508,6 +770,13 @@ class SessionController:
             return completed[-1].name
         return ""
 
+    @staticmethod
+    def _current_stage_names(state: ActivePlanState) -> str:
+        running = [stage.name for stage in state.stages if stage.status == "started"]
+        if running:
+            return ", ".join(running)
+        return SessionController._current_stage_name(state)
+
     def request_pause_after_current(self, source_dir: str = "") -> None:
         with self.lock:
             selected_source = self._source_dir_for_command(source_dir)
@@ -524,37 +793,6 @@ class SessionController:
             self.paused_by_source[selected_source] = False
             self.pause_after_current_by_source[selected_source] = False
         self.wake_event.set()
-
-    def _pause_between_stages_if_requested(self, item: QueueItem, stage: str) -> None:
-        source_dir = item.source_dir
-        paused_now = False
-        with self.lock:
-            if self.pause_after_current_by_source.get(source_dir, False):
-                self.paused_by_source[source_dir] = True
-                self.pause_after_current_by_source[source_dir] = False
-                paused_now = True
-        if paused_now:
-            print(f"[runner] {item.name} | paused after stage {stage}", flush=True)
-            self._notify_event_sinks(
-                {
-                    "event": "runner_pause",
-                    "session_id": self.session_id,
-                    "plan_run_id": self.current_plan_run_id,
-                    "stage": stage,
-                    "status": "paused",
-                    "timestamp": time.time(),
-                    "source": str(item.source),
-                    "workdir": str(item.workdir),
-                }
-            )
-        while True:
-            with self.lock:
-                if self.stop_requested:
-                    return
-                if not self.paused_by_source.get(source_dir, False):
-                    return
-            self.wake_event.wait(0.25)
-            self.wake_event.clear()
 
     def retry_failed(self) -> None:
         with self.lock:
@@ -581,6 +819,7 @@ class SessionController:
         with self.lock:
             if self.current is not None:
                 self.rerun_after_current = True
+                self.rerun_after_current_plan_run_id = self.current_plan_run_id
             elif self.last_item is not None:
                 self.queue.appendleft(self.last_item)
                 self.paused_by_source[self.last_item.source_dir] = False
@@ -591,6 +830,14 @@ class SessionController:
             self.exit_when_idle = True
         self.wake_event.set()
 
+    def _terminate_running_processes_locked(self) -> None:
+        for proc in list(self.running_stage_processes.values()):
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
+
     def request_stop(self) -> None:
         with self.lock:
             self.stop_requested = True
@@ -599,7 +846,9 @@ class SessionController:
                 self.paused_by_source[source_dir] = False
                 self.pause_after_current_by_source[source_dir] = False
             self.rerun_after_current = False
+            self.rerun_after_current_plan_run_id = ""
             self.queue.clear()
+            self._terminate_running_processes_locked()
         self.wake_event.set()
 
     def handle_command(self, command: str, source_dir: str = "") -> str:
@@ -645,11 +894,12 @@ class SessionController:
             "timestamp": event.timestamp,
             "active": self.snapshot().get("active", []),
         }
-        (meta_dir / "runner_state.json").write_text(
-            json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
+        with self.event_io_lock:
+            (meta_dir / "runner_state.json").write_text(
+                json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
 
     def _active_state_for_item(self, item: QueueItem) -> Optional[ActivePlanState]:
         for state in self.active.values():
@@ -657,14 +907,9 @@ class SessionController:
                 return state
         return None
 
-    @staticmethod
-    def _reset_cached_following_stages(active: ActivePlanState, stage: str) -> None:
-        try:
-            stage_names = display_stage_plan(active.item)
-            index = stage_names.index(stage)
-        except ValueError:
-            return
-        following = set(stage_names[index + 1 :])
+    def _reset_cached_following_stages(self, active: ActivePlanState, stage: str) -> None:
+        stage_names = [state.name for state in active.stages]
+        following = set(downstream_stage_names(stage, stage_names, self.stage_bank))
         for state in active.stages:
             if state.name not in following:
                 continue
@@ -801,13 +1046,14 @@ class SessionController:
         meta_dir = item.workdir / "00_meta"
         ensure_dir(meta_dir)
         event_line = json.dumps(event.__dict__, ensure_ascii=False)
-        with (meta_dir / "runner_events.jsonl").open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(event_line + "\n")
-        if self.events_jsonl is not None:
-            self.events_jsonl.parent.mkdir(parents=True, exist_ok=True)
-            with self.events_jsonl.open("a", encoding="utf-8", newline="\n") as fh:
+        with self.event_io_lock:
+            with (meta_dir / "runner_events.jsonl").open("a", encoding="utf-8", newline="\n") as fh:
                 fh.write(event_line + "\n")
-        self._write_item_state(item, event)
+            if self.events_jsonl is not None:
+                self.events_jsonl.parent.mkdir(parents=True, exist_ok=True)
+                with self.events_jsonl.open("a", encoding="utf-8", newline="\n") as fh:
+                    fh.write(event_line + "\n")
+            self._write_item_state(item, event)
         self._notify_event_sinks(dict(event.__dict__))
 
     def _notify_event_sinks(self, payload: Dict[str, Any]) -> None:
@@ -1039,18 +1285,32 @@ class SessionController:
                         stage.progress = stage_update["progress"]
                     stage.details.update({key: value for key, value in stage_update.items() if key != "progress"})
 
-    def _run_stage(self, item: QueueItem, stage: str, cmd: List[str]) -> None:
+    def _stage_cached_message(self, item: QueueItem, stage: str) -> str:
         resume_info = stage_resume_info(item, stage)
         if item_inputs_changed(item):
             clear_stage_marker(item, stage)
-            cached_before = False
+            return ""
         elif resume_info.marker_exists and not resume_info.marker_valid:
             clear_stage_marker(item, stage)
             print(f"[runner] {item.name} | {stage} | stale marker ignored | {resume_info.reason}", flush=True)
-            cached_before = resume_info.completed
-        else:
-            cached_before = resume_info.completed
-        stage_message = CACHED_STAGE_MESSAGE if cached_before else ""
+            return CACHED_STAGE_MESSAGE if resume_info.completed else ""
+        return CACHED_STAGE_MESSAGE if resume_info.completed else ""
+
+    @staticmethod
+    def _stage_child_events_path(item: QueueItem, plan_run_id: str, stage: str) -> Path:
+        safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage).strip("_") or "stage"
+        return item.workdir / "00_meta" / f"runner_child_{plan_run_id}_{safe_stage}.jsonl"
+
+    def _run_stage(
+        self,
+        item: QueueItem,
+        stage: str,
+        cmd: List[str],
+        *,
+        child_events: Optional[Path] = None,
+    ) -> None:
+        stage_message = self._stage_cached_message(item, stage)
+        cached_before = bool(stage_message)
         with self.lock:
             self.current_stage = stage
             active = self._active_state_for_item(item)
@@ -1060,7 +1320,7 @@ class SessionController:
             return
         self._emit(item, stage, "started", stage_message)
         print("[cmd]", subprocess.list2cmdline(cmd), flush=True)
-        child_events = self.events_jsonl or (item.workdir / "00_meta" / "runner_events.jsonl")
+        child_events = child_events or self._stage_child_events_path(item, plan_run_id, stage)
         ensure_dir(child_events.parent)
         env = os.environ.copy()
         env[CHILD_EVENT_ENV] = str(child_events)
@@ -1069,32 +1329,66 @@ class SessionController:
         env[RUNNER_MANAGED_STATE_ENV] = "1"
         offset = child_events.stat().st_size if child_events.exists() else 0
         proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR), env=env)
+        process_key = (plan_run_id, stage)
+        with self.lock:
+            self.running_stage_processes[process_key] = proc
+            stop_already_requested = self.stop_requested
+        if stop_already_requested and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         last_heartbeat = 0.0
-        while proc.poll() is None:
-            offset = self._forward_child_events(child_events, offset, item)
-            now = time.time()
-            if now - last_heartbeat >= 5.0:
-                self._refresh_running_stage_progress(item)
-                self._notify_event_sinks(
-                    {
-                        "event": "runner_heartbeat",
-                        "session_id": self.session_id,
-                        "plan_run_id": plan_run_id,
-                        "stage": stage,
-                        "status": "started",
-                        "timestamp": now,
-                        "source": str(item.source),
-                        "workdir": str(item.workdir),
-                    }
-                )
-                last_heartbeat = now
-            time.sleep(0.5)
+        stop_terminate_at = time.time() if stop_already_requested else 0.0
+        try:
+            while proc.poll() is None:
+                offset = self._forward_child_events(child_events, offset, item)
+                now = time.time()
+                with self.lock:
+                    stop_now = self.stop_requested
+                if stop_now:
+                    if not stop_terminate_at:
+                        stop_terminate_at = now
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                    elif now - stop_terminate_at >= 5.0:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                if now - last_heartbeat >= 5.0:
+                    self._refresh_running_stage_progress(item)
+                    self._notify_event_sinks(
+                        {
+                            "event": "runner_heartbeat",
+                            "session_id": self.session_id,
+                            "plan_run_id": plan_run_id,
+                            "stage": stage,
+                            "status": "started",
+                            "timestamp": now,
+                            "source": str(item.source),
+                            "workdir": str(item.workdir),
+                        }
+                    )
+                    last_heartbeat = now
+                time.sleep(0.5)
+        finally:
+            with self.lock:
+                if self.running_stage_processes.get(process_key) is proc:
+                    self.running_stage_processes.pop(process_key, None)
         offset = self._forward_child_events(child_events, offset, item)
         rc = int(proc.returncode or 0)
+        if stop_terminate_at:
+            clear_stage_marker(item, stage)
+            self._emit(item, stage, "failed", "stop_requested")
+            raise RuntimeError(f"{stage}_stop_requested")
         if rc != 0:
             clear_stage_marker(item, stage)
-            self._emit(item, stage, "failed", f"exit_code={rc}")
-            raise RuntimeError(f"{stage}_failed_rc_{rc}")
+            message = "stop_requested" if stop_terminate_at else f"exit_code={rc}"
+            self._emit(item, stage, "failed", message)
+            raise RuntimeError(f"{stage}_{message}")
         if not stage_completion_artifacts_valid(item, stage):
             clear_stage_marker(item, stage)
             reason = "stage_artifact_validation_failed"
@@ -1406,130 +1700,508 @@ class SessionController:
             return False
         return file_not_older_than(output_path, item.source) and file_not_older_than(output_path, item.plan_path)
 
-    def _process_item(self, item: QueueItem) -> None:
+    def _refresh_current_pointer_locked(self) -> None:
+        if self.active:
+            active = next(iter(self.active.values()))
+            self.current = active.item
+            self.current_plan_run_id = active.plan_run_id
+            self.current_stage = self._current_stage_names(active)
+            return
+        self.current = None
+        self.current_stage = ""
+        self.current_plan_run_id = ""
+
+    def _stage_status(self, active: ActivePlanState, stage: str) -> str:
+        for state in active.stages:
+            if state.name == stage:
+                return str(state.status or "pending").lower()
+        return "pending"
+
+    def _stage_terminal(self, active: ActivePlanState, stage: str) -> bool:
+        return self._stage_status(active, stage) in TERMINAL_STAGE_STATUSES
+
+    def _stage_ready(self, execution: PlanExecution, stage: str) -> bool:
+        active = self.active.get(execution.plan_run_id)
+        if active is None or self._stage_status(active, stage) != "pending":
+            return False
+        for dependency in effective_stage_dependencies(stage, execution.stage_names, self.stage_bank):
+            if self._stage_status(active, dependency) != "completed":
+                return False
+        return True
+
+    def _running_stage_load(self) -> int:
+        return sum(task.cost for task in self.running_stage_tasks.values() if not task.done.is_set())
+
+    def _running_stage_count(self) -> int:
+        return sum(1 for task in self.running_stage_tasks.values() if not task.done.is_set())
+
+    def _available_stage_capacity(self) -> int:
+        return max(0, self.stage_bank.capacity - self._running_stage_load())
+
+    def _available_stage_slots(self) -> int:
+        return max(0, self.stage_bank.max_running_stages - self._running_stage_count())
+
+    def _available_active_plan_slots(self) -> int:
+        return max(0, self.stage_bank.max_active_plans - len(self.active))
+
+    @staticmethod
+    def _workdir_key(item: QueueItem) -> str:
+        return str(item.workdir.resolve()).casefold()
+
+    def _workdir_in_use_locked(self, item: QueueItem) -> bool:
+        candidate_key = self._workdir_key(item)
+        return any(self._workdir_key(state.item) == candidate_key for state in self.active.values())
+
+    def _has_running_stage_for_source(self, source_dir: str) -> bool:
+        return any(
+            task.item.source_dir == source_dir and not task.done.is_set()
+            for task in self.running_stage_tasks.values()
+        )
+
+    def _can_launch_for_source(self, source_dir: str) -> bool:
+        with self.lock:
+            return (
+                not self.stop_requested
+                and not self.paused_by_source.get(source_dir, False)
+                and not self.pause_after_current_by_source.get(source_dir, False)
+            )
+
+    def _mark_pause_after_current_sources(self) -> bool:
+        paused_sources: List[str] = []
+        with self.lock:
+            for source_dir, requested in list(self.pause_after_current_by_source.items()):
+                if not requested or self._has_running_stage_for_source(source_dir):
+                    continue
+                self.paused_by_source[source_dir] = True
+                self.pause_after_current_by_source[source_dir] = False
+                paused_sources.append(source_dir)
+            if paused_sources:
+                self._refresh_current_pointer_locked()
+        for source_dir in paused_sources:
+            item = self._representative_item_for_source(source_dir)
+            self._notify_event_sinks(
+                {
+                    "event": "runner_pause",
+                    "session_id": self.session_id,
+                    "plan_run_id": "",
+                    "stage": "",
+                    "status": "paused",
+                    "timestamp": time.time(),
+                    "source": str(item.source) if item is not None else "",
+                    "workdir": str(item.workdir) if item is not None else "",
+                }
+            )
+            print(f"[runner] paused source: {source_dir}", flush=True)
+        return bool(paused_sources)
+
+    def _representative_item_for_source(self, source_dir: str) -> Optional[QueueItem]:
+        with self.lock:
+            for state in self.active.values():
+                if state.item.source_dir == source_dir:
+                    return state.item
+            for item in self.queue:
+                if item.source_dir == source_dir:
+                    return item
+        return None
+
+    def _activate_item(self, item: QueueItem) -> bool:
+        plan_run_id = f"{self.session_id}-{uuid.uuid4().hex[:12]}"
+        active_state = ActivePlanState(
+            plan_run_id=plan_run_id,
+            item=item,
+            status="queued",
+            started_at=time.time(),
+            stages=initial_stage_states(item),
+        )
+        with self.lock:
+            self.active[plan_run_id] = active_state
+            self._refresh_current_pointer_locked()
+
         output_path = output_path_for_item(item)
         if self._output_reusable(item):
-            self._emit(item, STAGE_ITEM, "skipped", f"output_exists={output_path.name}")
-            return
+            self._finish_plan_execution(
+                plan_run_id,
+                final_status="skipped",
+                message=f"output_exists={output_path.name}",
+            )
+            return True
         if item.mode == "fastpass" and not item.resolved.has_video_edit():
-            self._emit(item, STAGE_ITEM, "skipped", "fastpass_mode_without_video_edit")
+            self._finish_plan_execution(
+                plan_run_id,
+                final_status="skipped",
+                message="fastpass_mode_without_video_edit",
+            )
+            return True
+
+        try:
+            commands = self._build_item_commands(item)
+        except Exception as exc:
+            self._finish_plan_execution(
+                plan_run_id,
+                final_status="failed",
+                failed_stage=STAGE_ITEM,
+                message=str(exc),
+            )
+            return True
+        execution = PlanExecution(plan_run_id=plan_run_id, item=item, commands=commands)
+        with self.lock:
+            self.executions[plan_run_id] = execution
+            self._refresh_current_pointer_locked()
+        self._emit(item, STAGE_ITEM, "started")
+        return True
+
+    def _activate_next_queued_item(self) -> bool:
+        if self._available_stage_capacity() <= 0:
+            return False
+        if self._available_active_plan_slots() <= 0:
+            return False
+        with self.lock:
+            if self.stop_requested:
+                return False
+            if self._available_active_plan_slots() <= 0:
+                return False
+            selected_index = -1
+            for index, candidate in enumerate(list(self.queue)):
+                if self.paused_by_source.get(candidate.source_dir, False):
+                    continue
+                if self.pause_after_current_by_source.get(candidate.source_dir, False):
+                    continue
+                if self._workdir_in_use_locked(candidate):
+                    continue
+                selected_index = index
+                break
+            if selected_index < 0:
+                return False
+            item = self.queue[selected_index]
+            del self.queue[selected_index]
+        return self._activate_item(item)
+
+    def _mark_blocked_stages(self) -> bool:
+        made_progress = False
+        for execution in list(self.executions.values()):
+            active = self.active.get(execution.plan_run_id)
+            if active is None:
+                continue
+            for stage in execution.stage_names:
+                if self._stage_status(active, stage) != "pending":
+                    continue
+                blocked_by = ""
+                for dependency in effective_stage_dependencies(stage, execution.stage_names, self.stage_bank):
+                    dependency_status = self._stage_status(active, dependency)
+                    if dependency_status in ("failed", "skipped"):
+                        blocked_by = dependency
+                        break
+                if not blocked_by:
+                    continue
+                message = f"blocked_by={blocked_by}"
+                execution.blocked_stages[stage] = message
+                self._emit(execution.item, stage, "skipped", message)
+                made_progress = True
+        return made_progress
+
+    def _complete_cached_ready_stages(self) -> bool:
+        made_progress = False
+        for execution in list(self.executions.values()):
+            active = self.active.get(execution.plan_run_id)
+            if active is None:
+                continue
+            for stage in execution.stage_names:
+                if not self._stage_ready(execution, stage):
+                    continue
+                stage_message = self._stage_cached_message(execution.item, stage)
+                if not stage_message:
+                    continue
+                self._emit(execution.item, stage, "completed", stage_message)
+                made_progress = True
+        return made_progress
+
+    def _ready_stage_candidates(self) -> List[Tuple[int, int, float, int, PlanExecution, str]]:
+        candidates: List[Tuple[int, int, float, int, PlanExecution, str]] = []
+        for execution in list(self.executions.values()):
+            active = self.active.get(execution.plan_run_id)
+            if active is None:
+                continue
+            if not self._can_launch_for_source(execution.item.source_dir):
+                continue
+            for stage_index, stage in enumerate(execution.stage_names):
+                if not self._stage_ready(execution, stage):
+                    continue
+                cost = self.stage_bank.stage_cost(stage)
+                priority = self.stage_bank.stage_priority(stage)
+                candidates.append((priority, cost, active.started_at or time.time(), stage_index, execution, stage))
+        candidates.sort(key=lambda item: (item[0], -item[1], item[2], item[3]))
+        return candidates
+
+    def _start_stage_task(self, execution: PlanExecution, stage: str) -> None:
+        cmd = execution.command_for_stage(stage)
+        cost = self.stage_bank.stage_cost(stage)
+        task = RunningStageTask(
+            plan_run_id=execution.plan_run_id,
+            item=execution.item,
+            stage=stage,
+            cmd=cmd,
+            cost=cost,
+        )
+
+        def run_task() -> None:
+            try:
+                self._run_stage(
+                    execution.item,
+                    stage,
+                    cmd,
+                    child_events=self._stage_child_events_path(execution.item, execution.plan_run_id, stage),
+                )
+            except BaseException as exc:
+                task.error = exc
+            finally:
+                task.done.set()
+                self.wake_event.set()
+
+        task.thread = threading.Thread(
+            target=run_task,
+            name=f"runner-stage-{stage}-{execution.plan_run_id[-6:]}",
+            daemon=True,
+        )
+        self.running_stage_tasks[(execution.plan_run_id, stage)] = task
+        task.thread.start()
+
+    def _launch_ready_stages(self) -> bool:
+        if self._available_stage_capacity() <= 0:
+            return False
+        if self._available_stage_slots() <= 0:
+            return False
+        made_progress = False
+        while True:
+            available = self._available_stage_capacity()
+            if available <= 0:
+                return made_progress
+            if self._available_stage_slots() <= 0:
+                return made_progress
+            launched = False
+            for _priority, cost, _started_at, _stage_index, execution, stage in self._ready_stage_candidates():
+                if cost > available:
+                    continue
+                if (execution.plan_run_id, stage) in self.running_stage_tasks:
+                    continue
+                self._start_stage_task(execution, stage)
+                made_progress = True
+                launched = True
+                break
+            if not launched:
+                return made_progress
+
+    def _collect_finished_stage_tasks(self) -> bool:
+        made_progress = False
+        for key, task in list(self.running_stage_tasks.items()):
+            if not task.done.is_set():
+                continue
+            self.running_stage_tasks.pop(key, None)
+            if task.thread is not None:
+                task.thread.join(timeout=0.1)
+            execution = self.executions.get(task.plan_run_id)
+            if execution is not None and task.error is not None:
+                execution.failed_stages[task.stage] = str(task.error)
+                active = self.active.get(task.plan_run_id)
+                if active is not None and self._stage_status(active, task.stage) != "failed":
+                    self._emit(task.item, task.stage, "failed", str(task.error))
+            made_progress = True
+        return made_progress
+
+    def _has_unfinished_stage_task(self, plan_run_id: str) -> bool:
+        return any(
+            task.plan_run_id == plan_run_id and not task.done.is_set()
+            for task in self.running_stage_tasks.values()
+        )
+
+    def _cancel_stopped_pending_executions(self) -> bool:
+        with self.lock:
+            if not self.stop_requested:
+                return False
+            cancellations = [
+                execution
+                for execution in list(self.executions.values())
+                if not execution.failed_stages and not self._has_unfinished_stage_task(execution.plan_run_id)
+            ]
+        made_progress = False
+        for execution in cancellations:
+            active = self.active.get(execution.plan_run_id)
+            if active is None:
+                continue
+            if all(self._stage_terminal(active, stage) for stage in execution.stage_names):
+                continue
+            self._finish_plan_execution(
+                execution.plan_run_id,
+                final_status="failed",
+                failed_stage=STAGE_ITEM,
+                message="stop_requested",
+            )
+            made_progress = True
+        return made_progress
+
+    def _execution_is_terminal(self, execution: PlanExecution) -> bool:
+        if any(task.plan_run_id == execution.plan_run_id for task in self.running_stage_tasks.values()):
+            return False
+        active = self.active.get(execution.plan_run_id)
+        if active is None:
+            return True
+        return all(self._stage_terminal(active, stage) for stage in execution.stage_names)
+
+    def _finish_terminal_executions(self) -> bool:
+        made_progress = False
+        for execution in list(self.executions.values()):
+            if not self._execution_is_terminal(execution):
+                continue
+            if execution.failed_stages:
+                failed_stage, message = next(iter(execution.failed_stages.items()))
+                self._finish_plan_execution(
+                    execution.plan_run_id,
+                    final_status="failed",
+                    failed_stage=failed_stage,
+                    message=message,
+                )
+            else:
+                self._finish_plan_execution(execution.plan_run_id, final_status="completed")
+            made_progress = True
+        return made_progress
+
+    def _finish_plan_execution(
+        self,
+        plan_run_id: str,
+        *,
+        final_status: str,
+        failed_stage: str = "",
+        message: str = "",
+    ) -> None:
+        active_state = self.active.get(plan_run_id)
+        item = active_state.item if active_state is not None else None
+        if item is None:
+            execution = self.executions.get(plan_run_id)
+            item = execution.item if execution is not None else None
+        if item is None:
             return
 
-        self._emit(item, STAGE_ITEM, "started")
-        for stage, cmd in self._build_item_commands(item):
-            self._run_stage(item, stage, cmd)
-            self._pause_between_stages_if_requested(item, stage)
-        self._emit(item, STAGE_ITEM, "completed")
+        ended_at = time.time()
+        event_plan_run_id, event_started_at, event_ended_at, event_elapsed = self._update_active_event(
+            item,
+            STAGE_ITEM,
+            final_status,
+            message,
+            ended_at,
+        )
+        event_plan_run_id = event_plan_run_id or plan_run_id
+        mark_clean = final_status in ("completed", "skipped")
+        with self.lock:
+            active_state = self.active.pop(plan_run_id, None)
+            self.executions.pop(plan_run_id, None)
+            started_at = active_state.started_at if active_state is not None else ended_at
+            if final_status == "failed":
+                self.failed = [
+                    failed_item
+                    for failed_item in self.failed
+                    if (str(failed_item.plan_path).lower(), str(failed_item.source).lower())
+                    != (str(item.plan_path).lower(), str(item.source).lower())
+                ]
+                self.failed.append(item)
+            else:
+                self.failed = [
+                    failed_item
+                    for failed_item in self.failed
+                    if (str(failed_item.plan_path).lower(), str(failed_item.source).lower())
+                    != (str(item.plan_path).lower(), str(item.source).lower())
+                ]
+                self.completed.append(item)
+            self.finished_runs.append(
+                FinishedPlanState(
+                    plan_run_id=plan_run_id,
+                    item=item,
+                    status=final_status,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    stage=failed_stage,
+                    message=message,
+                )
+            )
+            self.last_item = item
+            if self.rerun_after_current_plan_run_id == plan_run_id or (
+                self.rerun_after_current and not self.rerun_after_current_plan_run_id
+            ):
+                self.queue.appendleft(item)
+                self.rerun_after_current = False
+                self.rerun_after_current_plan_run_id = ""
+            self._refresh_current_pointer_locked()
+
+        if not event_started_at:
+            event_started_at = started_at
+        if not event_ended_at:
+            event_ended_at = ended_at
+        if event_started_at:
+            event_elapsed = max(0.0, event_ended_at - event_started_at)
+        event = RunnerEvent(
+            event="runner",
+            plan=str(item.plan_path),
+            mode=item.mode,
+            stage=STAGE_ITEM,
+            status=final_status,
+            message=message,
+            timestamp=ended_at,
+            session_id=self.session_id,
+            plan_run_id=event_plan_run_id,
+            source=str(item.source),
+            workdir=str(item.workdir),
+            started_at=event_started_at,
+            ended_at=event_ended_at,
+            elapsed_seconds=round(event_elapsed, 3),
+        )
+        text = f"[runner] {item.name} | {STAGE_ITEM} | {final_status}"
+        if message:
+            text += f" | {message}"
+        print(text, flush=True)
+
+        meta_dir = item.workdir / "00_meta"
+        ensure_dir(meta_dir)
+        event_line = json.dumps(event.__dict__, ensure_ascii=False)
+        with self.event_io_lock:
+            with (meta_dir / "runner_events.jsonl").open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(event_line + "\n")
+            if self.events_jsonl is not None:
+                self.events_jsonl.parent.mkdir(parents=True, exist_ok=True)
+                with self.events_jsonl.open("a", encoding="utf-8", newline="\n") as fh:
+                    fh.write(event_line + "\n")
+            self._write_item_state(item, event)
+        self._notify_event_sinks(dict(event.__dict__))
+        if mark_clean:
+            mark_source_info_clean(item)
 
     def _worker_main(self) -> None:
         while True:
+            made_progress = False
+            made_progress = self._collect_finished_stage_tasks() or made_progress
+            made_progress = self._cancel_stopped_pending_executions() or made_progress
+            made_progress = self._mark_pause_after_current_sources() or made_progress
+            while True:
+                blocked = self._mark_blocked_stages()
+                cached = self._complete_cached_ready_stages()
+                if not blocked and not cached:
+                    break
+                made_progress = True
+            made_progress = self._finish_terminal_executions() or made_progress
+            made_progress = self._launch_ready_stages() or made_progress
+            if self._available_stage_capacity() > 0:
+                made_progress = self._activate_next_queued_item() or made_progress
+
             with self.lock:
-                if self.stop_requested and self.current is None and not self.queue:
+                no_active_work = not self.active and not self.executions and not self.running_stage_tasks
+                if self.stop_requested and no_active_work and not self.queue:
                     self.worker_done = True
                     return
-                if self.current is None and not self.queue:
+                if no_active_work and not self.queue:
                     if self.exit_when_idle:
                         self.worker_done = True
                         return
-                    should_wait = True
-                else:
-                    item = None
-                    for index, candidate in enumerate(list(self.queue)):
-                        if self.paused_by_source.get(candidate.source_dir, False):
-                            continue
-                        item = candidate
-                        del self.queue[index]
-                        break
-                    if item is None:
-                        should_wait = True
-                    else:
-                        should_wait = False
-                        plan_run_id = f"{self.session_id}-{uuid.uuid4().hex[:12]}"
-                        active_state = ActivePlanState(
-                            plan_run_id=plan_run_id,
-                            item=item,
-                            status="queued",
-                            started_at=time.time(),
-                            stages=initial_stage_states(item),
-                        )
-                        self.active[plan_run_id] = active_state
-                        self.current_plan_run_id = plan_run_id
-                        self.current = item
-                        self.current_stage = ""
+                should_wait = not made_progress
             if should_wait:
                 self.wake_event.wait(0.25)
                 self.wake_event.clear()
-                continue
-
-            assert self.current is not None
-            item = self.current
-            plan_run_id = self.current_plan_run_id
-            started_at = time.time()
-            failed_stage = ""
-            failed_message = ""
-            try:
-                self._process_item(item)
-            except Exception as exc:
-                failed_stage = self.current_stage
-                failed_message = str(exc)
-                self._emit(item, STAGE_ITEM, "failed", failed_message)
-                with self.lock:
-                    self.failed.append(item)
-            else:
-                with self.lock:
-                    self.failed = [
-                        failed_item
-                        for failed_item in self.failed
-                        if (str(failed_item.plan_path).lower(), str(failed_item.source).lower())
-                        != (str(item.plan_path).lower(), str(item.source).lower())
-                    ]
-                    self.completed.append(item)
-                mark_source_info_clean(item)
-            finally:
-                ended_at = time.time()
-                with self.lock:
-                    active_state = self.active.pop(plan_run_id, None)
-                    if active_state is not None:
-                        started_at = active_state.started_at or started_at
-                    if failed_message:
-                        self.finished_runs.append(
-                            FinishedPlanState(
-                                plan_run_id=plan_run_id,
-                                item=item,
-                                status="failed",
-                                started_at=started_at,
-                                ended_at=ended_at,
-                                stage=failed_stage,
-                                message=failed_message,
-                            )
-                        )
-                    else:
-                        final_status = "skipped"
-                        if active_state is not None and active_state.status == "skipped":
-                            final_status = "skipped"
-                        elif active_state is not None and any(stage.status == "completed" for stage in active_state.stages):
-                            final_status = "completed"
-                        self.finished_runs.append(
-                            FinishedPlanState(
-                                plan_run_id=plan_run_id,
-                                item=item,
-                                status=final_status,
-                                started_at=started_at,
-                                ended_at=ended_at,
-                            )
-                        )
-                    self.last_item = item
-                    if self.rerun_after_current:
-                        self.queue.appendleft(item)
-                        self.rerun_after_current = False
-                    source_dir = item.source_dir
-                    if self.pause_after_current_by_source.get(source_dir, False):
-                        self.paused_by_source[source_dir] = True
-                        self.pause_after_current_by_source[source_dir] = False
-                    self.current = None
-                    self.current_stage = ""
-                    self.current_plan_run_id = ""
-                self.wake_event.set()
 
 
 def print_help() -> None:
@@ -1695,50 +2367,64 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print("[discord] bridge stopped", flush=True)
             print("[runner] folder lock released", flush=True)
 
-    print_help()
-    while not controller.is_finished():
-        try:
-            raw = input("runner> ").strip().lower()
-        except EOFError:
-            controller.request_exit_when_idle()
-            break
-        if raw in ("", "status"):
-            print(controller.status_text(), flush=True)
-            continue
-        if raw == "pause after current":
-            controller.request_pause_after_current()
-            print("[runner] will pause after current item", flush=True)
-            continue
-        if raw == "resume":
-            controller.resume()
-            print("[runner] resumed", flush=True)
-            continue
-        if raw == "retry failed":
-            controller.retry_failed()
-            print("[runner] failed items re-queued", flush=True)
-            continue
-        if raw == "rerun current item":
-            controller.rerun_current_item()
-            print("[runner] rerun requested", flush=True)
-            continue
-        if raw == "exit when idle":
-            controller.request_exit_when_idle()
-            print("[runner] will exit when idle", flush=True)
-            continue
-        if raw in ("quit", "exit"):
-            if controller.is_busy():
-                controller.request_exit_when_idle()
-                print("[runner] busy; will exit when idle", flush=True)
-            else:
-                controller.request_stop()
-            continue
-        if raw == "help":
-            print_help()
-            continue
-        print("[runner] unknown command", flush=True)
+    def request_interrupt_shutdown() -> None:
+        if controller.is_busy():
+            controller.request_stop()
+            print("[runner] interrupt received; stopping active work", flush=True)
+        else:
+            controller.request_stop()
+            print("[runner] interrupt received; stopping", flush=True)
 
+    print_help()
     try:
-        controller.join()
+        try:
+            while not controller.is_finished():
+                try:
+                    raw = input("runner> ").strip().lower()
+                except EOFError:
+                    controller.request_exit_when_idle()
+                    break
+                if raw in ("", "status"):
+                    print(controller.status_text(), flush=True)
+                    continue
+                if raw == "pause after current":
+                    controller.request_pause_after_current()
+                    print("[runner] will pause after current item", flush=True)
+                    continue
+                if raw == "resume":
+                    controller.resume()
+                    print("[runner] resumed", flush=True)
+                    continue
+                if raw == "retry failed":
+                    controller.retry_failed()
+                    print("[runner] failed items re-queued", flush=True)
+                    continue
+                if raw == "rerun current item":
+                    controller.rerun_current_item()
+                    print("[runner] rerun requested", flush=True)
+                    continue
+                if raw == "exit when idle":
+                    controller.request_exit_when_idle()
+                    print("[runner] will exit when idle", flush=True)
+                    continue
+                if raw in ("quit", "exit"):
+                    if controller.is_busy():
+                        controller.request_exit_when_idle()
+                        print("[runner] busy; will exit when idle", flush=True)
+                    else:
+                        controller.request_stop()
+                    continue
+                if raw == "help":
+                    print_help()
+                    continue
+                print("[runner] unknown command", flush=True)
+        except KeyboardInterrupt:
+            request_interrupt_shutdown()
+        try:
+            controller.join()
+        except KeyboardInterrupt:
+            request_interrupt_shutdown()
+            controller.join()
         return 1 if controller.failed else 0
     finally:
         for _, bridge in bridges:

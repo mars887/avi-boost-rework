@@ -12,6 +12,8 @@ from typing import Any, Callable, Dict, Optional
 CommandHandler = Callable[[str], str]
 SnapshotProvider = Callable[[], Dict[str, Any]]
 DEFAULT_MAX_OUTBOX_ITEMS = 200
+DEFAULT_SNAPSHOT_INTERVAL_SECONDS = 10.0
+DEFAULT_STOP_FLUSH_SECONDS = 20.0
 
 
 class DiscordBridge:
@@ -25,6 +27,8 @@ class DiscordBridge:
         enabled: bool,
         shared_secret: str = "",
         max_outbox_items: int = DEFAULT_MAX_OUTBOX_ITEMS,
+        snapshot_interval_seconds: float = DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
+        stop_flush_seconds: float = DEFAULT_STOP_FLUSH_SECONDS,
     ) -> None:
         self.service_url = service_url.rstrip("/")
         self.session_id = session_id
@@ -36,6 +40,10 @@ class DiscordBridge:
         self.outbox: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max(1, int(max_outbox_items)))
         self.sender = threading.Thread(target=self._sender_main, name="discord-bridge-sender", daemon=True)
         self.poller = threading.Thread(target=self._poller_main, name="discord-bridge-poller", daemon=True)
+        self.snapshooter = threading.Thread(target=self._snapshot_main, name="discord-bridge-snapshot", daemon=True)
+        self.snapshot_interval_seconds = max(2.0, float(snapshot_interval_seconds or DEFAULT_SNAPSHOT_INTERVAL_SECONDS))
+        self.stop_flush_seconds = max(0.0, float(stop_flush_seconds or 0.0))
+        self.stop_drain_deadline = 0.0
         self.connected = False
         self.last_error = ""
         self.last_error_at = 0.0
@@ -58,15 +66,18 @@ class DiscordBridge:
         self.ever_connected = self.ever_connected or self.connected
         self.sender.start()
         self.poller.start()
+        self.snapshooter.start()
 
     def stop(self) -> None:
         if not self.enabled:
             self.stop_event.set()
             return
         self.notify_snapshot()
+        self.stop_drain_deadline = time.monotonic() + self.stop_flush_seconds
         self.stop_event.set()
-        self.sender.join(timeout=2.0)
         self.poller.join(timeout=2.0)
+        self.snapshooter.join(timeout=2.0)
+        self.sender.join(timeout=max(2.0, self.stop_flush_seconds + 1.0))
 
     def notify_event(self, event: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
         if not self.enabled:
@@ -115,10 +126,21 @@ class DiscordBridge:
                 item = self.outbox.get(timeout=0.25)
             except queue.Empty:
                 continue
+            now = time.monotonic()
+            next_attempt_at = float(item.get("_next_attempt_at") or 0.0)
+            if next_attempt_at > now:
+                if not self._retry_deadline_expired():
+                    self._requeue_for_retry(item)
+                    time.sleep(min(0.25, max(0.0, next_attempt_at - now)))
+                continue
             result = self._post(str(item["path"]), dict(item["payload"]))
             if isinstance(result, dict) and str(result.get("status") or "").lower() == "ok":
                 self.connected = True
                 self.ever_connected = True
+                continue
+            self.connected = False
+            if self._should_retry_item(item):
+                self._schedule_retry(item)
 
     def _poller_main(self) -> None:
         while not self.stop_event.wait(1.0):
@@ -158,6 +180,60 @@ class DiscordBridge:
                         "snapshot": self.snapshot_provider() if self.snapshot_provider is not None else {},
                     },
                 )
+
+    def _snapshot_main(self) -> None:
+        while not self.stop_event.wait(self.snapshot_interval_seconds):
+            self.notify_snapshot()
+
+    @staticmethod
+    def _item_low_priority(item: Dict[str, Any]) -> bool:
+        payload = dict(item.get("payload") or {})
+        event = dict(payload.get("event") or {})
+        return str(event.get("event") or "") == "runner_heartbeat"
+
+    def _retry_deadline_expired(self) -> bool:
+        return bool(
+            self.stop_event.is_set()
+            and self.stop_drain_deadline
+            and time.monotonic() >= self.stop_drain_deadline
+        )
+
+    def _should_retry_item(self, item: Dict[str, Any]) -> bool:
+        if self._item_low_priority(item):
+            return False
+        return not self._retry_deadline_expired()
+
+    @staticmethod
+    def _retry_delay_seconds(attempts: int) -> float:
+        return min(10.0, 0.5 * (2 ** max(0, min(int(attempts), 5))))
+
+    def _schedule_retry(self, item: Dict[str, Any]) -> None:
+        attempts = int(item.get("_attempts") or 0) + 1
+        delay = self._retry_delay_seconds(attempts)
+        if self.stop_event.is_set() and self.stop_drain_deadline:
+            remaining = self.stop_drain_deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            delay = min(delay, max(0.0, remaining))
+        item["_attempts"] = attempts
+        item["_next_attempt_at"] = time.monotonic() + delay
+        self._requeue_for_retry(item)
+
+    def _requeue_for_retry(self, item: Dict[str, Any]) -> None:
+        try:
+            self.outbox.put_nowait(item)
+            return
+        except queue.Full:
+            if self._item_low_priority(item):
+                return
+        try:
+            self.outbox.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self.outbox.put_nowait(item)
+        except queue.Full:
+            pass
 
     def _get(self, path: str, *, timeout: float = 2.0) -> Any:
         url = self.service_url + path

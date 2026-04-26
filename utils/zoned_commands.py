@@ -59,7 +59,15 @@ def read_text_guess(path: Path) -> str:
 
 
 def normalize_zoned_text(text: str) -> str:
-    return str(text or "").replace("\u00c2\u00a0", " ").replace("\u00a0", " ")
+    return (
+        str(text or "")
+        .replace("\u00c2\u00a0", " ")
+        .replace("\u00a0", " ")
+        .replace("\u202f", " ")
+        .replace("\u2007", " ")
+        .replace("\ufeff", "")
+        .replace("\u200b", "")
+    )
 
 
 def merge_legacy_zoned_text(zone_text: str, crop_resize_text: str) -> str:
@@ -111,7 +119,7 @@ def combine_zoned_texts(zone_text: str, crop_resize_text: str) -> str:
 
 
 def _strip_line(raw: str) -> str:
-    line = str(raw or "").strip()
+    line = normalize_zoned_text(str(raw or "")).strip()
     if not line or line.startswith("#") or line.startswith("//"):
         return ""
     return line
