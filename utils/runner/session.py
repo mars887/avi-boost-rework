@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import codecs
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -54,8 +56,10 @@ from .helpers import (
     item_short_snapshot,
     resolve_optional_path,
 )
+from .logs import RunnerLogLine
 from .models import ActivePlanState, FinishedPlanState, PlanExecution, QueueItem, RunningStageTask
-from .stage_bank import downstream_stage_names, effective_stage_dependencies, load_stage_bank_config
+from .stage_bank import StageBankConfig, downstream_stage_names, effective_stage_dependencies, load_stage_bank_config
+from .terminal import TerminalScreen, decode_visible_ansi_escapes, has_terminal_repaint, strip_ansi
 
 FAST_INTERRUPT = False
 WRAPPER_VPY = ROOT_DIR / "wrapper.vpy"
@@ -78,6 +82,48 @@ SESSION_ID_ENV = "PBBATCH_RUNNER_SESSION_ID"
 PLAN_RUN_ID_ENV = "PBBATCH_RUNNER_PLAN_RUN_ID"
 TERMINAL_STAGE_STATUSES = {"completed", "failed", "skipped"}
 
+
+class WinPtyProcessAdapter:
+    def __init__(self, process: Any) -> None:
+        self.process = process
+        self.returncode: Optional[int] = None
+        self.stdout = None
+
+    def poll(self) -> Optional[int]:
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            if self.process.isalive():
+                return None
+            self.returncode = int(self.process.exitstatus or 0)
+        except Exception:
+            self.returncode = 1
+        return self.returncode
+
+    def read(self, size: int = 4096) -> str:
+        return str(self.process.read(size) or "")
+
+    def terminate(self) -> None:
+        try:
+            self.process.terminate(force=False)
+        except TypeError:
+            self.process.terminate()
+        except Exception:
+            pass
+
+    def kill(self) -> None:
+        try:
+            self.process.terminate(force=True)
+        except TypeError:
+            try:
+                self.process.kill(9)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        self.returncode = self.poll()
+
+
 class SessionController:
     def __init__(
         self,
@@ -87,12 +133,13 @@ class SessionController:
         add_source_bitrate: bool,
         exit_when_idle: bool,
         session_id: str = "",
+        stage_bank_config: Optional[StageBankConfig] = None,
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex
         self.toolchain = load_toolchain()
         self.av1an_fork_enabled = is_mars_av1an_fork(self.toolchain.av1an_exe)
         self.av1an_progress_jsonl_enabled = av1an_supports_progress_jsonl(self.toolchain.av1an_exe)
-        self.stage_bank = load_stage_bank_config()
+        self.stage_bank = stage_bank_config or load_stage_bank_config()
         self.queue: Deque[QueueItem] = deque(items)
         self.failed: List[QueueItem] = []
         self.completed: List[QueueItem] = []
@@ -121,6 +168,11 @@ class SessionController:
         self.worker = threading.Thread(target=self._worker_main, name="runner-worker", daemon=True)
         self.source_dir = self._resolve_source_dir(items)
         self.event_sinks: List[Any] = []
+        self.log_sinks: List[Any] = []
+        self._console_screens: Dict[str, TerminalScreen] = {}
+        self._console_last_lines: Dict[str, str] = {}
+        self._console_in_place: Dict[str, bool] = {}
+        self._console_ansi_ready = False
 
     @staticmethod
     def _resolve_source_dir(items: List[QueueItem]) -> str:
@@ -164,6 +216,9 @@ class SessionController:
 
     def add_event_sink(self, sink: Any) -> None:
         self.event_sinks.append(sink)
+
+    def add_log_sink(self, sink: Any) -> None:
+        self.log_sinks.append(sink)
 
     def is_idle(self) -> bool:
         with self.lock:
@@ -553,6 +608,192 @@ class SessionController:
                 except Exception as exc:
                     print(f"[runner] event sink failed: {exc}", file=sys.stderr, flush=True)
 
+    def _notify_log_sinks(self, line: RunnerLogLine) -> None:
+        for sink in list(self.log_sinks):
+            try:
+                sink(line)
+            except Exception as exc:
+                print(f"[runner] log sink failed: {exc}", file=sys.stderr, flush=True)
+
+    @staticmethod
+    def _safe_stage_name(stage: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", stage).strip("_") or "stage"
+
+    def _stage_capture_log_path(self, item: QueueItem, plan_run_id: str, stage: str) -> Path:
+        safe_stage = self._safe_stage_name(stage)
+        safe_run = re.sub(r"[^A-Za-z0-9_.-]+", "_", plan_run_id).strip("_") or "run"
+        return item.workdir / "00_logs" / f"runner_capture_{safe_stage}_{safe_run}.log"
+
+    def _ensure_console_ansi(self) -> None:
+        if getattr(self, "_console_ansi_ready", False):
+            return
+        self._console_ansi_ready = True
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+        except Exception:
+            pass
+
+    def _finish_console_in_place_lines(self) -> None:
+        in_place = getattr(self, "_console_in_place", None)
+        if not in_place or not any(in_place.values()):
+            return
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        for key in list(in_place):
+            in_place[key] = False
+
+    def _print_stage_output(self, item: QueueItem, stage: str, plan_run_id: str, stream: str, raw_text: str) -> None:
+        text = decode_visible_ansi_escapes(raw_text)
+        if not text:
+            return
+        prefix = f"[{item.name} | {stage}]"
+        key = f"{plan_run_id}:{stage}"
+        self._ensure_console_ansi()
+        ansi_output = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        if has_terminal_repaint(text):
+            screens = getattr(self, "_console_screens", None)
+            if screens is None:
+                screens = {}
+                self._console_screens = screens
+            last_lines = getattr(self, "_console_last_lines", None)
+            if last_lines is None:
+                last_lines = {}
+                self._console_last_lines = last_lines
+            in_place = getattr(self, "_console_in_place", None)
+            if in_place is None:
+                in_place = {}
+                self._console_in_place = in_place
+            screen = screens.get(key)
+            if screen is None:
+                screen = TerminalScreen(max_lines=80)
+                screens[key] = screen
+            screen.feed(text)
+            plain = screen.current_nonempty_plain()
+            if not plain or plain == last_lines.get(key):
+                return
+            last_lines[key] = plain
+            rendered = screen.current_nonempty_ansi() if ansi_output else plain
+            if not ansi_output:
+                rendered = strip_ansi(rendered)
+            reset = "\x1b[0m" if ansi_output else ""
+            sys.stdout.write(f"\r{prefix} {rendered}{reset}")
+            sys.stdout.flush()
+            in_place[key] = True
+            return
+
+        self._finish_console_in_place_lines()
+        for line in text.splitlines():
+            if not strip_ansi(line).strip():
+                continue
+            rendered_line = line if ansi_output else strip_ansi(line)
+            print(f"{prefix} {rendered_line}\x1b[0m" if ansi_output else f"{prefix} {rendered_line}", flush=True)
+
+    def _record_stage_output(
+        self,
+        item: QueueItem,
+        stage: str,
+        plan_run_id: str,
+        stream: str,
+        text: str,
+        log_path: Path,
+    ) -> None:
+        raw_text = decode_visible_ansi_escapes(str(text or ""))
+        if not raw_text:
+            return
+        normalized = strip_ansi(raw_text).replace("\r", "\n")
+        timestamp = time.time()
+        self._print_stage_output(item, stage, plan_run_id, stream, raw_text)
+        self._notify_log_sinks(
+            RunnerLogLine(
+                timestamp=timestamp,
+                session_id=self.session_id,
+                plan_run_id=plan_run_id,
+                source=str(item.source),
+                plan=str(item.plan_path),
+                stage=stage,
+                stream=stream,
+                text=normalized.strip("\n"),
+                raw_text=raw_text,
+                log_path=str(log_path),
+            )
+        )
+
+    @staticmethod
+    def _native_console_log_paths(cmd: List[str]) -> List[Path]:
+        out: List[Path] = []
+        options = {"--av1an-log-file", "--log-file"}
+        index = 0
+        while index < len(cmd):
+            token = str(cmd[index])
+            if token in options and index + 1 < len(cmd):
+                out.append(Path(str(cmd[index + 1])))
+                index += 2
+                continue
+            for option in options:
+                prefix = option + "="
+                if token.startswith(prefix):
+                    out.append(Path(token[len(prefix) :]))
+                    break
+            index += 1
+        unique: List[Path] = []
+        seen: set[str] = set()
+        for path in out:
+            key = str(path.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
+
+    @staticmethod
+    def _read_new_log_text(path: Path, offset: int, encoding: str) -> tuple[int, str]:
+        if not path.exists() or not path.is_file():
+            return offset, ""
+        try:
+            size = path.stat().st_size
+            if size < offset:
+                offset = 0
+            with path.open("rb") as fh:
+                fh.seek(offset)
+                data = fh.read()
+                offset = fh.tell()
+        except Exception:
+            return offset, ""
+        if not data:
+            return offset, ""
+        return offset, data.decode(encoding, errors="replace")
+
+    @staticmethod
+    def _stage_prefers_pseudoterminal(stage: str, cmd: List[str]) -> bool:
+        if os.name != "nt":
+            return False
+        if str(os.environ.get("PBBATCH_DISABLE_WINPTY") or "").strip().lower() in ("1", "true", "yes", "on"):
+            return False
+        if stage in (STAGE_FASTPASS, STAGE_MAINPASS):
+            return True
+        names = {Path(str(token)).name.lower() for token in cmd}
+        return bool(names.intersection({"av1an.exe", "av1an", "auto_boost.py"}))
+
+    @staticmethod
+    def _set_windows_utf8_codepage() -> None:
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        except Exception:
+            pass
+
     def _ingest_child_event(self, item: QueueItem, payload: Dict[str, Any]) -> None:
         plan_run_id = str(payload.get("plan_run_id") or "")
         if plan_run_id:
@@ -625,7 +866,7 @@ class SessionController:
 
     @staticmethod
     def _parse_av1an_progress_text(text: str) -> Dict[str, Any]:
-        clean = ANSI_RE.sub("", str(text or "")).replace("\r", "\n")
+        clean = strip_ansi(str(text or "")).replace("\r", "\n")
         result: Dict[str, Any] = {}
         matches = list(AV1AN_PROGRESS_RE.finditer(clean))
         if matches:
@@ -786,7 +1027,7 @@ class SessionController:
 
     @staticmethod
     def _stage_child_events_path(item: QueueItem, plan_run_id: str, stage: str) -> Path:
-        safe_stage = re.sub(r"[^A-Za-z0-9_.-]+", "_", stage).strip("_") or "stage"
+        safe_stage = SessionController._safe_stage_name(stage)
         return item.workdir / "00_meta" / f"runner_child_{plan_run_id}_{safe_stage}.jsonl"
 
     def _run_stage(
@@ -807,67 +1048,222 @@ class SessionController:
             self._emit(item, stage, "completed", stage_message)
             return
         self._emit(item, stage, "started", stage_message)
-        print("[cmd]", subprocess.list2cmdline(cmd), flush=True)
         child_events = child_events or self._stage_child_events_path(item, plan_run_id, stage)
         ensure_dir(child_events.parent)
+        capture_log_path = self._stage_capture_log_path(item, plan_run_id, stage)
+        ensure_dir(capture_log_path.parent)
         env = os.environ.copy()
         env[CHILD_EVENT_ENV] = str(child_events)
         env[SESSION_ID_ENV] = self.session_id
         env[PLAN_RUN_ID_ENV] = plan_run_id
         env[RUNNER_MANAGED_STATE_ENV] = "1"
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env.setdefault("TERM", "xterm-256color")
+        env.setdefault("COLORTERM", "truecolor")
         offset = child_events.stat().st_size if child_events.exists() else 0
-        proc = subprocess.Popen(cmd, cwd=str(ROOT_DIR), env=env)
-        process_key = (plan_run_id, stage)
-        with self.lock:
-            self.running_stage_processes[process_key] = proc
-            stop_already_requested = self.stop_requested
-        if stop_already_requested and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        last_heartbeat = 0.0
-        stop_terminate_at = time.time() if stop_already_requested else 0.0
-        try:
-            while proc.poll() is None:
-                offset = self._forward_child_events(child_events, offset, item)
-                now = time.time()
-                with self.lock:
-                    stop_now = self.stop_requested
-                if stop_now:
-                    if not stop_terminate_at:
-                        stop_terminate_at = now
-                        try:
-                            proc.terminate()
-                        except Exception:
-                            pass
-                    elif now - stop_terminate_at >= 5.0:
-                        try:
-                            proc.kill()
-                        except Exception:
-                            pass
-                if now - last_heartbeat >= 5.0:
-                    self._refresh_running_stage_progress(item)
-                    self._notify_event_sinks(
-                        {
-                            "event": "runner_heartbeat",
-                            "session_id": self.session_id,
-                            "plan_run_id": plan_run_id,
-                            "stage": stage,
-                            "status": "started",
-                            "timestamp": now,
-                            "source": str(item.source),
-                            "workdir": str(item.workdir),
-                        }
+        output_queue: "queue.Queue[tuple[str, str]]" = queue.Queue()
+        reader_done = threading.Event()
+        encoding = "utf-8"
+        cmdline = subprocess.list2cmdline(cmd)
+        native_log_offsets = {
+            path: path.stat().st_size if path.exists() and path.is_file() else 0
+            for path in self._native_console_log_paths(cmd)
+        }
+        with capture_log_path.open("a", encoding=encoding, errors="replace", newline="") as capture_log:
+            capture_log.write(f"=== START {stage} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            capture_log.write(f"[cmd] {cmdline}\n")
+            capture_log.flush()
+            self._record_stage_output(item, stage, plan_run_id, "cmd", f"[cmd] {cmdline}\n", capture_log_path)
+            proc: Any
+            using_pty = False
+            if self._stage_prefers_pseudoterminal(stage, cmd):
+                try:
+                    from winpty import PtyProcess  # type: ignore[import-not-found]
+
+                    self._set_windows_utf8_codepage()
+                    proc = WinPtyProcessAdapter(
+                        PtyProcess.spawn(cmd, cwd=str(ROOT_DIR), env=env, dimensions=(40, 160))
                     )
-                    last_heartbeat = now
-                time.sleep(0.5)
-        finally:
+                    using_pty = True
+                    self._record_stage_output(
+                        item,
+                        stage,
+                        plan_run_id,
+                        "runner",
+                        "[runner] using Windows pseudoterminal capture\n",
+                        capture_log_path,
+                    )
+                except Exception as exc:
+                    self._record_stage_output(
+                        item,
+                        stage,
+                        plan_run_id,
+                        "runner",
+                        f"[runner] pseudoterminal unavailable; falling back to pipe capture: {exc}\n",
+                        capture_log_path,
+                    )
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=str(ROOT_DIR),
+                        env=env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+            else:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(ROOT_DIR),
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+
+            def read_process_output() -> None:
+                if using_pty:
+                    try:
+                        while proc.poll() is None:
+                            try:
+                                text = proc.read(4096)
+                            except EOFError:
+                                break
+                            if text:
+                                output_queue.put(("pty", text))
+                            else:
+                                time.sleep(0.05)
+                        while True:
+                            try:
+                                text = proc.read(4096)
+                            except Exception:
+                                break
+                            if not text:
+                                break
+                            output_queue.put(("pty", text))
+                    except Exception as exc:
+                        output_queue.put(("stderr", f"[runner] pty output reader failed: {exc}\n"))
+                    finally:
+                        reader_done.set()
+                    return
+                stream = proc.stdout
+                if stream is None:
+                    reader_done.set()
+                    return
+                decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+                try:
+                    if not hasattr(stream, "fileno"):
+                        while True:
+                            text = stream.readline()
+                            if text == "":
+                                break
+                            output_queue.put(("stdout", str(text)))
+                    else:
+                        while True:
+                            data = os.read(stream.fileno(), 4096)
+                            if not data:
+                                break
+                            text = decoder.decode(data)
+                            if text:
+                                output_queue.put(("stdout", text))
+                        tail = decoder.decode(b"", final=True)
+                        if tail:
+                            output_queue.put(("stdout", tail))
+                except Exception as exc:
+                    output_queue.put(("stderr", f"[runner] output reader failed: {exc}\n"))
+                finally:
+                    reader_done.set()
+
+            reader = threading.Thread(
+                target=read_process_output,
+                name=f"runner-output-{self._safe_stage_name(stage)}-{plan_run_id[-6:]}",
+                daemon=True,
+            )
+            reader.start()
+
+            def drain_output() -> None:
+                while True:
+                    try:
+                        stream_name, text = output_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    capture_log.write(text)
+                    capture_log.flush()
+                    self._record_stage_output(item, stage, plan_run_id, stream_name, text, capture_log_path)
+
+            def drain_native_logs() -> None:
+                for log_path, log_offset in list(native_log_offsets.items()):
+                    new_offset, text = self._read_new_log_text(log_path, log_offset, encoding)
+                    native_log_offsets[log_path] = new_offset
+                    if not text:
+                        continue
+                    capture_log.write(text)
+                    capture_log.flush()
+                    self._record_stage_output(item, stage, plan_run_id, "log", text, log_path)
+
+            process_key = (plan_run_id, stage)
             with self.lock:
-                if self.running_stage_processes.get(process_key) is proc:
-                    self.running_stage_processes.pop(process_key, None)
-        offset = self._forward_child_events(child_events, offset, item)
-        rc = int(proc.returncode or 0)
+                self.running_stage_processes[process_key] = proc
+                stop_already_requested = self.stop_requested
+            if stop_already_requested and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            last_heartbeat = 0.0
+            stop_terminate_at = time.time() if stop_already_requested else 0.0
+            try:
+                while proc.poll() is None:
+                    drain_output()
+                    drain_native_logs()
+                    offset = self._forward_child_events(child_events, offset, item)
+                    now = time.time()
+                    with self.lock:
+                        stop_now = self.stop_requested
+                    if stop_now:
+                        if not stop_terminate_at:
+                            stop_terminate_at = now
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                        elif now - stop_terminate_at >= 5.0:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                    if now - last_heartbeat >= 5.0:
+                        self._refresh_running_stage_progress(item)
+                        self._notify_event_sinks(
+                            {
+                                "event": "runner_heartbeat",
+                                "session_id": self.session_id,
+                                "plan_run_id": plan_run_id,
+                                "stage": stage,
+                                "status": "started",
+                                "timestamp": now,
+                                "source": str(item.source),
+                                "workdir": str(item.workdir),
+                            }
+                        )
+                        last_heartbeat = now
+                    time.sleep(0.25)
+            finally:
+                with self.lock:
+                    if self.running_stage_processes.get(process_key) is proc:
+                        self.running_stage_processes.pop(process_key, None)
+                while not reader_done.is_set() or not output_queue.empty():
+                    drain_output()
+                    drain_native_logs()
+                    if not reader_done.is_set():
+                        time.sleep(0.05)
+                reader.join(timeout=1.0)
+                drain_native_logs()
+                self._finish_console_in_place_lines()
+                capture_log.write(f"=== END {stage} {time.strftime('%Y-%m-%d %H:%M:%S')} rc={proc.returncode} ===\n")
+                capture_log.flush()
+            offset = self._forward_child_events(child_events, offset, item)
+            rc = int(proc.returncode or 0)
         if stop_terminate_at:
             clear_stage_marker(item, stage)
             self._emit(item, stage, "failed", "stop_requested")

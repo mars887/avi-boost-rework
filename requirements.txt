@@ -5,5 +5,7 @@ fonttools
 matplotlib
 numpy
 opencv-python
+PySide6>=6.10,<7
+pywinpty>=3.0,<4
 tkinterdnd2
 tqdm

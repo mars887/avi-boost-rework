@@ -1955,7 +1955,11 @@ async def run_bot(config: BotConfig) -> None:
     @web.middleware
     async def shared_secret_middleware(request: Any, handler: Any) -> Any:
         if config.shared_secret:
-            received = str(request.headers.get("X-PBBATCH-Discord-Secret") or "")
+            received = str(
+                request.headers.get("X-PBBATCH-Discord-Secret")
+                or request.headers.get("X-PBBATCH-Runner-Secret")
+                or ""
+            )
             if received != config.shared_secret:
                 return web.json_response({"status": "error", "message": "unauthorized"}, status=401)
         return await handler(request)

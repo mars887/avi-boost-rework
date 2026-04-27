@@ -16,7 +16,8 @@ from utils.runner_state import (
     STAGE_ZONE_EDIT,
 )
 
-from .cli import main, print_help
+from .api import RunnerIntegration, RunnerLaunchConfig, RunnerRuntime
+from .cli import build_arg_parser, main, print_help, runtime_config_from_args
 from .helpers import (
     av1an_encoder_name,
     build_queue,
@@ -26,6 +27,7 @@ from .helpers import (
     normalize_mode,
     resolve_optional_path,
 )
+from .logs import RunnerLogLine
 from .models import ActivePlanState, FinishedPlanState, PlanExecution, QueueItem, RunningStageTask, StageState
 from .session import SessionController
 from .stage_bank import (
@@ -47,6 +49,10 @@ __all__ = [
     "PlanExecution",
     "QueueItem",
     "RunningStageTask",
+    "RunnerIntegration",
+    "RunnerLaunchConfig",
+    "RunnerLogLine",
+    "RunnerRuntime",
     "STAGE_ATTACHMENTS",
     "STAGE_AUDIO",
     "STAGE_AUTOBOOST_PSD_SCENE",
@@ -66,6 +72,7 @@ __all__ = [
     "StageBankStage",
     "StageState",
     "av1an_encoder_name",
+    "build_arg_parser",
     "build_queue",
     "build_wrapper_vspipe_args",
     "downstream_stage_names",
@@ -77,4 +84,5 @@ __all__ = [
     "normalize_mode",
     "print_help",
     "resolve_optional_path",
+    "runtime_config_from_args",
 ]

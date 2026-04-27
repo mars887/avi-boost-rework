@@ -1,18 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import sys
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
-from utils.discord_bridge import DiscordBridge
 from utils.discord_config import discord_config_value
-from utils.runner_lock import SourceDirLock
-from utils.runner_source_info import prepare_source_info
 
-from .helpers import build_queue
-from .session import SessionController
+from .api import RunnerLaunchConfig, RunnerRuntime
+from .integrations import attach_discord_integrations
+
 
 def print_help() -> None:
     print(
@@ -28,7 +24,7 @@ def print_help() -> None:
     )
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Session runner for file and batch .plan files.")
     parser.add_argument("--mode", choices=["full", "fastpass"], default="")
     parser.add_argument("--events-jsonl", default="")
@@ -43,6 +39,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-interactive", action="store_true")
     parser.add_argument("--exit-when-idle", action="store_true")
     parser.add_argument("--session-id", default="")
+    parser.add_argument("--gui", dest="gui", action="store_true", default=True, help=argparse.SUPPRESS)
+    parser.add_argument("--no-gui", dest="gui", action="store_false", help="Run the legacy console runner.")
     discord_group = parser.add_mutually_exclusive_group()
     discord_group.add_argument(
         "--discord",
@@ -67,122 +65,94 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=discord_config_value("PBBATCH_DISCORD_SHARED_SECRET", ""),
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("plans", nargs="+")
-    args = parser.parse_args(argv)
+    parser.add_argument("plans", nargs="*")
+    return parser
 
-    queue = build_queue(args.plans, args.mode)
-    if not queue:
-        print("[runner] no plans resolved", file=sys.stderr)
-        return 1
-    source_dirs = sorted({str(item.source.parent.resolve()) for item in queue}, key=str.lower)
-    if args.discord_enabled and len(source_dirs) > 1:
-        print(f"[discord] multi-folder runner: {len(source_dirs)} folder sessions will be published", flush=True)
 
-    print(f"[runner] queue size: {len(queue)}", flush=True)
-    for index, item in enumerate(queue, start=1):
-        print(f"  {index}. {item.mode} | {item.plan_path}", flush=True)
-
-    controller = SessionController(
-        items=queue,
-        events_jsonl=args.events_jsonl,
-        add_source_bitrate=args.add_source_bitrate,
-        exit_when_idle=(args.exit_when_idle or args.no_interactive),
-        session_id=args.session_id,
+def runtime_config_from_args(args: argparse.Namespace) -> RunnerLaunchConfig:
+    return RunnerLaunchConfig(
+        plans=list(args.plans or []),
+        mode=str(args.mode or ""),
+        events_jsonl=str(args.events_jsonl or ""),
+        add_source_bitrate=bool(args.add_source_bitrate),
+        exit_when_idle=bool(args.exit_when_idle),
+        no_interactive=bool(args.no_interactive),
+        session_id=str(args.session_id or ""),
     )
-    def discord_session_id_for_source(source_dir: str) -> str:
-        if len(source_dirs) <= 1:
-            return controller.session_id
-        suffix = hashlib.sha1(source_dir.lower().encode("utf-8", errors="ignore")).hexdigest()[:8]
-        return f"{controller.session_id}-{suffix}"
 
-    bridges: List[tuple[str, DiscordBridge]] = []
-    if args.discord_enabled:
-        for source_dir in source_dirs:
-            discord_session_id = discord_session_id_for_source(source_dir)
-            bridge = DiscordBridge(
-                service_url=args.discord_service_url,
-                session_id=discord_session_id,
-                enabled=True,
-                shared_secret=args.discord_shared_secret,
-            )
-            bridge.attach(
-                snapshot_provider=lambda sd=source_dir, sid=discord_session_id: controller.snapshot(sd, session_id=sid),
-                command_handler=lambda command, sd=source_dir: controller.handle_command(command, source_dir=sd),
-            )
-            if args.discord_verbose:
-                bridge.set_error_callback(
-                    lambda message, sd=source_dir: print(f"[discord] bridge unavailable for {sd}: {message}", flush=True)
-                )
-            bridges.append((source_dir, bridge))
 
-        bridge_by_source = {source_dir: bridge for source_dir, bridge in bridges}
-
-        def notify_discord_event(payload: Dict[str, Any], _snapshot: Dict[str, Any]) -> None:
-            source = str(payload.get("source") or "")
-            source_dir = str(Path(source).parent.resolve()) if source else ""
-            bridge = bridge_by_source.get(source_dir)
-            if bridge is None:
-                return
-            bridge.notify_event(payload, controller.snapshot(source_dir, session_id=bridge.session_id))
-
-        controller.add_event_sink(notify_discord_event)
-    folder_locks = [SourceDirLock(source_dir=source_dir, session_id=controller.session_id, enabled=True) for source_dir in source_dirs]
-    if args.discord_enabled:
-        print(f"[discord] enabled: session_id={controller.session_id}", flush=True)
-        print(f"[discord] service_url={args.discord_service_url}", flush=True)
-        for source_dir, bridge in bridges:
-            print(f"[discord] source_dir={source_dir} | discord_session_id={bridge.session_id}", flush=True)
+def attach_cli_integrations(runtime: RunnerRuntime, args: argparse.Namespace) -> None:
+    if bool(getattr(args, "discord_enabled", True)) and len(runtime.source_dirs) > 1:
+        print(f"[discord] multi-folder runner: {len(runtime.source_dirs)} folder sessions will be published", flush=True)
+    bridges = attach_discord_integrations(
+        runtime,
+        service_url=str(getattr(args, "discord_service_url", "") or ""),
+        shared_secret=str(getattr(args, "discord_shared_secret", "") or ""),
+        enabled=bool(getattr(args, "discord_enabled", True)),
+        verbose=bool(getattr(args, "discord_verbose", False)),
+        logger=lambda message: print(message, flush=True),
+    )
+    if bool(getattr(args, "discord_enabled", True)):
+        print(f"[discord] enabled: session_id={runtime.session_id}", flush=True)
+        print(f"[discord] service_url={getattr(args, 'discord_service_url', '')}", flush=True)
+        for bridge in bridges:
+            print(f"[discord] source_dir={bridge.source_dir} | discord_session_id={bridge.session_id}", flush=True)
     else:
         print("[discord] disabled", flush=True)
-    acquired_locks: List[SourceDirLock] = []
+
+
+def run_headless(args: argparse.Namespace) -> int:
+    if not args.plans:
+        print("[runner] no plans provided; use GUI mode or pass at least one .plan with --no-gui", file=sys.stderr)
+        return 2
     try:
-        for folder_lock in folder_locks:
-            folder_lock.acquire()
-            acquired_locks.append(folder_lock)
-    except RuntimeError as exc:
-        for folder_lock in acquired_locks:
-            folder_lock.release()
+        runtime = RunnerRuntime(runtime_config_from_args(args))
+    except Exception as exc:
+        print(f"[runner] {exc}", file=sys.stderr)
+        return 1
+    if not runtime.queue:
+        print("[runner] no plans resolved", file=sys.stderr)
+        return 1
+
+    print(f"[runner] queue size: {len(runtime.queue)}", flush=True)
+    for index, item in enumerate(runtime.queue, start=1):
+        print(f"  {index}. {item.mode} | {item.plan_path}", flush=True)
+
+    attach_cli_integrations(runtime, args)
+    try:
+        runtime.start()
+    except Exception as exc:
+        runtime.close()
         print(f"[runner] {exc}", file=sys.stderr)
         return 2
-    for folder_lock in folder_locks:
+    for folder_lock in runtime.folder_locks:
         print(f"[runner] folder lock acquired: {folder_lock.path}", flush=True)
-    try:
-        for item in queue:
-            prepare_source_info(item)
-    except Exception as exc:
-        for folder_lock in folder_locks:
-            folder_lock.release()
-        print(f"[runner] source info preparation failed: {exc}", file=sys.stderr)
-        return 2
-    controller.start()
-    for _, bridge in bridges:
-        bridge.start()
-    if args.discord_enabled:
-        connected_count = sum(1 for _, bridge in bridges if bridge.connected)
-        if connected_count == len(bridges):
+    if bool(getattr(args, "discord_enabled", True)):
+        connected_count = sum(1 for integration in runtime.integrations if getattr(integration, "connected", False))
+        if connected_count == len(runtime.integrations):
             print("[discord] runner registered in bot service", flush=True)
-        elif args.discord_verbose:
-            print(f"[discord] registered {connected_count}/{len(bridges)} folder sessions; runner will keep working locally", flush=True)
+        elif bool(getattr(args, "discord_verbose", False)):
+            print(
+                f"[discord] registered {connected_count}/{len(runtime.integrations)} folder sessions; "
+                "runner will keep working locally",
+                flush=True,
+            )
 
     if args.no_interactive:
-        try:
-            controller.join()
-            return 1 if controller.failed else 0
-        finally:
-            for _, bridge in bridges:
-                bridge.stop()
-            for folder_lock in folder_locks:
-                folder_lock.release()
-            if args.discord_enabled:
-                print("[discord] bridge stopped", flush=True)
-            print("[runner] folder lock released", flush=True)
+        code = runtime.join()
+        if bool(getattr(args, "discord_enabled", True)):
+            print("[discord] bridge stopped", flush=True)
+        print("[runner] folder lock released", flush=True)
+        return code
+
+    controller = runtime.controller
 
     def request_interrupt_shutdown() -> None:
         if controller.is_busy():
-            controller.request_stop()
+            runtime.stop()
             print("[runner] interrupt received; stopping active work", flush=True)
         else:
-            controller.request_stop()
+            runtime.stop()
             print("[runner] interrupt received; stopping", flush=True)
 
     print_help()
@@ -222,7 +192,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         controller.request_exit_when_idle()
                         print("[runner] busy; will exit when idle", flush=True)
                     else:
-                        controller.request_stop()
+                        runtime.stop()
                     continue
                 if raw == "help":
                     print_help()
@@ -231,16 +201,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         except KeyboardInterrupt:
             request_interrupt_shutdown()
         try:
-            controller.join()
+            code = runtime.join()
         except KeyboardInterrupt:
             request_interrupt_shutdown()
-            controller.join()
-        return 1 if controller.failed else 0
+            code = runtime.join()
+        return code
     finally:
-        for _, bridge in bridges:
-            bridge.stop()
-        for folder_lock in folder_locks:
-            folder_lock.release()
-        if args.discord_enabled:
+        runtime.close()
+        if bool(getattr(args, "discord_enabled", True)):
             print("[discord] bridge stopped", flush=True)
         print("[runner] folder lock released", flush=True)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.gui:
+        try:
+            from .gui import run_runner_gui
+        except ImportError as exc:
+            print(f"[runner-gui] PySide6 GUI is unavailable: {exc}", file=sys.stderr)
+            print("[runner-gui] Install it with: python -m pip install \"PySide6>=6.10,<7\"", file=sys.stderr)
+            return 2
+        return run_runner_gui(args)
+    return run_headless(args)
+
