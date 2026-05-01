@@ -6,7 +6,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from ab_logging import is_progress_line, strip_ansi
 
@@ -16,6 +16,7 @@ def run_cmd(
     cwd: Optional[Path] = None,
     check: bool = True,
     inherit_output: bool = False,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> subprocess.CompletedProcess:
     """Run a command and stream output with progress-line handling."""
     cmd_str = " ".join(shlex.quote(str(x)) for x in cmd)
@@ -39,6 +40,15 @@ def run_cmd(
     progress_width = 0
     had_progress = False
     last_was_cr = False
+
+    def notify_progress(text: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(text)
+        except Exception:
+            pass
+
     if p.stdout is not None:
         while True:
             ch = p.stdout.read(1)
@@ -53,6 +63,7 @@ def run_cmd(
                 clean = strip_ansi(line)
                 if ch == "\r" or is_progress_line(clean):
                     s = clean.strip()
+                    notify_progress(s)
                     if len(s) < progress_width:
                         s = s + (" " * (progress_width - len(s)))
                     progress_width = max(progress_width, len(s))
@@ -84,6 +95,7 @@ def run_cmd(
         clean = strip_ansi(buf)
         if is_progress_line(clean):
             s = clean.strip()
+            notify_progress(s)
             if len(s) < progress_width:
                 s = s + (" " * (progress_width - len(s)))
             sys.stdout.write(s + "\r")

@@ -76,6 +76,9 @@ AV1AN_PROGRESS_RE = re.compile(
     re.IGNORECASE,
 )
 AV1AN_CHUNK_RE = re.compile(r"\[(?P<done>\d+)\s*/\s*(?P<total>\d+)\s+Chunks\]", re.IGNORECASE)
+AV1AN_EST_SIZE_RE = re.compile(r"\best\.\s+(?P<size>[^,\)]+)", re.IGNORECASE)
+PSD_FRAME_PROGRESS_RE = re.compile(r"^Frame\s+\d+\s*/\s*Detecting scenes\s*/\s*[0-9]+(?:\.[0-9]+)?\s*fps$", re.IGNORECASE)
+PSD_SCENE_PROGRESS_RE = re.compile(r"^Scene\s*\[\s*(?P<start>\d+)\s*:\s*(?P<end>\d+)\s*\]\s*/\s*Creating scenes$", re.IGNORECASE)
 
 CHILD_EVENT_ENV = "PBBATCH_RUNNER_CHILD_EVENTS_JSONL"
 SESSION_ID_ENV = "PBBATCH_RUNNER_SESSION_ID"
@@ -124,6 +127,134 @@ class WinPtyProcessAdapter:
         self.returncode = self.poll()
 
 
+class StageOutputFilter:
+    def __init__(self, stage: str) -> None:
+        self.stage = stage
+        self.screen = TerminalScreen(max_lines=160)
+        self.last_ui_progress_at = 0.0
+        self.last_capture_progress_at = 0.0
+        self.last_capture_line = ""
+        self.pending_line = ""
+        self.scene_ranges: List[Tuple[int, int]] = []
+        self.scene_seen: set[Tuple[int, int]] = set()
+        self.psd_progress_row_active = False
+
+    def process(self, stream: str, text: str, now: float) -> Tuple[str, str]:
+        raw = str(text or "")
+        if not raw:
+            return "", ""
+        if stream in ("cmd", "runner", "stderr"):
+            return raw, raw
+        if self.stage == STAGE_AUTOBOOST_PSD_SCENE:
+            return self._process_psd(raw, now)
+        if self.stage in (STAGE_AUTOBOOST_SCENE, STAGE_FASTPASS, STAGE_MAINPASS):
+            return self._process_terminal_progress(raw, now)
+        return raw, raw
+
+    def flush(self, now: float, *, final: bool = False) -> Tuple[str, str]:
+        ui = ""
+        capture = ""
+        if self.stage == STAGE_AUTOBOOST_PSD_SCENE:
+            if self.pending_line.strip():
+                if self.psd_progress_row_active:
+                    ui += "\n"
+                    self.psd_progress_row_active = False
+                ui += self.pending_line
+                capture += self.pending_line
+                self.pending_line = ""
+            scenes = self._final_scene_text()
+            if scenes:
+                if self.psd_progress_row_active:
+                    ui += "\n"
+                    self.psd_progress_row_active = False
+                ui += scenes
+                capture += scenes
+        elif self.stage in (STAGE_AUTOBOOST_SCENE, STAGE_FASTPASS, STAGE_MAINPASS):
+            snapshot = self.screen.current_nonempty_plain()
+            if snapshot and (final or snapshot != self.last_capture_line):
+                capture += f"[progress] {snapshot}\n"
+                self.last_capture_line = snapshot
+        return ui, capture
+
+    def _process_terminal_progress(self, raw: str, now: float) -> Tuple[str, str]:
+        clean = strip_ansi(raw)
+        noisy_progress = (
+            has_terminal_repaint(raw)
+            or bool(AV1AN_PROGRESS_RE.search(clean))
+            or bool(AV1AN_CHUNK_RE.search(clean))
+        )
+        if not noisy_progress:
+            return raw, raw
+        self.screen.feed(raw)
+        ui = ""
+        capture = ""
+        if now - self.last_ui_progress_at >= 0.5:
+            ui = raw
+            self.last_ui_progress_at = now
+        snapshot = self.screen.current_nonempty_plain()
+        if snapshot and snapshot != self.last_capture_line and now - self.last_capture_progress_at >= 5.0:
+            capture = f"[progress] {snapshot}\n"
+            self.last_capture_line = snapshot
+            self.last_capture_progress_at = now
+        return ui, capture
+
+    def _process_psd(self, raw: str, now: float) -> Tuple[str, str]:
+        normalized = strip_ansi(raw).replace("\r", "\n")
+        self.pending_line += normalized
+        if "\n" not in self.pending_line:
+            return "", ""
+        parts = self.pending_line.splitlines(keepends=True)
+        if parts and not parts[-1].endswith(("\n", "\r")):
+            self.pending_line = parts.pop()
+        else:
+            self.pending_line = ""
+
+        ui_parts: List[str] = []
+        capture_parts: List[str] = []
+        for part in parts:
+            clean = part.strip()
+            if not clean:
+                continue
+            scene_match = PSD_SCENE_PROGRESS_RE.match(clean)
+            if scene_match:
+                scene_range = (int(scene_match.group("start")), int(scene_match.group("end")))
+                if scene_range not in self.scene_seen:
+                    self.scene_seen.add(scene_range)
+                    self.scene_ranges.append(scene_range)
+                continue
+            if PSD_FRAME_PROGRESS_RE.match(clean):
+                if now - self.last_ui_progress_at >= 2.0:
+                    ui_parts.append(f"\x1b[2K[progress] {clean}\r")
+                    self.last_ui_progress_at = now
+                    self.psd_progress_row_active = True
+                if now - self.last_capture_progress_at >= 10.0:
+                    capture_parts.append(f"[progress] {clean}\n")
+                    self.last_capture_progress_at = now
+                continue
+            if self.psd_progress_row_active:
+                ui_parts.append("\n")
+                self.psd_progress_row_active = False
+            ui_parts.append(part)
+            capture_parts.append(part)
+        return "".join(ui_parts), "".join(capture_parts)
+
+    def _final_scene_text(self) -> str:
+        if not self.scene_ranges:
+            return ""
+        leaves: List[Tuple[int, int]] = []
+        for start, end in self.scene_ranges:
+            contains_child = any(
+                (child_start, child_end) != (start, end)
+                and start <= child_start
+                and child_end <= end
+                for child_start, child_end in self.scene_ranges
+            )
+            if not contains_child:
+                leaves.append((start, end))
+        lines = [f"Scene [{start:5d}:{end:5d}] / Creating scenes" for start, end in leaves]
+        return "\n".join(lines) + ("\n" if lines else "")
+
+
 class SessionController:
     def __init__(
         self,
@@ -156,7 +287,9 @@ class SessionController:
         self.add_source_bitrate = bool(add_source_bitrate)
         self.source_dirs = sorted({item.source_dir for item in items}, key=str.lower)
         self.pause_after_current_by_source: Dict[str, bool] = {source_dir: False for source_dir in self.source_dirs}
+        self.pause_after_plans_by_source: Dict[str, bool] = {source_dir: False for source_dir in self.source_dirs}
         self.paused_by_source: Dict[str, bool] = {source_dir: False for source_dir in self.source_dirs}
+        self.pause_after_stage_plan_run_ids: set[str] = set()
         self.exit_when_idle = bool(exit_when_idle)
         self.rerun_after_current = False
         self.rerun_after_current_plan_run_id = ""
@@ -207,6 +340,9 @@ class SessionController:
     def _folder_pause_after_current(self, source_dir: str) -> bool:
         return bool(self.pause_after_current_by_source.get(source_dir, False))
 
+    def _folder_pause_after_plans(self, source_dir: str) -> bool:
+        return bool(self.pause_after_plans_by_source.get(source_dir, False))
+
     def start(self) -> None:
         self.worker.start()
         self.wake_event.set()
@@ -240,6 +376,7 @@ class SessionController:
             completed = len(self.completed)
             paused = ", ".join(sorted(k for k, v in self.paused_by_source.items() if v)) or "no"
             pause_after = ", ".join(sorted(k for k, v in self.pause_after_current_by_source.items() if v)) or "no"
+            pause_after_plans = ", ".join(sorted(k for k, v in self.pause_after_plans_by_source.items() if v)) or "no"
             exit_idle = "yes" if self.exit_when_idle else "no"
         if active:
             current = "\n".join(
@@ -255,6 +392,7 @@ class SessionController:
             f"failed: {failed}\n"
             f"paused: {paused}\n"
             f"pause_after_current: {pause_after}\n"
+            f"pause_after_plans: {pause_after_plans}\n"
             f"exit_when_idle: {exit_idle}"
         )
 
@@ -271,6 +409,11 @@ class SessionController:
                 self._folder_pause_after_current(selected_source)
                 if selected_source
                 else any(self.pause_after_current_by_source.values())
+            )
+            pause_after_plans = (
+                self._folder_pause_after_plans(selected_source)
+                if selected_source
+                else any(self.pause_after_plans_by_source.values())
             )
             state = (
                 "finished"
@@ -289,6 +432,7 @@ class SessionController:
                 "state": state,
                 "paused": paused,
                 "pause_after_current": pause_after_current,
+                "pause_after_plans": pause_after_plans,
                 "exit_when_idle": self.exit_when_idle,
                 "stop_requested": self.stop_requested,
                 "active": [state.snapshot() for state in active],
@@ -329,12 +473,40 @@ class SessionController:
             else:
                 self.paused_by_source[selected_source] = True
                 self.pause_after_current_by_source[selected_source] = False
+            self.pause_after_plans_by_source[selected_source] = False
+
+    def request_pause_after_plans(self, source_dir: str = "") -> None:
+        with self.lock:
+            selected_source = self._source_dir_for_command(source_dir)
+            has_active = any(state.item.source_dir == selected_source for state in self.active.values())
+            if has_active:
+                self.pause_after_plans_by_source[selected_source] = True
+            else:
+                self.paused_by_source[selected_source] = True
+                self.pause_after_plans_by_source[selected_source] = False
+            self.pause_after_current_by_source[selected_source] = False
+
+    def request_pause_plan(self, plan_run_id: str) -> None:
+        plan_run_id = str(plan_run_id or "").strip()
+        if not plan_run_id:
+            return
+        with self.lock:
+            if plan_run_id in self.active:
+                self.pause_after_stage_plan_run_ids.add(plan_run_id)
+        self.wake_event.set()
 
     def resume(self, source_dir: str = "") -> None:
         with self.lock:
             selected_source = self._source_dir_for_command(source_dir)
             self.paused_by_source[selected_source] = False
             self.pause_after_current_by_source[selected_source] = False
+            self.pause_after_plans_by_source[selected_source] = False
+            self.pause_after_stage_plan_run_ids = {
+                plan_run_id
+                for plan_run_id in self.pause_after_stage_plan_run_ids
+                if self.active.get(plan_run_id) is not None
+                and self.active[plan_run_id].item.source_dir != selected_source
+            }
         self.wake_event.set()
 
     def retry_failed(self) -> None:
@@ -356,6 +528,96 @@ class SessionController:
             self.failed.clear()
             for source_dir in self.paused_by_source:
                 self.paused_by_source[source_dir] = False
+                self.pause_after_current_by_source[source_dir] = False
+                self.pause_after_plans_by_source[source_dir] = False
+        self.wake_event.set()
+
+    @staticmethod
+    def _item_matches(item: QueueItem, plan: str, source: str = "") -> bool:
+        plan_text = str(plan or "").strip().lower()
+        source_text = str(source or "").strip().lower()
+        item_plan = str(item.plan_path).lower()
+        item_plan_resolved = str(item.plan_path.resolve()).lower()
+        item_source = str(item.source).lower()
+        item_source_resolved = str(item.source.resolve()).lower()
+        if plan_text and plan_text not in (item_plan, item_plan_resolved):
+            return False
+        if source_text and source_text not in (item_source, item_source_resolved):
+            return False
+        return True
+
+    def retry_failed_item(self, plan: str, source: str = "") -> bool:
+        with self.lock:
+            target = next((item for item in self.failed if self._item_matches(item, plan, source)), None)
+            if target is None:
+                return False
+            self.failed = [item for item in self.failed if item is not target]
+            self.finished_runs = [
+                run
+                for run in self.finished_runs
+                if not (run.status == "failed" and self._item_matches(run.item, plan, source))
+            ]
+            self.queue.appendleft(target)
+            self.paused_by_source[target.source_dir] = False
+            self.pause_after_current_by_source[target.source_dir] = False
+            self.pause_after_plans_by_source[target.source_dir] = False
+        self.wake_event.set()
+        return True
+
+    def prioritize_queued_item(self, plan: str, source: str = "") -> bool:
+        with self.lock:
+            selected_index = -1
+            for index, item in enumerate(self.queue):
+                if self._item_matches(item, plan, source):
+                    selected_index = index
+                    break
+            if selected_index < 0:
+                return False
+            item = self.queue[selected_index]
+            del self.queue[selected_index]
+            self.queue.appendleft(item)
+            self.paused_by_source[item.source_dir] = False
+            self.pause_after_current_by_source[item.source_dir] = False
+            self.pause_after_plans_by_source[item.source_dir] = False
+        self.wake_event.set()
+        return True
+
+    def remove_queued_item(self, plan: str, source: str = "") -> bool:
+        with self.lock:
+            for index, item in enumerate(self.queue):
+                if self._item_matches(item, plan, source):
+                    del self.queue[index]
+                    self.wake_event.set()
+                    return True
+        return False
+
+    def request_stop_plan(self, plan_run_id: str) -> None:
+        plan_run_id = str(plan_run_id or "").strip()
+        if not plan_run_id:
+            return
+        finish_now = False
+        with self.lock:
+            self.pause_after_stage_plan_run_ids.discard(plan_run_id)
+            execution = self.executions.get(plan_run_id)
+            if execution is not None:
+                execution.failed_stages[STAGE_ITEM] = "stop_requested"
+            for (active_plan_run_id, _stage), proc in list(self.running_stage_processes.items()):
+                if active_plan_run_id != plan_run_id:
+                    continue
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                except Exception:
+                    pass
+            if plan_run_id in self.active and not self._has_unfinished_stage_task(plan_run_id):
+                finish_now = True
+        if finish_now:
+            self._finish_plan_execution(
+                plan_run_id,
+                final_status="failed",
+                failed_stage=STAGE_ITEM,
+                message="stop_requested",
+            )
         self.wake_event.set()
 
     def rerun_current_item(self) -> None:
@@ -388,8 +650,10 @@ class SessionController:
             for source_dir in self.paused_by_source:
                 self.paused_by_source[source_dir] = False
                 self.pause_after_current_by_source[source_dir] = False
+                self.pause_after_plans_by_source[source_dir] = False
             self.rerun_after_current = False
             self.rerun_after_current_plan_run_id = ""
+            self.pause_after_stage_plan_run_ids.clear()
             self.queue.clear()
             self._terminate_running_processes_locked()
         self.wake_event.set()
@@ -400,7 +664,10 @@ class SessionController:
             return "status sent"
         if name in ("pause", "pause_after_current"):
             self.request_pause_after_current(source_dir)
-            return "will pause after current active plan"
+            return "will pause after current active stages"
+        if name in ("pause_after_plans", "pause_after_active_plans"):
+            self.request_pause_after_plans(source_dir)
+            return "will pause after active plans"
         if name == "resume":
             self.resume(source_dir)
             return "resumed"
@@ -473,7 +740,9 @@ class SessionController:
         message: str,
         timestamp: float,
         progress: Optional[float] = None,
+        details: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, float, float, float]:
+        detail_updates = dict(details or {})
         with self.lock:
             active = self._active_state_for_item(item)
             if active is None:
@@ -490,6 +759,23 @@ class SessionController:
                 ended_at = active.ended_at
             else:
                 stage_state = active.stage(stage)
+                if status == "progress":
+                    if stage_state.status in ("pending", ""):
+                        stage_state.status = "started"
+                        stage_state.started_at = timestamp
+                        stage_state.ended_at = 0.0
+                    if message:
+                        stage_state.message = message
+                    if progress is not None and progress >= 0:
+                        stage_state.progress = progress
+                    if detail_updates:
+                        stage_state.details.update(detail_updates)
+                    started_at = stage_state.started_at
+                    ended_at = stage_state.ended_at
+                    elapsed = 0.0
+                    if started_at:
+                        elapsed = (ended_at or timestamp) - started_at
+                    return active.plan_run_id, started_at, ended_at, elapsed
                 if (
                     stage in (STAGE_FASTPASS, STAGE_SSIMU2)
                     and status in ("started", "completed", "failed")
@@ -554,6 +840,8 @@ class SessionController:
                     stage_state.ended_at = timestamp
                 if progress is not None and progress >= 0:
                     stage_state.progress = progress
+                if detail_updates:
+                    stage_state.details.update(detail_updates)
                 started_at = stage_state.started_at
                 ended_at = stage_state.ended_at
 
@@ -807,6 +1095,8 @@ class SessionController:
             return
         timestamp = float(payload.get("timestamp") or time.time())
         message = str(payload.get("message") or "")
+        raw_details = payload.get("details")
+        details = raw_details if isinstance(raw_details, dict) else {}
         raw_progress = payload.get("progress")
         progress = None
         try:
@@ -820,6 +1110,7 @@ class SessionController:
             message,
             timestamp,
             progress=progress,
+            details=details,
         )
         event = RunnerEvent(
             event=str(payload.get("event") or "runner_child"),
@@ -838,9 +1129,13 @@ class SessionController:
             ended_at=ended_at,
             elapsed_seconds=round(elapsed, 3),
         )
-        print(f"[runner-child] {item.name} | {stage} | {status}", flush=True)
+        if status != "progress":
+            print(f"[runner-child] {item.name} | {stage} | {status}", flush=True)
         self._write_item_state(item, event)
-        self._notify_event_sinks(dict(event.__dict__))
+        event_payload = dict(event.__dict__)
+        if details:
+            event_payload["details"] = dict(details)
+        self._notify_event_sinks(event_payload)
 
     def _forward_child_events(self, path: Path, offset: int, item: QueueItem) -> int:
         if not path.exists():
@@ -895,6 +1190,9 @@ class SessionController:
             eta = str(match.group("eta") or "").strip()
             if eta:
                 result["eta"] = eta
+            est_match = AV1AN_EST_SIZE_RE.search(clean[match.start() : match.end() + 160])
+            if est_match:
+                result["estimated_size"] = est_match.group("size").strip()
             chunk_matches = list(AV1AN_CHUNK_RE.finditer(clean[: match.start()]))
             if chunk_matches:
                 chunk_match = chunk_matches[-1]
@@ -959,6 +1257,11 @@ class SessionController:
                 ("chunks_done", "chunks_done"),
                 ("chunks_total", "chunks_total"),
                 ("eta", "eta"),
+                ("elapsed", "progress_elapsed"),
+                ("estimated_size", "estimated_size"),
+                ("estimated_output_size", "estimated_size"),
+                ("est_size", "estimated_size"),
+                ("est_size_bytes", "estimated_size_bytes"),
             ):
                 if source_key in payload and payload[source_key] not in (None, ""):
                     result[target_key] = payload[source_key]
@@ -971,18 +1274,21 @@ class SessionController:
                     result["spf"] = float(result["spf"])
                 if "kbps" in result:
                     result["kbps"] = float(result["kbps"])
+                if "estimated_size_bytes" in result:
+                    result["estimated_size_bytes"] = int(float(result["estimated_size_bytes"]))
             except Exception:
                 pass
             return result
         return {}
 
-    def _refresh_running_stage_progress(self, item: QueueItem) -> None:
+    def _refresh_running_stage_progress(self, item: QueueItem, stage_names: Optional[List[str]] = None) -> None:
         log_dir = item.workdir / "00_logs"
         progress_sources = {
             STAGE_FASTPASS: log_dir / "03.1_fastpass.log",
             STAGE_MAINPASS: log_dir / "06_av1an_mainpass.log",
         }
         progress_jsonl_sources = {
+            STAGE_AUTOBOOST_SCENE: log_dir / "03.1_fastpass.progress.jsonl",
             STAGE_FASTPASS: log_dir / "03.1_fastpass.progress.jsonl",
             STAGE_MAINPASS: log_dir / "06_av1an_mainpass.progress.jsonl",
         }
@@ -990,15 +1296,22 @@ class SessionController:
             active = self._active_state_for_item(item)
             if active is None:
                 return
-            running = [stage.name for stage in active.stages if stage.status == "started"]
+            if stage_names is None:
+                targets = [stage.name for stage in active.stages if stage.status == "started"]
+            else:
+                requested = {str(name) for name in stage_names}
+                targets = [
+                    stage.name
+                    for stage in active.stages
+                    if stage.name in requested and stage.status == "started"
+                ]
         updates: Dict[str, Dict[str, Any]] = {}
-        for stage_name in running:
-            log_path = progress_sources.get(stage_name)
-            if log_path is None:
-                continue
-            progress = self._last_av1an_progress_from_jsonl(progress_jsonl_sources.get(stage_name, Path()))
+        for stage_name in targets:
+            jsonl_path = progress_jsonl_sources.get(stage_name)
+            progress = self._last_av1an_progress_from_jsonl(jsonl_path) if jsonl_path is not None else {}
             if not progress:
-                progress = self._last_av1an_progress_from_log(log_path)
+                log_path = progress_sources.get(stage_name)
+                progress = self._last_av1an_progress_from_log(log_path) if log_path is not None else {}
             if progress:
                 updates[stage_name] = progress
         if not updates:
@@ -1070,6 +1383,7 @@ class SessionController:
             path: path.stat().st_size if path.exists() and path.is_file() else 0
             for path in self._native_console_log_paths(cmd)
         }
+        output_filter = StageOutputFilter(stage)
         with capture_log_path.open("a", encoding=encoding, errors="replace", newline="") as capture_log:
             capture_log.write(f"=== START {stage} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
             capture_log.write(f"[cmd] {cmdline}\n")
@@ -1187,9 +1501,12 @@ class SessionController:
                         stream_name, text = output_queue.get_nowait()
                     except queue.Empty:
                         break
-                    capture_log.write(text)
-                    capture_log.flush()
-                    self._record_stage_output(item, stage, plan_run_id, stream_name, text, capture_log_path)
+                    ui_text, capture_text = output_filter.process(stream_name, text, time.time())
+                    if capture_text:
+                        capture_log.write(capture_text)
+                        capture_log.flush()
+                    if ui_text:
+                        self._record_stage_output(item, stage, plan_run_id, stream_name, ui_text, capture_log_path)
 
             def drain_native_logs() -> None:
                 for log_path, log_offset in list(native_log_offsets.items()):
@@ -1197,9 +1514,12 @@ class SessionController:
                     native_log_offsets[log_path] = new_offset
                     if not text:
                         continue
-                    capture_log.write(text)
-                    capture_log.flush()
-                    self._record_stage_output(item, stage, plan_run_id, "log", text, log_path)
+                    ui_text, capture_text = output_filter.process("log", text, time.time())
+                    if capture_text:
+                        capture_log.write(capture_text)
+                        capture_log.flush()
+                    if ui_text:
+                        self._record_stage_output(item, stage, plan_run_id, "log", ui_text, log_path)
 
             process_key = (plan_run_id, stage)
             with self.lock:
@@ -1259,10 +1579,17 @@ class SessionController:
                         time.sleep(0.05)
                 reader.join(timeout=1.0)
                 drain_native_logs()
+                ui_text, capture_text = output_filter.flush(time.time(), final=True)
+                if capture_text:
+                    capture_log.write(capture_text)
+                    capture_log.flush()
+                if ui_text:
+                    self._record_stage_output(item, stage, plan_run_id, "stdout", ui_text, capture_log_path)
                 self._finish_console_in_place_lines()
                 capture_log.write(f"=== END {stage} {time.strftime('%Y-%m-%d %H:%M:%S')} rc={proc.returncode} ===\n")
                 capture_log.flush()
             offset = self._forward_child_events(child_events, offset, item)
+            self._refresh_running_stage_progress(item, stage_names=[stage])
             rc = int(proc.returncode or 0)
         if stop_terminate_at:
             clear_stage_marker(item, stage)
@@ -1650,6 +1977,36 @@ class SessionController:
                 and not self.pause_after_current_by_source.get(source_dir, False)
             )
 
+    def _mark_pause_after_plan_sources(self) -> bool:
+        paused_sources: List[str] = []
+        with self.lock:
+            for source_dir, requested in list(self.pause_after_plans_by_source.items()):
+                if not requested:
+                    continue
+                if any(state.item.source_dir == source_dir for state in self.active.values()):
+                    continue
+                self.paused_by_source[source_dir] = True
+                self.pause_after_plans_by_source[source_dir] = False
+                paused_sources.append(source_dir)
+            if paused_sources:
+                self._refresh_current_pointer_locked()
+        for source_dir in paused_sources:
+            item = self._representative_item_for_source(source_dir)
+            self._notify_event_sinks(
+                {
+                    "event": "runner_pause",
+                    "session_id": self.session_id,
+                    "plan_run_id": "",
+                    "stage": "",
+                    "status": "paused",
+                    "timestamp": time.time(),
+                    "source": str(item.source) if item is not None else "",
+                    "workdir": str(item.workdir) if item is not None else "",
+                }
+            )
+            print(f"[runner] paused source after active plans: {source_dir}", flush=True)
+        return bool(paused_sources)
+
     def _mark_pause_after_current_sources(self) -> bool:
         paused_sources: List[str] = []
         with self.lock:
@@ -1750,6 +2107,8 @@ class SessionController:
                     continue
                 if self.pause_after_current_by_source.get(candidate.source_dir, False):
                     continue
+                if getattr(self, "pause_after_plans_by_source", {}).get(candidate.source_dir, False):
+                    continue
                 if self._workdir_in_use_locked(candidate):
                     continue
                 selected_index = index
@@ -1804,6 +2163,8 @@ class SessionController:
         for execution in list(self.executions.values()):
             active = self.active.get(execution.plan_run_id)
             if active is None:
+                continue
+            if execution.plan_run_id in getattr(self, "pause_after_stage_plan_run_ids", set()):
                 continue
             if not self._can_launch_for_source(execution.item.source_dir):
                 continue
@@ -1977,6 +2338,7 @@ class SessionController:
         with self.lock:
             active_state = self.active.pop(plan_run_id, None)
             self.executions.pop(plan_run_id, None)
+            self.pause_after_stage_plan_run_ids.discard(plan_run_id)
             started_at = active_state.started_at if active_state is not None else ended_at
             if final_status == "failed":
                 self.failed = [
@@ -2062,6 +2424,7 @@ class SessionController:
             made_progress = self._collect_finished_stage_tasks() or made_progress
             made_progress = self._cancel_stopped_pending_executions() or made_progress
             made_progress = self._mark_pause_after_current_sources() or made_progress
+            made_progress = self._mark_pause_after_plan_sources() or made_progress
             while True:
                 blocked = self._mark_blocked_stages()
                 cached = self._complete_cached_ready_stages()

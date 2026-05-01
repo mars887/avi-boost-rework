@@ -10,6 +10,17 @@ CSI_RE = re.compile(r"\x1b\[([0-9;?]*)([ -/]*)([@-~])")
 OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 VISIBLE_ESC_RE = re.compile(r"(?:\\x1b|\\u001b|\\033)", re.IGNORECASE)
 ANSI_STRIP_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+WINDOWS_PROGRESS_GLYPH_TRANSLATION = str.maketrans(
+    {
+        "▁": "▏",
+        "▂": "▎",
+        "▃": "▍",
+        "▄": "▌",
+        "▅": "▋",
+        "▆": "▊",
+        "▇": "▉",
+    }
+)
 
 ANSI_HTML_COLORS = {
     30: "#000000",
@@ -68,6 +79,10 @@ def strip_ansi(text: str) -> str:
     return ANSI_STRIP_RE.sub("", decoded)
 
 
+def normalize_terminal_glyphs(text: str) -> str:
+    return str(text or "").translate(WINDOWS_PROGRESS_GLYPH_TRANSLATION)
+
+
 def has_terminal_repaint(text: str) -> bool:
     decoded = decode_visible_ansi_escapes(text)
     if "\r" in decoded:
@@ -88,7 +103,7 @@ class TerminalScreen:
         self.style = TerminalStyle()
 
     def feed(self, text: str) -> None:
-        raw = OSC_RE.sub("", decode_visible_ansi_escapes(text))
+        raw = normalize_terminal_glyphs(OSC_RE.sub("", decode_visible_ansi_escapes(text)))
         if not raw:
             return
         idx = 0

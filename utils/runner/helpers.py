@@ -86,10 +86,15 @@ def build_wrapper_vspipe_args(
     ]
 
 
-def build_queue(plan_args: List[str], cli_mode: str) -> List[QueueItem]:
+def build_queue(plan_args: List[str], cli_mode: str, mode_overrides: Dict[str, str] | None = None) -> List[QueueItem]:
     queue: List[QueueItem] = []
     seen: set[str] = set()
     visiting: set[str] = set()
+    overrides = {
+        str(Path(path).expanduser().resolve()).lower(): normalize_mode(mode)
+        for path, mode in dict(mode_overrides or {}).items()
+        if str(path or "").strip()
+    }
 
     def visit(path: Path, inherited_mode: str) -> None:
         plan_path = path.expanduser().resolve()
@@ -101,13 +106,13 @@ def build_queue(plan_args: List[str], cli_mode: str) -> List[QueueItem]:
             if key in seen:
                 return
             seen.add(key)
-            mode = normalize_mode(cli_mode or inherited_mode or plan.meta.mode or "full")
+            mode = normalize_mode(overrides.get(key) or cli_mode or inherited_mode or plan.meta.mode or "full")
             queue.append(QueueItem(resolved=resolve_file_plan(plan_path), mode=mode))
             return
 
         visiting.add(key)
         try:
-            batch_mode = normalize_mode(cli_mode or plan.meta.mode or inherited_mode)
+            batch_mode = normalize_mode(overrides.get(key) or cli_mode or plan.meta.mode or inherited_mode)
             for item in plan.items:
                 nested = Path(item.plan).expanduser()
                 if not nested.is_absolute():

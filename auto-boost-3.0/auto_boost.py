@@ -8,15 +8,12 @@ Entry-point CLI that wires the pipeline stages together.
 from __future__ import annotations
 
 import argparse
-import json
+import os
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-import os
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -50,6 +47,7 @@ from ab_scenes_io import (
     write_base_scenes_from_av1an,
     write_uniform_scenes,
 )
+from ab_runner_events import emit_runner_child_event
 from ab_ssimu2 import calculate_ssimu2
 from ab_state import (
     is_valid_base_scenes,
@@ -72,36 +70,6 @@ def vspipe_args_to_dict(items: List[str]) -> Dict[str, str]:
         if key:
             out[key] = value
     return out
-
-
-def emit_runner_child_event(stage: str, status: str, *, message: str = "", source: Path | None = None, workdir: Path | None = None) -> None:
-    events_path = os.environ.get("PBBATCH_RUNNER_CHILD_EVENTS_JSONL", "").strip()
-    if not events_path:
-        return
-    event = {
-        "event": "runner_child",
-        "session_id": os.environ.get("PBBATCH_RUNNER_SESSION_ID", ""),
-        "plan_run_id": os.environ.get("PBBATCH_RUNNER_PLAN_RUN_ID", ""),
-        "plan": "",
-        "mode": "",
-        "stage": stage,
-        "status": status,
-        "message": message,
-        "timestamp": time.time(),
-        "source": str(source or ""),
-        "workdir": str(workdir or ""),
-        "progress": -1.0,
-        "started_at": 0.0,
-        "ended_at": 0.0,
-        "elapsed_seconds": 0.0,
-    }
-    try:
-        path = Path(events_path).expanduser().resolve()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-    except Exception:
-        return
 
 
 RUN_STAGE_ALIASES = {

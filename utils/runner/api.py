@@ -41,6 +41,7 @@ class RunnerIntegration(Protocol):
 class RunnerLaunchConfig:
     plans: List[str] = field(default_factory=list)
     mode: str = ""
+    plan_modes: Dict[str, str] = field(default_factory=dict)
     events_jsonl: str = ""
     add_source_bitrate: bool = False
     exit_when_idle: bool = False
@@ -53,7 +54,7 @@ class RunnerLaunchConfig:
 class RunnerRuntime:
     def __init__(self, config: RunnerLaunchConfig) -> None:
         self.config = config
-        self.queue: List[QueueItem] = build_queue(config.plans, config.mode) if config.plans else []
+        self.queue: List[QueueItem] = build_queue(config.plans, config.mode, config.plan_modes) if config.plans else []
         self.source_dirs = sorted({item.source_dir for item in self.queue}, key=str.lower)
         self.controller = SessionController(
             items=self.queue,
@@ -94,6 +95,24 @@ class RunnerRuntime:
 
     def handle_command(self, command: str, source_dir: str = "") -> str:
         return self.controller.handle_command(command, source_dir=source_dir)
+
+    def request_pause_after_plans(self, source_dir: str = "") -> None:
+        self.controller.request_pause_after_plans(source_dir)
+
+    def request_pause_plan(self, plan_run_id: str) -> None:
+        self.controller.request_pause_plan(plan_run_id)
+
+    def request_stop_plan(self, plan_run_id: str) -> None:
+        self.controller.request_stop_plan(plan_run_id)
+
+    def retry_failed_item(self, plan: str, source: str = "") -> bool:
+        return self.controller.retry_failed_item(plan, source)
+
+    def prioritize_queued_item(self, plan: str, source: str = "") -> bool:
+        return self.controller.prioritize_queued_item(plan, source)
+
+    def remove_queued_item(self, plan: str, source: str = "") -> bool:
+        return self.controller.remove_queued_item(plan, source)
 
     def start(self) -> None:
         if self._started:

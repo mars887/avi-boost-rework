@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import tqdm
 
 from ab_metrics_core import has_vapoursynth, load_vs_clip
+from ab_runner_events import emit_runner_child_event
+
+
+def _format_eta(seconds: float) -> str:
+    if seconds < 0 or seconds == float("inf"):
+        return "unknown"
+    total = int(round(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
 
 def calculate_ssimu2(
     *,
@@ -83,6 +98,41 @@ def calculate_ssimu2(
         prop_keys = ("SSIMULACRA2", "_SSIMULACRA2")
 
     scores: List[float] = []
+    sample_step = max(1, int(skip or 1))
+    total_samples = max(1, int(result.num_frames or 0))
+    started_at = time.monotonic()
+    last_progress_at = 0.0
+
+    def emit_progress(*, force: bool = False) -> None:
+        nonlocal last_progress_at
+        if not scores:
+            return
+        now = time.monotonic()
+        if not force and now - last_progress_at < 1.0:
+            return
+        last_progress_at = now
+        samples_done = len(scores)
+        elapsed = max(0.001, now - started_at)
+        sample_rate = samples_done / elapsed
+        frame_rate = sample_rate * sample_step
+        remaining_samples = max(0, total_samples - samples_done)
+        eta_seconds = remaining_samples / sample_rate if sample_rate > 0 else float("inf")
+        emit_runner_child_event(
+            "SSIMU2 Metrics",
+            "progress",
+            source=src_file,
+            workdir=out_path.parent.parent if out_path.parent.name == "fastpass" else out_path.parent,
+            progress=max(0.0, min(100.0, samples_done * 100.0 / total_samples)),
+            details={
+                "fps": frame_rate,
+                "eta": _format_eta(eta_seconds),
+                "ssimu2": sum(scores) / samples_done,
+                "samples_done": samples_done,
+                "samples_total": total_samples,
+                "step": sample_step,
+            },
+        )
+
     with tqdm.tqdm(total=result.num_frames, desc=f"SSIMULACRA2 ({selected})") as pbar:
         for frame in result.frames():
             v = None
@@ -98,6 +148,9 @@ def calculate_ssimu2(
 
             scores.append(max(v, 0.0))
             pbar.update(1)
+            emit_progress()
+
+    emit_progress(force=True)
 
     with out_path.open("w", encoding="utf-8", newline="\n") as f:
         f.write(f"skip: {skip}\n")

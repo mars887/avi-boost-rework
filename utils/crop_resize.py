@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -316,7 +317,8 @@ def _chapter_ranges(selector: str, chapters: Sequence[Chapter], fps: Fraction, t
     exact = [chapter for chapter in chapters if _normalize_title(chapter.title) == query]
     matches = exact or [chapter for chapter in chapters if query and query in _normalize_title(chapter.title)]
     if not matches:
-        raise ValueError(f"chapter selector not found: {selector!r}")
+        print(f"[warn] Chapter selector not found: {selector!r}. Skipping.", file=sys.stderr)
+        return []
     out: List[FrameRange] = []
     for chapter in matches:
         start = max(0, min(sec_to_frame_floor(chapter.start_sec, fps), total_frames))

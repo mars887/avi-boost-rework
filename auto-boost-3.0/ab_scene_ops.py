@@ -194,7 +194,7 @@ def build_crf_adjusted_scenes_obj(
                 new_crf = float(base_crf) - float(max_neg)
 
         print(
-            f"Enc:  [{st}:{en}] | chunk_p5={per_chunk_5[i]:.4f} | "
+            f"Enc: [Scene {i}] - [{st}:{en}] | chunk_p5={per_chunk_5[i]:.4f} | "
             f"avg={avg_total:.4f} | adj={adj:+.2f} | crf={new_crf:.2f}"
         )
 
