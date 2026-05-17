@@ -118,6 +118,13 @@ class VideoExperimental:
     vpy_wrapper: bool = False
     source_loader: str = DEFAULT_SOURCE_LOADER
     crop_resize_enabled: bool = False
+    av1an_decoupled_enabled: bool = False
+    source_workers: str = "1"
+    encoder_workers: str = ""
+    raw_spool_limit: str = "4G"
+    raw_spool_dir: str = ""
+    raw_spool_min_free_ram: str = "0"
+    use_disk_cache: bool = False
 
 
 @dataclass
@@ -279,6 +286,13 @@ class ResolvedFilePlan:
             "vpyWrapper": bool_text(experimental.vpy_wrapper),
             "sourceLoader": str(experimental.source_loader or DEFAULT_SOURCE_LOADER),
             "cropResizeEnabled": bool_text(experimental.crop_resize_enabled),
+            "av1anDecoupledEnabled": bool_text(experimental.av1an_decoupled_enabled),
+            "sourceWorkers": str(experimental.source_workers or ""),
+            "encoderWorkers": str(experimental.encoder_workers or ""),
+            "rawSpoolLimit": str(experimental.raw_spool_limit or ""),
+            "rawSpoolDir": str(experimental.raw_spool_dir or ""),
+            "rawSpoolMinFreeRam": str(experimental.raw_spool_min_free_ram or ""),
+            "useDiskCache": bool_text(experimental.use_disk_cache),
         }
         if details.note:
             track_mux["note"] = details.note

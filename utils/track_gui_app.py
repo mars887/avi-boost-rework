@@ -105,6 +105,25 @@ class TrackConfigGui:
             source_loader=defaults_raw.get("sourceLoader") or defaults_raw.get("source_loader") or DEFAULT_SOURCE_LOADER,
             crop_resize_enabled=defaults_raw.get("cropResizeEnabled") if "cropResizeEnabled" in defaults_raw else defaults_raw.get("crop_resize_enabled", False),
             crop_resize_commands=defaults_raw.get("cropResizeCommands") or defaults_raw.get("crop_resize_commands") or "",
+            av1an_decoupled_enabled=(
+                defaults_raw.get("av1anDecoupledEnabled")
+                if "av1anDecoupledEnabled" in defaults_raw
+                else defaults_raw.get("av1an_decoupled_enabled", False)
+            ),
+            source_workers=defaults_raw.get("sourceWorkers") or defaults_raw.get("source_workers") or "1",
+            encoder_workers=defaults_raw.get("encoderWorkers") or defaults_raw.get("encoder_workers") or "",
+            raw_spool_limit=defaults_raw.get("rawSpoolLimit") or defaults_raw.get("raw_spool_limit") or "4G",
+            raw_spool_dir=defaults_raw.get("rawSpoolDir") or defaults_raw.get("raw_spool_dir") or "",
+            raw_spool_min_free_ram=(
+                defaults_raw.get("rawSpoolMinFreeRam")
+                or defaults_raw.get("raw_spool_min_free_ram")
+                or "0"
+            ),
+            use_disk_cache=(
+                defaults_raw.get("useDiskCache")
+                if "useDiskCache" in defaults_raw
+                else defaults_raw.get("use_disk_cache", False)
+            ),
             attach_encode_info=defaults_raw["attachEncodeInfo"] if "attachEncodeInfo" in defaults_raw else defaults_raw.get("attach_encode_info", False),
             note=defaults_raw.get("note") or "",
         )
@@ -655,8 +674,8 @@ class TrackConfigGui:
         else:
             self._build_labeled_combo(core_section, row, 1, "Encoder", self.encoder_var, VIDEO_ENCODER_OPTIONS, width=24)
             row += 1
-        self._build_labeled_entry(core_section, row, 0, "Fast-pass workers", self.fastpass_workers_var, numeric="int")
-        self._build_labeled_entry(core_section, row, 1, "Main-pass workers", self.mainpass_workers_var, numeric="int")
+        self.fastpass_workers_entry = self._build_labeled_entry(core_section, row, 0, "Fast-pass workers", self.fastpass_workers_var, numeric="int")
+        self.mainpass_workers_entry = self._build_labeled_entry(core_section, row, 1, "Main-pass workers", self.mainpass_workers_var, numeric="int")
 
         feature_section, row = self._build_section(
             grid,
@@ -765,6 +784,13 @@ class TrackConfigGui:
         self.vpy_wrapper_var = tk.BooleanVar(value=bool(self.defaults.vpy_wrapper))
         self.source_loader_var = tk.StringVar(value=self.defaults.source_loader or DEFAULT_SOURCE_LOADER)
         self.crop_resize_enabled_var = tk.BooleanVar(value=bool(self.defaults.crop_resize_enabled))
+        self.av1an_decoupled_enabled_var = tk.BooleanVar(value=bool(self.defaults.av1an_decoupled_enabled))
+        self.source_workers_var = tk.StringVar(value=self.defaults.source_workers)
+        self.encoder_workers_var = tk.StringVar(value=self.defaults.encoder_workers)
+        self.raw_spool_limit_var = tk.StringVar(value=self.defaults.raw_spool_limit)
+        self.raw_spool_dir_var = tk.StringVar(value=self.defaults.raw_spool_dir)
+        self.raw_spool_min_free_ram_var = tk.StringVar(value=self.defaults.raw_spool_min_free_ram)
+        self.use_disk_cache_var = tk.BooleanVar(value=bool(self.defaults.use_disk_cache))
 
         global_section, row = self._build_section(grid, title="Global", columns=2)
         global_section.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
@@ -781,8 +807,23 @@ class TrackConfigGui:
             width=20,
         )
 
+        decoupled_section, row = self._build_section(grid, title="Av1an Decoupled Mode", columns=3)
+        decoupled_section.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        self.av1an_decoupled_check = ttk.Checkbutton(decoupled_section, text="Enable", variable=self.av1an_decoupled_enabled_var)
+        self.av1an_decoupled_check.grid(row=row, column=0, columnspan=6, sticky=tk.W, pady=(0, 8))
+        row += 1
+        self.source_workers_entry = self._build_labeled_entry(decoupled_section, row, 0, "Source workers", self.source_workers_var, numeric="int")
+        ttk.Label(decoupled_section, text="Use disk cache", style="SectionLabel.TLabel").grid(row=row, column=2, sticky=tk.W, padx=(0, 8), pady=6)
+        self.use_disk_cache_check = ttk.Checkbutton(decoupled_section, text="Enabled", variable=self.use_disk_cache_var)
+        self.use_disk_cache_check.grid(row=row, column=3, sticky=tk.W, pady=6)
+        self.raw_spool_limit_entry = self._build_labeled_entry(decoupled_section, row, 2, "Raw spool limit", self.raw_spool_limit_var)
+        row += 1
+        self.encoder_workers_entry = self._build_labeled_entry(decoupled_section, row, 0, "Encoder workers", self.encoder_workers_var, numeric="int")
+        self.raw_spool_dir_entry = self._build_labeled_entry(decoupled_section, row, 1, "Raw spool dir", self.raw_spool_dir_var)
+        self.raw_spool_min_free_ram_entry = self._build_labeled_entry(decoupled_section, row, 2, "Min free RAM", self.raw_spool_min_free_ram_var)
+
         crop_section, row = self._build_section(grid, title="Dynamic crop/resize", columns=1)
-        crop_section.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
+        crop_section.grid(row=2, column=0, sticky="nsew", padx=6, pady=6)
         crop_section.columnconfigure(0, weight=1)
         ttk.Checkbutton(crop_section, text="Enable crop/resize", variable=self.crop_resize_enabled_var).grid(
             row=row, column=0, sticky=tk.W, pady=(0, 8)
@@ -797,6 +838,14 @@ class TrackConfigGui:
         self.vpy_wrapper_var.trace_add("write", self.on_experimental_change)
         self.source_loader_var.trace_add("write", self.on_defaults_change)
         self.crop_resize_enabled_var.trace_add("write", self.on_crop_resize_enabled_change)
+        self.av1an_decoupled_enabled_var.trace_add("write", self.on_av1an_decoupled_change)
+        self.source_workers_var.trace_add("write", self.on_defaults_change)
+        self.encoder_workers_var.trace_add("write", self.on_defaults_change)
+        self.raw_spool_limit_var.trace_add("write", self.on_defaults_change)
+        self.raw_spool_dir_var.trace_add("write", self.on_defaults_change)
+        self.raw_spool_min_free_ram_var.trace_add("write", self.on_defaults_change)
+        self.use_disk_cache_var.trace_add("write", self.on_defaults_change)
+        self._refresh_av1an_decoupled_state()
         self._refresh_crop_resize_state()
 
     def _build_tracks_tab(self, frame):
@@ -1109,6 +1158,13 @@ class TrackConfigGui:
             source_loader=self._get_var_value("source_loader_var") or DEFAULT_SOURCE_LOADER,
             crop_resize_enabled=bool(getattr(self, "crop_resize_enabled_var", tk.BooleanVar(value=False)).get()),
             crop_resize_commands=crop_resize_value,
+            av1an_decoupled_enabled=bool(getattr(self, "av1an_decoupled_enabled_var", tk.BooleanVar(value=False)).get()),
+            source_workers=self._get_var_value("source_workers_var") or "1",
+            encoder_workers=self._get_var_value("encoder_workers_var"),
+            raw_spool_limit=self._get_var_value("raw_spool_limit_var") or "4G",
+            raw_spool_dir=self._get_var_value("raw_spool_dir_var"),
+            raw_spool_min_free_ram=self._get_var_value("raw_spool_min_free_ram_var") or "0",
+            use_disk_cache=bool(getattr(self, "use_disk_cache_var", tk.BooleanVar(value=False)).get()),
             attach_encode_info=bool(getattr(self, "attach_encode_info_var", tk.BooleanVar(value=False)).get()),
             note=self._get_var_value("note_var"),
         )
@@ -1134,6 +1190,24 @@ class TrackConfigGui:
         if not entry:
             return
         entry.configure(state="normal" if enabled else "disabled")
+
+    def _set_widget_state(self, widget, enabled, *, readonly=False):
+        if not widget:
+            return
+        widget.configure(state=("readonly" if readonly and enabled else "normal" if enabled else "disabled"))
+
+    def _refresh_av1an_decoupled_state(self):
+        enabled = bool(getattr(self, "av1an_decoupled_enabled_var", tk.BooleanVar(value=False)).get())
+        for widget_name in (
+            "source_workers_entry",
+            "encoder_workers_entry",
+            "raw_spool_limit_entry",
+            "raw_spool_dir_entry",
+            "raw_spool_min_free_ram_entry",
+            "use_disk_cache_check",
+        ):
+            self._set_widget_state(getattr(self, widget_name, None), enabled)
+        self._set_widget_state(getattr(self, "mainpass_workers_entry", None), not enabled)
 
     def _refresh_field_states(self):
         if getattr(self, "_state_refreshing", False):
@@ -1332,6 +1406,10 @@ class TrackConfigGui:
     def on_defaults_change(self, *_args):
         self.defaults = self._current_defaults()
         self._refresh_results()
+
+    def on_av1an_decoupled_change(self, *_args):
+        self._refresh_av1an_decoupled_state()
+        self.on_defaults_change()
 
     def _refresh_crop_resize_state(self):
         enabled = bool(getattr(self, "crop_resize_enabled_var", tk.BooleanVar(value=False)).get())
@@ -1546,6 +1624,13 @@ class TrackConfigGui:
             "vpy_wrapper": self.defaults.vpy_wrapper,
             "source_loader": self.defaults.source_loader,
             "crop_resize_enabled": self.defaults.crop_resize_enabled,
+            "av1an_decoupled_enabled": self.defaults.av1an_decoupled_enabled,
+            "source_workers": self.defaults.source_workers,
+            "encoder_workers": self.defaults.encoder_workers,
+            "raw_spool_limit": self.defaults.raw_spool_limit,
+            "raw_spool_dir": self.defaults.raw_spool_dir,
+            "raw_spool_min_free_ram": self.defaults.raw_spool_min_free_ram,
+            "use_disk_cache": self.defaults.use_disk_cache,
             "attach_encode_info": self.defaults.attach_encode_info,
             "note": self.defaults.note,
         }

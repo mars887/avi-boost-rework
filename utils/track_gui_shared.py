@@ -142,6 +142,13 @@ class DefaultSettings:
         source_loader=DEFAULT_SOURCE_LOADER,
         crop_resize_enabled=False,
         crop_resize_commands="",
+        av1an_decoupled_enabled=False,
+        source_workers="1",
+        encoder_workers="",
+        raw_spool_limit="4G",
+        raw_spool_dir="",
+        raw_spool_min_free_ram="0",
+        use_disk_cache=False,
         attach_encode_info=False,
         note="",
     ):
@@ -189,6 +196,13 @@ class DefaultSettings:
         if self.crop_resize_enabled:
             self.vpy_wrapper = True
         self.crop_resize_commands = crop_resize_commands or ""
+        self.av1an_decoupled_enabled = parse_bool_value(av1an_decoupled_enabled, default=False)
+        self.source_workers = str(source_workers or "1").strip()
+        self.encoder_workers = str(encoder_workers or self.mainpass_workers or self.workers or "").strip()
+        self.raw_spool_limit = str(raw_spool_limit or "4G").strip()
+        self.raw_spool_dir = str(raw_spool_dir or "").strip()
+        self.raw_spool_min_free_ram = str(raw_spool_min_free_ram or "0").strip()
+        self.use_disk_cache = parse_bool_value(use_disk_cache, default=False)
         self.attach_encode_info = parse_bool_value(attach_encode_info, default=False)
         self.note = note or ""
 
@@ -449,6 +463,13 @@ def build_results(files, tracks_by_file, settings, defaults):
     default_vpy_wrapper = defaults.vpy_wrapper
     default_source_loader = defaults.source_loader
     default_crop_resize_enabled = defaults.crop_resize_enabled
+    default_av1an_decoupled_enabled = defaults.av1an_decoupled_enabled
+    default_source_workers = defaults.source_workers
+    default_encoder_workers = defaults.encoder_workers
+    default_raw_spool_limit = defaults.raw_spool_limit
+    default_raw_spool_dir = defaults.raw_spool_dir
+    default_raw_spool_min_free_ram = defaults.raw_spool_min_free_ram
+    default_use_disk_cache = defaults.use_disk_cache
     default_attach_encode_info = defaults.attach_encode_info
     default_note = defaults.note
 
@@ -605,6 +626,13 @@ def build_results(files, tracks_by_file, settings, defaults):
                 track_mux["vpyWrapper"] = "true" if default_vpy_wrapper else "false"
                 track_mux["sourceLoader"] = default_source_loader
                 track_mux["cropResizeEnabled"] = "true" if default_crop_resize_enabled else "false"
+                track_mux["av1anDecoupledEnabled"] = "true" if default_av1an_decoupled_enabled else "false"
+                track_mux["sourceWorkers"] = default_source_workers
+                track_mux["encoderWorkers"] = default_encoder_workers
+                track_mux["rawSpoolLimit"] = default_raw_spool_limit
+                track_mux["rawSpoolDir"] = default_raw_spool_dir
+                track_mux["rawSpoolMinFreeRam"] = default_raw_spool_min_free_ram
+                track_mux["useDiskCache"] = "true" if default_use_disk_cache else "false"
                 track_mux["attachEncodeInfo"] = "true" if default_attach_encode_info else "false"
                 if default_note:
                     track_mux["note"] = default_note
@@ -696,6 +724,13 @@ def build_default_defaults_dict():
         "source_loader": DEFAULT_SOURCE_LOADER,
         "crop_resize_enabled": False,
         "crop_resize_commands": "",
+        "av1an_decoupled_enabled": False,
+        "source_workers": "1",
+        "encoder_workers": "",
+        "raw_spool_limit": "4G",
+        "raw_spool_dir": "",
+        "raw_spool_min_free_ram": "0",
+        "use_disk_cache": False,
         "attach_encode_info": False,
         "note": "",
     }

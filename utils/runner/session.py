@@ -1879,8 +1879,6 @@ class SessionController:
                     str(workdir / "video" / "video-final.mkv"),
                     "--scenes",
                     str(workdir / "video" / "scenes-final.json"),
-                    "--workers",
-                    str(int(primary.mainpass_workers)),
                     "--temp",
                     str(workdir / "video" / "mainpass"),
                     "-n",
@@ -1902,6 +1900,25 @@ class SessionController:
                     "--no-defaults",
                     "-a=-an -sn",
                 ]
+                decoupled_enabled = bool(experimental.av1an_decoupled_enabled and self.av1an_fork_enabled)
+                if decoupled_enabled:
+                    source_workers = _optional_arg_text(experimental.source_workers) or "1"
+                    encoder_workers = _optional_arg_text(experimental.encoder_workers)
+                    raw_spool_limit = _optional_arg_text(experimental.raw_spool_limit)
+                    raw_spool_dir = _optional_arg_text(experimental.raw_spool_dir)
+                    raw_spool_min_free_ram = _optional_arg_text(experimental.raw_spool_min_free_ram)
+                    mainpass_cmd.extend(["--source-workers", source_workers])
+                    if encoder_workers:
+                        mainpass_cmd.extend(["--encoder-workers", encoder_workers])
+                    if raw_spool_limit:
+                        mainpass_cmd.extend(["--raw-spool-limit", raw_spool_limit])
+                    if raw_spool_dir:
+                        mainpass_cmd.extend(["--raw-spool-dir", resolve_optional_path(raw_spool_dir, paths.plan_path)])
+                    if raw_spool_min_free_ram:
+                        mainpass_cmd.extend(["--raw-spool-min-free-ram", raw_spool_min_free_ram])
+                    mainpass_cmd.extend(["--use-disk-cache", "true" if experimental.use_disk_cache else "false"])
+                else:
+                    mainpass_cmd.extend(["--workers", str(int(primary.mainpass_workers))])
                 if self.av1an_progress_jsonl_enabled:
                     mainpass_cmd.extend(["--progress-jsonl", str(log_dir / "06_av1an_mainpass.progress.jsonl")])
                 if self.av1an_fork_enabled:

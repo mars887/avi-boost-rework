@@ -77,6 +77,13 @@ def gui_defaults_from_file_plan(plan: FilePlan) -> Dict[str, Any]:
         "vpy_wrapper": experimental.vpy_wrapper,
         "source_loader": experimental.source_loader,
         "crop_resize_enabled": experimental.crop_resize_enabled,
+        "av1an_decoupled_enabled": experimental.av1an_decoupled_enabled,
+        "source_workers": str(experimental.source_workers or ""),
+        "encoder_workers": str(experimental.encoder_workers or ""),
+        "raw_spool_limit": str(experimental.raw_spool_limit or ""),
+        "raw_spool_dir": str(experimental.raw_spool_dir or ""),
+        "raw_spool_min_free_ram": str(experimental.raw_spool_min_free_ram or ""),
+        "use_disk_cache": experimental.use_disk_cache,
         "note": details.note,
     }
 
@@ -203,6 +210,13 @@ def file_plan_from_gui_result(
         vpy_wrapper=parse_bool_value(defaults.get("vpy_wrapper"), False),
         source_loader=normalize_source_loader(defaults.get("source_loader") or DEFAULT_SOURCE_LOADER),
         crop_resize_enabled=parse_bool_value(defaults.get("crop_resize_enabled"), False),
+        av1an_decoupled_enabled=parse_bool_value(defaults.get("av1an_decoupled_enabled"), False),
+        source_workers=str(defaults.get("source_workers") or "1"),
+        encoder_workers=str(defaults.get("encoder_workers") or ""),
+        raw_spool_limit=str(defaults.get("raw_spool_limit") or "4G"),
+        raw_spool_dir=str(defaults.get("raw_spool_dir") or ""),
+        raw_spool_min_free_ram=str(defaults.get("raw_spool_min_free_ram") or "0"),
+        use_disk_cache=parse_bool_value(defaults.get("use_disk_cache"), False),
     )
 
     video_config = dict(video_result.get("videoConfig") or {})

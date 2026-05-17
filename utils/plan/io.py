@@ -181,6 +181,15 @@ def _toml_optional_scalar(value: Any) -> str:
     return _toml_scalar(value)
 
 
+def _toml_optional_coerced_scalar(value: Any) -> str:
+    if value is None:
+        return _toml_string("")
+    text = str(value).strip()
+    if not text:
+        return _toml_string("")
+    return _toml_scalar(coerce_scalar(text))
+
+
 def _convert_param_line_to_toml(raw_line: str) -> str:
     indent = raw_line[: len(raw_line) - len(raw_line.lstrip())]
     stripped = raw_line.strip()
@@ -383,6 +392,12 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
     video_mainpass_params = dict(video_mainpass_section.get("params") or {})
     mux_data = dict(data.get("mux") or {})
 
+    def experimental_value(*keys: str, default: Any = "") -> Any:
+        for key in keys:
+            if key in video_experimental_data:
+                return video_experimental_data.get(key)
+        return default
+
     format_version = int(meta_data.get("format_version") or data.get("format_version") or PLAN_FORMAT_VERSION)
     plan_type = str(meta_data.get("plan_type") or data.get("plan_type") or FILE_PLAN_TYPE)
 
@@ -461,6 +476,16 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
                 vpy_wrapper=parse_bool_value(video_experimental_data.get("vpy_wrapper"), False),
                 source_loader=normalize_source_loader(video_experimental_data.get("source_loader") or DEFAULT_SOURCE_LOADER),
                 crop_resize_enabled=parse_bool_value(video_experimental_data.get("crop_resize_enabled"), False),
+                av1an_decoupled_enabled=parse_bool_value(
+                    experimental_value("av1an_decoupled_enabled", "decoupled_enabled"),
+                    False,
+                ),
+                source_workers=str(experimental_value("source_workers", "decoupled_source_workers", default="1") or ""),
+                encoder_workers=str(experimental_value("encoder_workers", "decoupled_encoder_workers", default="") or ""),
+                raw_spool_limit=str(experimental_value("raw_spool_limit", "raw_spool_lim", default="4G") or ""),
+                raw_spool_dir=str(experimental_value("raw_spool_dir", default="") or ""),
+                raw_spool_min_free_ram=str(experimental_value("raw_spool_min_free_ram", default="0") or ""),
+                use_disk_cache=parse_bool_value(experimental_value("use_disk_cache"), False),
             ),
             fastpass_params=(
                 {
@@ -612,6 +637,13 @@ def _dump_file_plan(plan: FilePlan) -> str:
             f"vpy_wrapper = {_toml_scalar(plan.video.experimental.vpy_wrapper)}",
             f"source_loader = {_toml_string(normalize_source_loader(plan.video.experimental.source_loader))}",
             f"crop_resize_enabled = {_toml_scalar(plan.video.experimental.crop_resize_enabled)}",
+            f"av1an_decoupled_enabled = {_toml_scalar(plan.video.experimental.av1an_decoupled_enabled)}",
+            f"source_workers = {_toml_optional_coerced_scalar(plan.video.experimental.source_workers)}",
+            f"encoder_workers = {_toml_optional_coerced_scalar(plan.video.experimental.encoder_workers)}",
+            f"raw_spool_limit = {_toml_optional_coerced_scalar(plan.video.experimental.raw_spool_limit)}",
+            f"raw_spool_dir = {_toml_string(plan.video.experimental.raw_spool_dir)}",
+            f"raw_spool_min_free_ram = {_toml_optional_coerced_scalar(plan.video.experimental.raw_spool_min_free_ram)}",
+            f"use_disk_cache = {_toml_scalar(plan.video.experimental.use_disk_cache)}",
             "",
             "[mux]",
             f"attach_encode_info = {_toml_scalar(plan.video.primary.attach_encode_info)}",
