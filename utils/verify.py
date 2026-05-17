@@ -9,126 +9,36 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, TextIO, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.media_helpers import normalize_track_type as norm_type
+from utils.pipeline_runtime import read_json as read_json_file, setup_stage_logging
+from utils.plan_model import resolve_file_plan
 
 
 MIN_BYTES_SUB = 0          # subtitles can be tiny
 MIN_BYTES_ATTACHMENT = 16
 MIN_BYTES_AUDIO = 1024
 MIN_BYTES_VIDEO = 1024 * 256  # 256 KiB; adjust if you want stricter
-STATE_DIR_NAME = ".state"
-VERIFY_MARKER = "VERIFY_DONE"
-
+DURATION_TOLERANCE_MS = 5000
 
 def eprint(*a: Any) -> None:
     print(*a, file=sys.stderr)
 
 
-class TeeStream:
-    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
-        self._stream = stream
-        self._log: Optional[TextIO] = log_file
-
-    def write(self, s: str) -> int:
-        try:
-            self._stream.write(s)
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.write(s)
-                self._log.flush()
-            except Exception:
-                self._log = None
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.flush()
-            except Exception:
-                self._log = None
-
-    def close_log(self) -> None:
-        if self._log is None:
-            return
-        try:
-            self._log.flush()
-        except Exception:
-            pass
-        try:
-            self._log.close()
-        except Exception:
-            pass
-        self._log = None
-
-    def isatty(self) -> bool:
-        return bool(getattr(self._stream, "isatty", lambda: False)())
-
-    @property
-    def encoding(self) -> str:
-        return getattr(self._stream, "encoding", "utf-8")
-
-
 def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
-    if not log_path:
-        return
-    p = Path(log_path)
-    if not p.is_absolute() and workdir is not None:
-        p = workdir / p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    log_fh = p.open("a", encoding=enc, errors="replace")
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        log_fh.write(f"=== START verify {ts} ===\n")
-        log_fh.flush()
-    except Exception:
-        pass
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    tee_out = TeeStream(orig_stdout, log_fh)
-    tee_err = TeeStream(orig_stderr, log_fh)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-
-    def _cleanup() -> None:
-        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            log_fh.write(f"=== END verify {ts_end} ===\n")
-            log_fh.flush()
-        except Exception:
-            pass
-        sys.stdout = orig_stdout
-        sys.stderr = orig_stderr
-        tee_out.close_log()
-        tee_err.close_log()
-
-    atexit.register(_cleanup)
-
-
-def marker_path(workdir: Path) -> Path:
-    return workdir / STATE_DIR_NAME / VERIFY_MARKER
-
-
-def write_marker(workdir: Path) -> None:
-    p = marker_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
+    setup_stage_logging(log_path, stage_name="verify", base_dir=workdir)
 
 
 def sanitize_error_id(s: str) -> str:
@@ -150,7 +60,7 @@ def resolve_rel_to_workdir(workdir: Path, p: str) -> Path:
 
 
 def read_json(p: Path) -> Any:
-    return json.loads(p.read_text(encoding="utf-8"))
+    return read_json_file(p)
 
 
 def which_or(path_or_name: str) -> Optional[str]:
@@ -257,6 +167,60 @@ def ffprobe_duration_ms(js: Dict[str, Any]) -> int:
         return 0
 
 
+def parse_int_ms(value: Any) -> int:
+    try:
+        if value in (None, "", "N/A"):
+            return 0
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return 0
+
+
+def resolve_source_audio_duration_ms(
+    workdir: Path,
+    track: Dict[str, Any],
+    output_entry: Dict[str, Any],
+    ffprobe: Optional[str],
+) -> Tuple[int, Optional[Path], str]:
+    manifest_duration_ms = parse_int_ms(output_entry.get("source_duration_ms"))
+    if manifest_duration_ms > 0:
+        return manifest_duration_ms, None, "manifest"
+
+    if not ffprobe:
+        return 0, None, ""
+
+    file_base = str(track.get("fileBase") or "").strip()
+    if not file_base:
+        return 0, None, ""
+
+    src_path = workdir / "audio" / "tmp" / f"{file_base}.src.mka"
+    if not src_path.exists():
+        return 0, None, ""
+
+    js = run_ffprobe_json(ffprobe, src_path)
+    if not ffprobe_has_stream(js, "audio"):
+        raise RuntimeError(f"audio_source_tmp_no_audio_stream_track_{int(track.get('trackId') or 0)}")
+    return ffprobe_duration_ms(js), src_path, "tmp_src_mka"
+
+
+def duration_matches_reference(
+    output_duration_ms: int,
+    reference_duration_ms: int,
+    mux_delay_ms: int,
+    tolerance_ms: int,
+) -> bool:
+    if output_duration_ms <= 0 or reference_duration_ms <= 0:
+        return True
+
+    candidates = [output_duration_ms]
+    if mux_delay_ms != 0:
+        candidates.append(output_duration_ms + mux_delay_ms)
+    return min(abs(candidate - reference_duration_ms) for candidate in candidates) <= tolerance_ms
+
+
 def source_has_chapters(source: Path, ffprobe: Optional[str]) -> Optional[bool]:
     if not ffprobe:
         return None
@@ -297,37 +261,17 @@ def check_file_exists(p: Path, min_bytes: int, err_id: str) -> None:
         raise RuntimeError(err_id)
 
 
-def parse_tracks(tracks_json: Dict[str, Any]) -> List[Dict[str, Any]]:
-    tracks = tracks_json.get("tracks")
-    if not isinstance(tracks, list):
-        raise RuntimeError("invalid_tracksjson_no_tracks")
-    out: List[Dict[str, Any]] = []
-    for t in tracks:
-        if isinstance(t, dict):
-            out.append(t)
-    return out
-
-
-def norm_type(t: str) -> str:
-    v = (t or "").strip().lower()
-    if v.startswith("sub") or v == "subtitle":
-        return "sub"
-    if v.startswith("aud") or v == "audio":
-        return "audio"
-    if v.startswith("vid") or v == "video":
-        return "video"
-    return v
-
-
 def is_skip(status: str) -> bool:
     return (status or "").strip().upper() == "SKIP"
 
 
 def verify_video(workdir: Path, tracks: List[Dict[str, Any]], ffprobe: Optional[str]) -> Tuple[Optional[Path], int]:
-    # If any video track is not SKIP -> expect video-final.mkv
-    need_video = any(norm_type(str(t.get("type") or "")) == "video" and not is_skip(str(t.get("trackStatus") or "")) for t in tracks)
-    if not need_video:
-        print("[verify] video: no active video tracks => skip video-final check")
+    need_video_final = any(
+        norm_type(str(t.get("type") or "")) == "video" and str(t.get("trackStatus") or "").strip().upper() == "EDIT"
+        for t in tracks
+    )
+    if not need_video_final:
+        print("[verify] video: no EDIT video tracks => skip video-final check")
         return None, 0
 
     vpath = workdir / "video" / "video-final.mkv"
@@ -410,6 +354,26 @@ def verify_audio(workdir: Path, tracks: List[Dict[str, Any]], ffprobe: Optional[
                 dms = ffprobe_duration_ms(js)
                 if dms <= 0:
                     raise RuntimeError(f"audio_bad_duration_track_{tid}")
+
+                manifest_dms = parse_int_ms(o.get("duration_ms"))
+                if manifest_dms > 0 and abs(dms - manifest_dms) > DURATION_TOLERANCE_MS:
+                    raise RuntimeError(f"audio_duration_mismatch_manifest_track_{tid}")
+
+                mux_delay_ms = parse_int_ms(o.get("mux_delay_ms"))
+                source_dms, source_ref_path, source_ref_kind = resolve_source_audio_duration_ms(workdir, t, o, ffprobe)
+                if source_dms > 0:
+                    if not duration_matches_reference(dms, source_dms, mux_delay_ms, DURATION_TOLERANCE_MS):
+                        raise RuntimeError(f"audio_duration_mismatch_source_track_{tid}")
+                    raw_delta = abs(dms - source_dms)
+                    muxed_delta = abs((dms + mux_delay_ms) - source_dms)
+                    matched_as = "muxed" if mux_delay_ms != 0 and muxed_delta < raw_delta else "raw"
+                    ref_note = source_ref_kind
+                    if source_ref_path is not None:
+                        ref_note = f"{source_ref_kind}:{source_ref_path.name}"
+                    print(
+                        f"[verify] audio: trackId={tid} duration ok "
+                        f"out={dms}ms muxed={dms + mux_delay_ms}ms source={source_dms}ms ref={ref_note} match={matched_as}"
+                    )
             results.append((p, dms))
 
     return results
@@ -489,39 +453,19 @@ def verify_demux_outputs(workdir: Path, source: Path, ffprobe: Optional[str]) ->
             raise RuntimeError("chapters_missing_or_too_small")
 
 
-def verify_duration_consistency(
-    video_dms: int,
-    audio_list: List[Tuple[Path, int]],
-    tolerance_ms: int = 5000,
-) -> None:
-    if video_dms <= 0:
-        return
-    audio_durations = [d for (_, d) in audio_list if d > 0]
-    if not audio_durations:
-        return
-    amin, amax = min(audio_durations), max(audio_durations)
-    # compare against video
-    if abs(video_dms - amin) > tolerance_ms or abs(video_dms - amax) > tolerance_ms:
-        raise RuntimeError("duration_mismatch_audio_vs_video")
-
-
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog="verify")
-    ap.add_argument("--source", required=True)
-    ap.add_argument("--workdir", required=True)
-    ap.add_argument("--tracksData", required=True, help="Relative is relative to --workdir")
+    ap.add_argument("--plan", required=True)
     ap.add_argument("--ffprobe", default="ffprobe", help="Optional; used if available")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
     args = ap.parse_args(argv)
 
-    source = Path(args.source)
-    workdir = Path(args.workdir)
+    resolved_plan = resolve_file_plan(Path(args.plan))
+    source = resolved_plan.paths.source
+    workdir = resolved_plan.paths.workdir
+    tracks = resolved_plan.runtime_tracks()
+
     setup_logging(args.log, workdir)
-    tracks_path = resolve_rel_to_workdir(workdir, args.tracksData)
-    marker = marker_path(workdir)
-    if marker.exists():
-        print(f"[verify] skip: marker exists: {marker}")
-        return 0
 
     try:
         if not source.exists():
@@ -536,10 +480,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             write_verify_error(workdir, "missing_workdir")
             eprint("[verify] ERROR: workdir missing")
             return 2
-        if not tracks_path.exists():
-            write_verify_error(workdir, "missing_tracksjson")
-            eprint(f"[verify] ERROR: tracks.json missing: {tracks_path}")
-            return 2
 
         ffprobe = which_or(args.ffprobe)
         if ffprobe:
@@ -547,21 +487,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             print("[verify] ffprobe: not found => media-structure checks will be skipped")
 
-        tracks_json = read_json(tracks_path)
-        tracks = parse_tracks(tracks_json)
-
         # 1) demux artifacts if manifest exists
         verify_demux_outputs(workdir, source, ffprobe)
 
         # 2) video
-        vpath, v_dms = verify_video(workdir, tracks, ffprobe)
+        verify_video(workdir, tracks, ffprobe)
 
         # 3) audio
-        audio_list = verify_audio(workdir, tracks, ffprobe)
-
-        # 4) optional duration consistency
-        if ffprobe and v_dms > 0 and audio_list:
-            verify_duration_consistency(v_dms, audio_list, tolerance_ms=5000)
+        verify_audio(workdir, tracks, ffprobe)
 
         # If we got here => OK
         # Clean previous verify_error.txt if present (optional)
@@ -573,7 +506,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             pass
 
         print("[verify] OK")
-        write_marker(workdir)
         return 0
 
     except Exception as ex:

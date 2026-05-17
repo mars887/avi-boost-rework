@@ -2,128 +2,39 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import atexit
 import json
 import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-WIN_BAD = r'<>:"/\|?*'
-WIN_BAD_RE = re.compile(rf"[{re.escape(WIN_BAD)}]")
-STATE_DIR_NAME = ".state"
-DEMUX_MARKER = "DEMUX_DONE"
+from utils.media_helpers import (
+    find_track_info,
+    normalize_track_type as normalize_type,
+    sanitize_component,
+    subtitle_extension_from_codec as sub_ext_from_codec,
+)
+from utils.pipeline_runtime import setup_stage_logging, write_json as write_json_file
+from utils.plan_model import resolve_file_plan
 
 
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
 
 
-class TeeStream:
-    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
-        self._stream = stream
-        self._log: Optional[TextIO] = log_file
-
-    def write(self, s: str) -> int:
-        try:
-            self._stream.write(s)
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.write(s)
-                self._log.flush()
-            except Exception:
-                self._log = None
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.flush()
-            except Exception:
-                self._log = None
-
-    def close_log(self) -> None:
-        if self._log is None:
-            return
-        try:
-            self._log.flush()
-        except Exception:
-            pass
-        try:
-            self._log.close()
-        except Exception:
-            pass
-        self._log = None
-
-    def isatty(self) -> bool:
-        return bool(getattr(self._stream, "isatty", lambda: False)())
-
-    @property
-    def encoding(self) -> str:
-        return getattr(self._stream, "encoding", "utf-8")
-
-
 def setup_logging(log_path: Optional[str], workdir: Optional[Path] = None) -> None:
-    if not log_path:
-        return
-    p = Path(log_path)
-    if not p.is_absolute() and workdir is not None:
-        p = workdir / p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    log_fh = p.open("a", encoding=enc, errors="replace")
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        log_fh.write(f"=== START demux {ts} ===\n")
-        log_fh.flush()
-    except Exception:
-        pass
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    tee_out = TeeStream(orig_stdout, log_fh)
-    tee_err = TeeStream(orig_stderr, log_fh)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-
-    def _cleanup() -> None:
-        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            log_fh.write(f"=== END demux {ts_end} ===\n")
-            log_fh.flush()
-        except Exception:
-            pass
-        sys.stdout = orig_stdout
-        sys.stderr = orig_stderr
-        tee_out.close_log()
-        tee_err.close_log()
-
-    atexit.register(_cleanup)
+    setup_stage_logging(log_path or "", stage_name="demux", base_dir=workdir)
 
 
 def ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
-
-
-def marker_path(workdir: Path) -> Path:
-    return workdir / STATE_DIR_NAME / DEMUX_MARKER
-
-
-def write_marker(workdir: Path) -> None:
-    p = marker_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
 
 
 def which_or(name: str, fallback: str) -> str:
@@ -131,17 +42,7 @@ def which_or(name: str, fallback: str) -> str:
 
 
 def safe_filename(name: str, max_len: int = 180) -> str:
-    name = (name or "").strip()
-    if not name:
-        return "unnamed"
-    name = WIN_BAD_RE.sub("_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    name = name.rstrip(". ")
-    if not name:
-        name = "unnamed"
-    if len(name) > max_len:
-        name = name[:max_len].rstrip(". ")
-    return name
+    return sanitize_component(name, default="unnamed", max_len=max_len)
 
 
 PROGRESS_RE = re.compile(r"^(progress|processed)\s*[:\-]?\s*\d+%\s*$", re.IGNORECASE)
@@ -203,20 +104,8 @@ def run_cmd(cmd: List[str]) -> None:
         raise RuntimeError(f"Command failed with code {rc}")
 
 
-def load_json(p: Path) -> Any:
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def write_json(p: Path, obj: Any) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-
-
-def resolve_tracks_path(workdir: Path, tracks_data_arg: str) -> Path:
-    td = Path(tracks_data_arg)
-    return td if td.is_absolute() else (workdir / td)
+    write_json_file(p, obj)
 
 
 @dataclass
@@ -225,17 +114,6 @@ class TrackEntry:
     type: str
     trackStatus: str
     fileBase: str
-
-
-def normalize_type(raw: str) -> str:
-    v = (raw or "").strip().lower()
-    if v.startswith("sub") or v == "subtitle":
-        return "sub"
-    if v.startswith("aud") or v == "audio":
-        return "audio"
-    if v.startswith("vid") or v == "video":
-        return "video"
-    return v
 
 
 def is_skip(status: str) -> bool:
@@ -262,37 +140,7 @@ def get_mkvmerge_json(mkvmerge: str, source: Path) -> Dict[str, Any]:
         raise RuntimeError(f"Failed to parse mkvmerge JSON: {ex}\nOutput:\n{p.stdout}")
 
 
-def find_track_info(mkvj: Dict[str, Any], track_id: int) -> Optional[Dict[str, Any]]:
-    for t in mkvj.get("tracks", []) or []:
-        if int(t.get("id", -1)) == int(track_id):
-            return t
-    return None
-
-
-def sub_ext_from_codec(codec_id: str) -> str:
-    c = (codec_id or "").upper()
-    if "S_TEXT/ASS" in c:
-        return ".ass"
-    if "S_TEXT/SSA" in c:
-        return ".ssa"
-    if "S_TEXT/UTF8" in c:
-        return ".srt"
-    if "S_TEXT/WEBVTT" in c:
-        return ".vtt"
-    if "S_TEXT/USF" in c:
-        return ".usf"
-    if "S_TEXT/TIMEDTEXT" in c or "S_TEXT/TTML" in c:
-        return ".ttml"
-    if "S_HDMV/PGS" in c:
-        return ".sup"
-    if "S_VOBSUB" in c:
         # может быть пара idx+sub; оставляем .sub как базовый
-        return ".sub"
-    if "S_DVBSUB" in c:
-        return ".sub"
-    return ".sub"
-
-
 def extract_subtitles(
     mkvextract: str,
     source: Path,
@@ -517,8 +365,7 @@ def extract_chapters(mkvextract: str, source: Path, chapters_dir: Path, overwrit
 
 
 
-def parse_tracks_json(tracks_json: Dict[str, Any]) -> List[TrackEntry]:
-    tracks = tracks_json.get("tracks", []) or []
+def parse_tracks(tracks: List[Dict[str, Any]]) -> List[TrackEntry]:
     parsed: List[TrackEntry] = []
     for t in tracks:
         try:
@@ -534,33 +381,25 @@ def parse_tracks_json(tracks_json: Dict[str, Any]) -> List[TrackEntry]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Demux subtitles, attachments, chapters to WORKDIR")
-    ap.add_argument("--source", required=True, help="Input source MKV")
-    ap.add_argument("--workdir", required=True, help="Per-file workdir")
-    ap.add_argument("--tracksData", required=True, help="tracks.json path (relative to workdir is allowed)")
+    ap.add_argument("--plan", required=True, help="Path to file .plan")
     ap.add_argument("--mkvmerge", default="mkvmerge", help="Path to mkvmerge")
     ap.add_argument("--mkvextract", default="mkvextract", help="Path to mkvextract")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing extracted files")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --workdir if not absolute)")
     args = ap.parse_args()
 
-    source = Path(args.source)
-    workdir = Path(args.workdir)
+    resolved_plan = resolve_file_plan(Path(args.plan))
+    source = resolved_plan.paths.source
+    workdir = resolved_plan.paths.workdir
+    entries = parse_tracks(resolved_plan.runtime_tracks())
+
     setup_logging(args.log, workdir)
-    marker = marker_path(workdir)
-    if marker.exists() and not args.overwrite:
-        print(f"[demux] skip: marker exists: {marker}")
-        return 0
 
     if not source.exists():
         eprint(f"[demux] Source not found: {source}")
         return 2
 
     ensure_dir(workdir)
-
-    tracks_path = resolve_tracks_path(workdir, args.tracksData)
-    if not tracks_path.exists():
-        eprint(f"[demux] tracksData not found: {tracks_path}")
-        return 3
 
     mkvmerge = which_or(args.mkvmerge, args.mkvmerge)
     mkvextract = which_or(args.mkvextract, args.mkvextract)
@@ -573,9 +412,6 @@ def main() -> int:
         return 4
 
     try:
-        tracks_json = load_json(tracks_path)
-        entries = parse_tracks_json(tracks_json)
-
         # subs only (status != SKIP)
         subs = [t for t in entries if t.type == "sub" and not is_skip(t.trackStatus)]
 
@@ -625,8 +461,6 @@ def main() -> int:
             "chapters": chapters_info,
         }
         write_json(workdir / "00_meta" / "demux_manifest.json", manifest)
-        write_marker(workdir)
-
         print("[demux] OK")
         return 0
 

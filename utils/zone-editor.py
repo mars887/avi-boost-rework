@@ -17,7 +17,6 @@ edit_av1an_scenes.py
 from __future__ import annotations
 
 import argparse
-import atexit
 import copy
 import json
 import math
@@ -34,109 +33,16 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# ------------------------- state markers -------------------------
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-STATE_DIR_NAME = ".state"
-ZONE_MARKER = "ZONE_EDIT_DONE"
-
-
-class TeeStream:
-    def __init__(self, stream, log_file) -> None:
-        self._stream = stream
-        self._log = log_file
-
-    def write(self, s: str) -> int:
-        try:
-            self._stream.write(s)
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.write(s)
-                self._log.flush()
-            except Exception:
-                self._log = None
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.flush()
-            except Exception:
-                self._log = None
-
-    def close_log(self) -> None:
-        if self._log is None:
-            return
-        try:
-            self._log.flush()
-        except Exception:
-            pass
-        try:
-            self._log.close()
-        except Exception:
-            pass
-        self._log = None
+from utils.pipeline_runtime import setup_stage_logging
+from utils.zoned_commands import project_zone_command_lines
 
 
 def setup_logging(log_path: str, base_dir: Optional[Path] = None) -> None:
-    if not log_path:
-        return
-    p = Path(log_path)
-    if not p.is_absolute() and base_dir is not None:
-        p = base_dir / p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    log_fh = p.open("a", encoding=enc, errors="replace")
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        log_fh.write(f"=== START zone-editor {ts} ===\n")
-        log_fh.flush()
-    except Exception:
-        pass
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    tee_out = TeeStream(orig_stdout, log_fh)
-    tee_err = TeeStream(orig_stderr, log_fh)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-
-    def _cleanup() -> None:
-        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            log_fh.write(f"=== END zone-editor {ts_end} ===\n")
-            log_fh.flush()
-        except Exception:
-            pass
-        sys.stdout = orig_stdout
-        sys.stderr = orig_stderr
-        tee_out.close_log()
-        tee_err.close_log()
-
-    atexit.register(_cleanup)
-
-
-def state_root_from_out(out_path: Path) -> Path:
-    p = out_path.resolve()
-    if p.parent.name.lower() == "video" and p.parent.parent.exists():
-        return p.parent.parent
-    return p.parent
-
-
-def marker_path(out_path: Path) -> Path:
-    root = state_root_from_out(out_path)
-    return root / STATE_DIR_NAME / ZONE_MARKER
-
-
-def write_marker(out_path: Path) -> None:
-    p = marker_path(out_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
+    setup_stage_logging(log_path, stage_name="zone-editor", base_dir=base_dir)
 
 
 # Можно заполнить позже: {"--crf": Decimal("0.25"), "--someparam": Decimal("2")}
@@ -369,11 +275,20 @@ class Action:
 
 
 @dataclass(frozen=True)
+class BoundaryOptions:
+    min_len: int = 9
+    min2_len: int = 4
+    magnet: int = 0
+    threshold: int = 0
+
+
+@dataclass(frozen=True)
 class Command:
     selectors: Tuple[Selector, ...]
-    sep: str  # '-', '!', '^'
+    sep: str  # '-', '!', '^', '|'
     actions: Tuple[Action, ...]
     raw_line: str
+    boundary_options: Optional[BoundaryOptions] = None
 
 
 # ------------------------- parsing helpers -------------------------
@@ -411,14 +326,50 @@ def normalize_key(k: str) -> str:
     return "--" + k
 
 
-def split_command_tokens(line: str) -> Tuple[str, str, List[str]]:
+def space_boundary_bars(line: str) -> str:
+    out: List[str] = []
+    quote = ""
+    for ch in line:
+        if ch in ("'", '"'):
+            if quote == ch:
+                quote = ""
+            elif not quote:
+                quote = ch
+            out.append(ch)
+            continue
+        if ch == "|" and not quote:
+            out.append(" | ")
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def split_command_tokens(line: str) -> Tuple[str, str, List[str], List[str]]:
     """
-    Returns: (selectors_part, sep, action_tokens)
-    Parsing strategy: shlex.split -> find first token that is exactly '-', '!', '^'
+    Returns: (selectors_part, sep, action_tokens, boundary_option_tokens)
+    Parsing strategy:
+      - boundary edit mode: selectors | option_tokens | action_tokens
+      - legacy mode: find first token that is exactly '-', '!', '^'
     """
-    tokens = shlex.split(line, posix=False)
+    tokens = shlex.split(space_boundary_bars(line), posix=False)
     if not tokens:
         raise ValueError("Empty command line")
+
+    if "|" in tokens:
+        first_bar = tokens.index("|")
+        try:
+            second_bar = tokens.index("|", first_bar + 1)
+        except ValueError:
+            raise ValueError("Boundary command must contain two standalone '|' separators")
+
+        selectors_part = " ".join(tokens[:first_bar]).strip()
+        option_tokens = tokens[first_bar + 1 : second_bar]
+        action_tokens = tokens[second_bar + 1 :]
+        if not selectors_part:
+            raise ValueError("Missing selectors part before boundary options")
+        if not action_tokens:
+            raise ValueError("Missing actions part after boundary options")
+        return selectors_part, "|", action_tokens, option_tokens
 
     sep_idx = None
     sep = ""
@@ -438,11 +389,92 @@ def split_command_tokens(line: str) -> Tuple[str, str, List[str]]:
     if not action_tokens:
         raise ValueError("Missing actions part after separator")
 
-    return selectors_part, sep, action_tokens
+    return selectors_part, sep, action_tokens, []
+
+
+def parse_boundary_options(option_tokens: List[str]) -> BoundaryOptions:
+    key_aliases = {
+        "min": "min_len",
+        "min-len": "min_len",
+        "min_len": "min_len",
+        "min-scene-len": "min_len",
+        "min_scene_len": "min_len",
+        "min2": "min2_len",
+        "min2-len": "min2_len",
+        "min2_len": "min2_len",
+        "special-min": "min2_len",
+        "special_min": "min2_len",
+        "magnet": "magnet",
+        "snap": "magnet",
+        "snap-to": "magnet",
+        "snap_to": "magnet",
+        "thr": "threshold",
+        "threshold": "threshold",
+        "tolerance": "threshold",
+        "ignore": "threshold",
+    }
+
+    values: Dict[str, Optional[int]] = {
+        "min_len": None,
+        "min2_len": None,
+        "magnet": None,
+        "threshold": None,
+    }
+
+    i = 0
+    while i < len(option_tokens):
+        tok = str(option_tokens[i]).strip()
+        if not tok:
+            i += 1
+            continue
+
+        key_text: str
+        value_text: str
+        if "=" in tok:
+            key_text, value_text = tok.split("=", 1)
+            i += 1
+        elif ":" in tok:
+            key_text, value_text = tok.split(":", 1)
+            i += 1
+        else:
+            if i + 1 >= len(option_tokens):
+                raise ValueError(f"Boundary option {tok!r} has no value")
+            key_text = tok
+            value_text = str(option_tokens[i + 1])
+            i += 2
+
+        key_norm = key_text.strip().lstrip("-").casefold()
+        key_norm = key_aliases.get(key_norm, "")
+        if not key_norm:
+            raise ValueError(f"Unknown boundary option: {key_text!r}")
+
+        try:
+            value_dec = Decimal(str(value_text))
+        except Exception:
+            raise ValueError(f"Invalid integer value for boundary option {key_text!r}: {value_text!r}")
+        if value_dec != value_dec.to_integral_value():
+            raise ValueError(f"Boundary option {key_text!r} must be an integer frame count")
+        value = int(value_dec)
+        if value < 0:
+            raise ValueError(f"Boundary option {key_text!r} must be >= 0")
+        values[key_norm] = value
+
+    min_len = values["min_len"] if values["min_len"] is not None else 9
+    min2_len = values["min2_len"] if values["min2_len"] is not None else 4
+    magnet = values["magnet"] if values["magnet"] is not None else 0
+    threshold = values["threshold"] if values["threshold"] is not None else 0
+    return BoundaryOptions(
+        min_len=int(min_len),
+        min2_len=int(min2_len),
+        magnet=int(magnet),
+        threshold=int(threshold),
+    )
 
 
 def parse_preset_definition(line: str) -> Tuple[str, List[str]]:
-    selectors_part, _sep, action_tokens = split_command_tokens(line)
+    selectors_part, sep, action_tokens, _option_tokens = split_command_tokens(line)
+    if sep == "|":
+        raise ValueError("Preset definitions cannot use boundary edit mode")
     name = selectors_part.strip()
     if not name.startswith("@"):
         raise ValueError("Preset line must start with '@'")
@@ -515,7 +547,10 @@ def parse_selectors(
             b = int(m.group(2))
             if b < a:
                 a, b = b, a
-            fr = FrameRange(start=a, end=b)
+            # Frame selectors are inclusive in the user-facing DSL: 100F300
+            # means frames [100, 300]. Internally scenes use end-exclusive
+            # ranges, so store it as [100, 301).
+            fr = FrameRange(start=a, end=b + 1)
             out.append(Selector(kind="frames", frame_ranges=(fr,), raw=raw))
             continue
 
@@ -597,14 +632,14 @@ def load_commands(command_arg: str) -> List[str]:
     if os.path.exists(command_arg) and os.path.isfile(command_arg):
         with open(command_arg, "r", encoding="utf-8") as f:
             lines = f.read().splitlines()
-        return lines
+        return project_zone_command_lines(lines)
 
     # Otherwise treat as inline:
     # delimiter is "?" (per spec). Also allow newlines if user passed them.
     if "\n" in command_arg:
-        return command_arg.splitlines()
+        return project_zone_command_lines(command_arg.splitlines())
 
-    return [x.strip() for x in command_arg.split("?")]
+    return project_zone_command_lines([x.strip() for x in command_arg.split("?")])
 
 
 def parse_commands(
@@ -628,16 +663,18 @@ def parse_commands(
             presets[name] = action_tokens
             continue
 
-        selectors_part, sep, action_tokens = split_command_tokens(line)
+        selectors_part, sep, action_tokens, option_tokens = split_command_tokens(line)
         selectors = parse_selectors(selectors_part, video=video, total_frames=total_frames)
         expanded_tokens = expand_preset_tokens(action_tokens, presets)
         actions = parse_actions(expanded_tokens)
+        boundary_options = parse_boundary_options(option_tokens) if sep == "|" else None
 
         cmds.append(Command(
             selectors=tuple(selectors),
             sep=sep,
             actions=tuple(actions),
             raw_line=raw_line.strip(),
+            boundary_options=boundary_options,
         ))
     return cmds
 
@@ -824,6 +861,334 @@ def apply_action_to_pairs(
     return new_pairs, None, after
 
 
+# ------------------------- boundary editing -------------------------
+
+@dataclass
+class SceneSegment:
+    start: int
+    end: int
+    scene: Dict[str, Any]
+    selected: bool
+
+
+def normalize_frame_ranges(ranges: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    cleaned = sorted((int(a), int(b)) for a, b in ranges if int(b) > int(a))
+    out: List[Tuple[int, int]] = []
+    for start, end in cleaned:
+        if not out:
+            out.append((start, end))
+            continue
+        prev_start, prev_end = out[-1]
+        if start <= prev_end:
+            out[-1] = (prev_start, max(prev_end, end))
+        else:
+            out.append((start, end))
+    return out
+
+
+def command_frame_ranges(cmd: Command) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    for sel in cmd.selectors:
+        if sel.kind in ("frames", "time", "chapter"):
+            for fr in sel.frame_ranges:
+                ranges.append((fr.start, fr.end))
+    return normalize_frame_ranges(ranges)
+
+
+def scene_timeline(scenes: Sequence[Dict[str, Any]]) -> Optional[Tuple[int, int]]:
+    starts: List[int] = []
+    ends: List[int] = []
+    for sc in scenes:
+        try:
+            starts.append(int(sc.get("start_frame")))
+            ends.append(int(sc.get("end_frame")))
+        except Exception:
+            continue
+    if not starts or not ends:
+        return None
+    return min(starts), max(ends)
+
+
+def scene_boundaries(scenes: Sequence[Dict[str, Any]]) -> List[int]:
+    bounds: set[int] = set()
+    for sc in scenes:
+        try:
+            bounds.add(int(sc.get("start_frame")))
+            bounds.add(int(sc.get("end_frame")))
+        except Exception:
+            continue
+    return sorted(bounds)
+
+
+def clip_ranges_to_timeline(
+    ranges: Sequence[Tuple[int, int]],
+    timeline_start: int,
+    timeline_end: int,
+) -> List[Tuple[int, int]]:
+    clipped: List[Tuple[int, int]] = []
+    for start, end in ranges:
+        s0 = max(timeline_start, min(int(start), timeline_end))
+        s1 = max(timeline_start, min(int(end), timeline_end))
+        if s1 > s0:
+            clipped.append((s0, s1))
+    return normalize_frame_ranges(clipped)
+
+
+def nearest_boundary(pos: int, bounds: Sequence[int]) -> Tuple[Optional[int], int]:
+    if not bounds:
+        return None, 0
+    best = min((int(b) for b in bounds), key=lambda b: (abs(b - pos), b))
+    return best, abs(best - pos)
+
+
+def snap_boundary_to_scene(pos: int, bounds: Sequence[int], opts: BoundaryOptions) -> int:
+    nearest, dist = nearest_boundary(pos, bounds)
+    if nearest is None or dist == 0:
+        return pos
+    if opts.threshold > 0 and dist <= opts.threshold:
+        return nearest
+    if opts.magnet > 0 and dist <= opts.magnet:
+        return nearest
+    return pos
+
+
+def snap_ranges_to_scene_boundaries(
+    ranges: Sequence[Tuple[int, int]],
+    bounds: Sequence[int],
+    opts: BoundaryOptions,
+) -> List[Tuple[int, int]]:
+    snapped: List[Tuple[int, int]] = []
+    for start, end in ranges:
+        s0 = snap_boundary_to_scene(int(start), bounds, opts)
+        s1 = snap_boundary_to_scene(int(end), bounds, opts)
+        if s1 > s0:
+            snapped.append((s0, s1))
+    return normalize_frame_ranges(snapped)
+
+
+def merge_close_selector_ranges(
+    ranges: Sequence[Tuple[int, int]],
+    opts: BoundaryOptions,
+) -> List[Tuple[int, int]]:
+    if opts.min2_len <= 0:
+        return normalize_frame_ranges(ranges)
+
+    out: List[Tuple[int, int]] = []
+    for start, end in normalize_frame_ranges(ranges):
+        if not out:
+            out.append((start, end))
+            continue
+        prev_start, prev_end = out[-1]
+        gap = start - prev_end
+        if 0 < gap < opts.min2_len:
+            out[-1] = (prev_start, end)
+        else:
+            out.append((start, end))
+    return out
+
+
+def interval_inside_ranges(start: int, end: int, ranges: Sequence[Tuple[int, int]]) -> bool:
+    for r0, r1 in ranges:
+        if start >= r0 and end <= r1:
+            return True
+    return False
+
+
+def split_scenes_for_boundary_ranges(
+    scenes: Sequence[Dict[str, Any]],
+    ranges: Sequence[Tuple[int, int]],
+) -> List[SceneSegment]:
+    cut_points = sorted({p for r in ranges for p in r})
+    segments: List[SceneSegment] = []
+
+    for sc in scenes:
+        try:
+            scene_start = int(sc.get("start_frame"))
+            scene_end = int(sc.get("end_frame"))
+        except Exception:
+            continue
+        if scene_end <= scene_start:
+            continue
+
+        points = [scene_start]
+        points.extend(p for p in cut_points if scene_start < p < scene_end)
+        points.append(scene_end)
+        points = sorted(set(points))
+
+        for i in range(len(points) - 1):
+            start = points[i]
+            end = points[i + 1]
+            if end <= start:
+                continue
+            new_scene = copy.deepcopy(sc)
+            new_scene["start_frame"] = start
+            new_scene["end_frame"] = end
+            segments.append(SceneSegment(
+                start=start,
+                end=end,
+                scene=new_scene,
+                selected=interval_inside_ranges(start, end, ranges),
+            ))
+
+    return segments
+
+
+def short_segment_threshold(segments: Sequence[SceneSegment], idx: int, opts: BoundaryOptions) -> int:
+    seg = segments[idx]
+    special = idx == 0 or idx == len(segments) - 1
+    if 0 < idx < len(segments) - 1:
+        left = segments[idx - 1]
+        right = segments[idx + 1]
+        if left.selected == right.selected and seg.selected != left.selected:
+            special = True
+    if special:
+        return opts.min2_len
+    return opts.min_len
+
+
+def choose_merge_direction(segments: Sequence[SceneSegment], idx: int) -> Optional[str]:
+    seg = segments[idx]
+    candidates: List[Tuple[int, str]] = []
+
+    if idx > 0 and segments[idx - 1].selected == seg.selected:
+        candidates.append((segments[idx - 1].end - segments[idx - 1].start, "left"))
+    if idx + 1 < len(segments) and segments[idx + 1].selected == seg.selected:
+        candidates.append((segments[idx + 1].end - segments[idx + 1].start, "right"))
+
+    if not candidates:
+        if idx > 0:
+            candidates.append((segments[idx - 1].end - segments[idx - 1].start, "left"))
+        if idx + 1 < len(segments):
+            candidates.append((segments[idx + 1].end - segments[idx + 1].start, "right"))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], 1 if item[1] == "left" else 0), reverse=True)
+    return candidates[0][1]
+
+
+def merge_segment(segments: List[SceneSegment], idx: int, direction: str) -> None:
+    seg = segments[idx]
+    if direction == "left" and idx > 0:
+        left = segments[idx - 1]
+        left.end = seg.end
+        del segments[idx]
+        return
+    if direction == "right" and idx + 1 < len(segments):
+        right = segments[idx + 1]
+        right.start = seg.start
+        del segments[idx]
+
+
+def merge_short_segments(segments: List[SceneSegment], opts: BoundaryOptions) -> List[SceneSegment]:
+    if not segments:
+        return segments
+    if opts.min_len <= 0 and opts.min2_len <= 0:
+        return segments
+
+    changed = True
+    while changed:
+        changed = False
+        for idx, seg in enumerate(list(segments)):
+            if idx >= len(segments):
+                break
+            length = seg.end - seg.start
+            threshold = short_segment_threshold(segments, idx, opts)
+            if threshold <= 0 or length >= threshold:
+                continue
+            direction = choose_merge_direction(segments, idx)
+            if direction is None:
+                continue
+            merge_segment(segments, idx, direction)
+            changed = True
+            break
+
+    return segments
+
+
+def materialize_segments(segments: Sequence[SceneSegment]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for seg in segments:
+        if seg.end <= seg.start:
+            continue
+        sc = seg.scene
+        sc["start_frame"] = int(seg.start)
+        sc["end_frame"] = int(seg.end)
+        out.append(sc)
+    return out
+
+
+def align_scene_boundaries_for_command(
+    scenes: List[Dict[str, Any]],
+    cmd: Command,
+    cmd_index: int,
+) -> set[int]:
+    opts = cmd.boundary_options
+    if opts is None:
+        return set()
+
+    timeline = scene_timeline(scenes)
+    if timeline is None:
+        return set()
+    timeline_start, timeline_end = timeline
+
+    ranges = command_frame_ranges(cmd)
+    ranges = clip_ranges_to_timeline(ranges, timeline_start, timeline_end)
+    if not ranges:
+        return set()
+
+    before_count = len(scenes)
+    bounds = scene_boundaries(scenes)
+    ranges = snap_ranges_to_scene_boundaries(ranges, bounds, opts)
+    ranges = merge_close_selector_ranges(ranges, opts)
+    if not ranges:
+        return set()
+
+    segments = split_scenes_for_boundary_ranges(scenes, ranges)
+    segments = merge_short_segments(segments, opts)
+
+    selected_indexes = {idx for idx, seg in enumerate(segments) if seg.selected}
+    scenes[:] = materialize_segments(segments)
+
+    after_count = len(scenes)
+    ranges_text = format_frame_group(ranges)
+    print(
+        f"[boundaries] cmd#{cmd_index} {ranges_text} "
+        f"scenes {before_count}->{after_count}, selected={format_scene_group(sorted(selected_indexes))}"
+    )
+    return selected_indexes
+
+
+def select_boundary_scenes_for_command(
+    scenes: List[Dict[str, Any]],
+    cmd: Command,
+) -> set[int]:
+    opts = cmd.boundary_options
+    if opts is None:
+        return set()
+
+    timeline = scene_timeline(scenes)
+    if timeline is None:
+        return set()
+    timeline_start, timeline_end = timeline
+
+    ranges = command_frame_ranges(cmd)
+    ranges = clip_ranges_to_timeline(ranges, timeline_start, timeline_end)
+    if not ranges:
+        return set()
+
+    bounds = scene_boundaries(scenes)
+    ranges = snap_ranges_to_scene_boundaries(ranges, bounds, opts)
+    ranges = merge_close_selector_ranges(ranges, opts)
+    if not ranges:
+        return set()
+
+    segments = split_scenes_for_boundary_ranges(scenes, ranges)
+    segments = merge_short_segments(segments, opts)
+    return {idx for idx, seg in enumerate(segments) if seg.selected}
+
+
 # ------------------------- scene matching -------------------------
 
 def overlap_len(a0: int, a1: int, b0: int, b1: int) -> int:
@@ -862,6 +1227,16 @@ def scene_selected(scene_idx: int, scene_start: int, scene_end: int, cmd: Comman
     return False
 
 
+def scene_index_selected(scene_idx: int, cmd: Command) -> bool:
+    for sel in cmd.selectors:
+        if sel.kind != "scene_idx":
+            continue
+        for (a, b) in sel.scene_ranges:
+            if a <= scene_idx <= b:
+                return True
+    return False
+
+
 def selector_matches(scene_idx: int, scene_start: int, scene_end: int, cmd: Command) -> List[Dict[str, Any]]:
     matches: List[Dict[str, Any]] = []
     scene_len = max(1, scene_end - scene_start)
@@ -892,6 +1267,87 @@ def selector_matches(scene_idx: int, scene_start: int, scene_end: int, cmd: Comm
     return matches
 
 
+def format_scene_group(values: Sequence[int]) -> str:
+    ordered: List[int] = []
+    for value in values:
+        ivalue = int(value)
+        if ordered and ordered[-1] == ivalue:
+            continue
+        ordered.append(ivalue)
+
+    if not ordered:
+        return "-"
+
+    parts: List[str] = []
+    start = end = ordered[0]
+    for value in ordered[1:]:
+        if value == end + 1:
+            end = value
+            continue
+        parts.append(str(start) if start == end else f"{start}..{end}")
+        start = end = value
+    parts.append(str(start) if start == end else f"{start}..{end}")
+    return ",".join(parts)
+
+
+def format_frame_group(ranges: Sequence[Tuple[int, int]]) -> str:
+    normalized: List[Tuple[int, int]] = []
+    for start, end in ranges:
+        s0 = int(start)
+        s1 = int(end)
+        if not normalized:
+            normalized.append((s0, s1))
+            continue
+        prev_start, prev_end = normalized[-1]
+        if s0 <= prev_end:
+            normalized[-1] = (prev_start, max(prev_end, s1))
+            continue
+        normalized.append((s0, s1))
+    return ",".join(f"{start}-{end}" for start, end in normalized) if normalized else "-"
+
+
+def render_command_actions(cmd: Command) -> str:
+    try:
+        _selectors_part, _sep, action_tokens, _option_tokens = split_command_tokens(cmd.raw_line)
+    except ValueError:
+        parts: List[str] = []
+        for action in cmd.actions:
+            parts.append(action.key)
+            parts.append(action.raw_value)
+        return " ".join(parts).strip()
+    return " ".join(action_tokens).strip()
+
+
+def render_boundary_options(opts: BoundaryOptions) -> str:
+    return (
+        f"min={opts.min_len} "
+        f"min2={opts.min2_len} "
+        f"magnet={opts.magnet} "
+        f"thr={opts.threshold}"
+    )
+
+
+def render_command_context(cmd: Command, matches: Sequence[Dict[str, Any]]) -> str:
+    matched_raws = {str(item.get("raw") or "") for item in matches if item.get("raw")}
+    selector_parts: List[str] = []
+    for selector in cmd.selectors:
+        raw = selector.raw
+        if raw in matched_raws:
+            selector_parts.append(f"[ {raw} ]")
+        else:
+            selector_parts.append(raw)
+    selectors_text = ",".join(selector_parts)
+    actions_text = render_command_actions(cmd)
+    if cmd.sep == "|" and cmd.boundary_options is not None:
+        options_text = render_boundary_options(cmd.boundary_options)
+        if actions_text:
+            return f"{selectors_text} | {options_text} | {actions_text}"
+        return f"{selectors_text} | {options_text} |"
+    if actions_text:
+        return f"{selectors_text} {cmd.sep} {actions_text}"
+    return selectors_text
+
+
 # ------------------------- main apply -------------------------
 
 def apply_commands_to_scenes(
@@ -900,10 +1356,17 @@ def apply_commands_to_scenes(
     *,
     param_step: Dict[str, Decimal],
     video: VideoInfo,
+    boundaries_only: bool = False,
+    params_only: bool = False,
 ) -> None:
+    if boundaries_only and params_only:
+        raise RuntimeError("--boundaries-only and --params-only cannot be used together")
+
     scenes = scenes_data.get("scenes") or []
     if not isinstance(scenes, list):
         raise RuntimeError("Invalid scenes.json: top-level 'scenes' must be a list.")
+
+    log_groups: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
     for idx, sc in enumerate(scenes):
         try:
@@ -914,6 +1377,32 @@ def apply_commands_to_scenes(
         ensure_scene_meta(sc, idx, s0, s1, video.fps)
 
     for cmd_i, cmd in enumerate(commands, start=1):
+        boundary_selected: Optional[set[int]] = None
+        if boundaries_only:
+            if cmd.boundary_options is None:
+                continue
+            align_scene_boundaries_for_command(scenes, cmd, cmd_i)
+            for idx, sc in enumerate(scenes):
+                try:
+                    s0 = int(sc.get("start_frame"))
+                    s1 = int(sc.get("end_frame"))
+                except Exception:
+                    continue
+                ensure_scene_meta(sc, idx, s0, s1, video.fps)
+            continue
+
+        if cmd.boundary_options is not None and params_only:
+            boundary_selected = select_boundary_scenes_for_command(scenes, cmd)
+        elif cmd.boundary_options is not None:
+            boundary_selected = align_scene_boundaries_for_command(scenes, cmd, cmd_i)
+            for idx, sc in enumerate(scenes):
+                try:
+                    s0 = int(sc.get("start_frame"))
+                    s1 = int(sc.get("end_frame"))
+                except Exception:
+                    continue
+                ensure_scene_meta(sc, idx, s0, s1, video.fps)
+
         for idx, sc in enumerate(scenes):
             try:
                 s0 = int(sc.get("start_frame"))
@@ -921,7 +1410,10 @@ def apply_commands_to_scenes(
             except Exception:
                 continue
 
-            if not scene_selected(idx, s0, s1, cmd):
+            if boundary_selected is not None:
+                if idx not in boundary_selected and not scene_index_selected(idx, cmd):
+                    continue
+            elif not scene_selected(idx, s0, s1, cmd):
                 continue
 
             zo = sc.get("zone_overrides")
@@ -966,9 +1458,6 @@ def apply_commands_to_scenes(
 
             if changes:
                 zo["video_params"] = build_video_params(pairs)
-                print(f"[scene {idx:4d}  {s0}-{s1})  cmd#{cmd_i}: {cmd.raw_line}")
-                for c in changes:
-                    print(f"  - {c}")
                 meta = ensure_scene_meta(sc, idx, s0, s1, video.fps)
                 ze = meta.get("zone_editor")
                 if not isinstance(ze, dict):
@@ -978,15 +1467,46 @@ def apply_commands_to_scenes(
                 if not isinstance(applied, list):
                     applied = []
                     ze["applied_commands"] = applied
+                match_info = selector_matches(idx, s0, s1, cmd)
                 applied.append({
                     "cmd_index": cmd_i,
                     "cmd_line": cmd.raw_line,
                     "selectors": [sel.raw for sel in cmd.selectors],
                     "sep": cmd.sep,
-                    "matches": selector_matches(idx, s0, s1, cmd),
+                    "matches": match_info,
                     "changes": changes_detail,
                 })
                 ze["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                command_context = render_command_context(cmd, match_info)
+                group_key = (cmd_i, command_context, tuple(changes))
+                group = log_groups.get(group_key)
+                if group is None:
+                    group = {
+                        "cmd_index": cmd_i,
+                        "command_context": command_context,
+                        "changes": tuple(changes),
+                        "scene_indexes": [],
+                        "frame_ranges": [],
+                    }
+                    log_groups[group_key] = group
+                group["scene_indexes"].append(idx)
+                group["frame_ranges"].append((s0, s1))
+
+    for idx, sc in enumerate(scenes):
+        try:
+            s0 = int(sc.get("start_frame"))
+            s1 = int(sc.get("end_frame"))
+        except Exception:
+            continue
+        ensure_scene_meta(sc, idx, s0, s1, video.fps)
+
+    for group in log_groups.values():
+        scene_text = format_scene_group(group["scene_indexes"])
+        frame_text = format_frame_group(group["frame_ranges"])
+        print(f"[scene {scene_text:>8}  {frame_text}]  - cmd#{group['cmd_index']} - {group['command_context']}")
+        for change in group["changes"]:
+            print(f"  {change}")
 
     scenes_data["split_scenes"] = copy.deepcopy(scenes)
 
@@ -998,11 +1518,24 @@ def main(argv: Sequence[str]) -> int:
     ap.add_argument("--scenes", required=False, help="Input scenes.json (av1an scenes file)")
     ap.add_argument("--out", required=False, help="Output scenes.json path")
     ap.add_argument("--source", required=False, help="Source video file (for chapters/time->frames mapping)")
-    ap.add_argument("--command", required=False, help="Commands: file path (newline-separated, supports # comments and @presets) OR inline string (separator '?')")
+    ap.add_argument(
+        "--command",
+        required=False,
+        help=(
+            "Commands: file path (newline-separated, supports # comments and @presets) "
+            "OR inline string (separator '?'). Boundary mode: "
+            "selectors | min=9 min2=4 magnet=2 thr=1 | actions"
+        ),
+    )
     ap.add_argument("--no-vfr-warn", action="store_true", help="Do not warn when avg_frame_rate differs from r_frame_rate")
     ap.add_argument("--parse-check", action="store_true", help="Parse-check command(s) and exit without writing output.")
+    ap.add_argument("--boundaries-only", action="store_true", help="Apply only boundary edits from |...| commands; ignore all parameter actions.")
+    ap.add_argument("--params-only", action="store_true", help="Apply parameter actions without changing scene boundaries.")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --out dir if not absolute)")
     args = ap.parse_args(list(argv))
+
+    if args.boundaries_only and args.params_only:
+        raise SystemExit("--boundaries-only and --params-only cannot be used together")
 
     if args.parse_check:
         if not args.source:
@@ -1030,10 +1563,6 @@ def main(argv: Sequence[str]) -> int:
 
     out_path = Path(args.out).resolve()
     setup_logging(args.log, out_path.parent)
-    marker = marker_path(out_path)
-    if marker.exists():
-        print(f"[skip] marker exists: {marker}")
-        return 0
 
     # Load scenes json
     with open(args.scenes, "r", encoding="utf-8") as f:
@@ -1059,12 +1588,18 @@ def main(argv: Sequence[str]) -> int:
     commands = parse_commands(raw_lines, video=video, total_frames=total_frames)
 
     # Apply
-    apply_commands_to_scenes(scenes_data, commands, param_step=DEFAULT_PARAM_STEP, video=video)
+    apply_commands_to_scenes(
+        scenes_data,
+        commands,
+        param_step=DEFAULT_PARAM_STEP,
+        video=video,
+        boundaries_only=bool(args.boundaries_only),
+        params_only=bool(args.params_only),
+    )
 
     # Save
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(scenes_data, f, ensure_ascii=False, indent=2)
-    write_marker(out_path)
 
     return 0
 

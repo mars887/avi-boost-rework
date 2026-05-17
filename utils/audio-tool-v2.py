@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # audio-tool.py
 #
-# Audio processing utility for a single source MKV based on tracks.json.
+# Audio processing utility for a single source MKV based on file .plan.
 #
 # Key behaviors (updated per January 2026 clarifications):
 # - Source is always MKV.
@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import argparse
-import atexit
 import json
 import os
 import re
@@ -32,18 +31,22 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TextIO, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.pipeline_runtime import read_json as read_json_file, setup_stage_logging, write_json as write_json_file
+from utils.plan_model import resolve_file_plan
 
 TOOL_NAME = "audio-tool"
 TOOL_VERSION = "1.2"
 
 MIN_OUT_BYTES = 1024  # sanity check
 DEFAULT_TMP_CODEC = "flac"  # preferred intermediate for "complex" EDIT
-STATE_DIR_NAME = ".state"
-AUDIO_MARKER = "AUDIO_DONE"
 
 
 class AudioToolError(RuntimeError):
@@ -56,102 +59,8 @@ def eprint(*a: Any) -> None:
     print(*a, file=sys.stderr)
 
 
-class TeeStream:
-    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
-        self._stream = stream
-        self._log: Optional[TextIO] = log_file
-
-    def write(self, s: str) -> int:
-        try:
-            self._stream.write(s)
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.write(s)
-                self._log.flush()
-            except Exception:
-                self._log = None
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.flush()
-            except Exception:
-                self._log = None
-
-    def close_log(self) -> None:
-        if self._log is None:
-            return
-        try:
-            self._log.flush()
-        except Exception:
-            pass
-        try:
-            self._log.close()
-        except Exception:
-            pass
-        self._log = None
-
-    def isatty(self) -> bool:
-        return bool(getattr(self._stream, "isatty", lambda: False)())
-
-    @property
-    def encoding(self) -> str:
-        return getattr(self._stream, "encoding", "utf-8")
-
-
 def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
-    if not log_path:
-        return
-    p = Path(log_path)
-    if not p.is_absolute() and workdir is not None:
-        p = workdir / p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    log_fh = p.open("a", encoding=enc, errors="replace")
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        log_fh.write(f"=== START {TOOL_NAME} {ts} ===\n")
-        log_fh.flush()
-    except Exception:
-        pass
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    tee_out = TeeStream(orig_stdout, log_fh)
-    tee_err = TeeStream(orig_stderr, log_fh)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-
-    def _cleanup() -> None:
-        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            log_fh.write(f"=== END {TOOL_NAME} {ts_end} ===\n")
-            log_fh.flush()
-        except Exception:
-            pass
-        sys.stdout = orig_stdout
-        sys.stderr = orig_stderr
-        tee_out.close_log()
-        tee_err.close_log()
-
-    atexit.register(_cleanup)
-
-
-def marker_path(workdir: Path) -> Path:
-    return workdir / STATE_DIR_NAME / AUDIO_MARKER
-
-
-def write_marker(workdir: Path) -> None:
-    p = marker_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
+    setup_stage_logging(log_path, stage_name=TOOL_NAME, base_dir=workdir)
 
 
 def sanitize_error_id(s: str) -> str:
@@ -200,12 +109,11 @@ def run_cmd(
 
 
 def read_json(p: Path) -> Any:
-    return json.loads(p.read_text(encoding="utf-8"))
+    return read_json_file(p)
 
 
 def write_json(p: Path, obj: Any) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_json_file(p, obj)
 
 
 
@@ -418,7 +326,7 @@ def parse_profile(track: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 @dataclass
 class OutputEntry:
     srcTrackId: int
-    status: str              # COPY | EDIT (from tracks.json)
+    status: str              # COPY | EDIT
     role: str                # primary | fallback_original (optional)
     outPath: str             # relative to workdir
     container: str
@@ -427,6 +335,7 @@ class OutputEntry:
     sample_rate: Optional[int]
     bitrate_kbps: Optional[int]
     duration_ms: int
+    source_duration_ms: int = 0
     source_start_time_ms: int = 0
     mux_delay_ms: int = 0
     notes: str = ""
@@ -628,9 +537,7 @@ def encode_opus_with_opusenc(
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(prog=TOOL_NAME)
-    ap.add_argument("--source", required=True, help="Path to source MKV")
-    ap.add_argument("--workdir", required=True, help="Episode workdir")
-    ap.add_argument("--tracksData", required=True, help="Path to tracks.json (relative is relative to --workdir)")
+    ap.add_argument("--plan", required=True, help="Path to file .plan")
 
     ap.add_argument("--ffmpeg", default="ffmpeg")
     ap.add_argument("--ffprobe", default="ffprobe")
@@ -648,14 +555,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = ap.parse_args(argv)
 
-    source = Path(args.source)
-    workdir = Path(args.workdir)
+    resolved_plan = resolve_file_plan(Path(args.plan))
+    source = resolved_plan.paths.source
+    workdir = resolved_plan.paths.workdir
     setup_logging(args.log, workdir)
-    tracks_data = Path(args.tracksData)
-    marker = marker_path(workdir)
-    if marker.exists() and not args.overwrite:
-        print(f"[{TOOL_NAME}] skip: marker exists: {marker}")
-        return 0
 
     if not source.exists():
         write_error_marker(workdir, "audio_missing_source")
@@ -663,17 +566,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if source.suffix.lower() != ".mkv":
-        # user clarified: always mkv
-        write_error_marker(workdir, "audio_invalid_source_container")
-        eprint(f"[{TOOL_NAME}] ERROR: source must be MKV: {source}")
-#         return 2
+        eprint(
+            f"[{TOOL_NAME}] WARN: source is not MKV; continuing because mkvmerge/ffprobe "
+            f"can process supported containers: {source}"
+        )
 
-    if not tracks_data.is_absolute():
-        tracks_data = workdir / tracks_data
-    if not tracks_data.exists():
-        write_error_marker(workdir, "audio_missing_tracksjson")
-        eprint(f"[{TOOL_NAME}] ERROR: tracks.json not found: {tracks_data}")
-        return 2
+    tracks = resolved_plan.runtime_tracks()
+    audio_statuses = [
+        str(track.get("trackStatus") or "").upper().strip()
+        for track in tracks
+        if isinstance(track, dict) and str(track.get("type") or "").lower().strip() in ("audio", "aud")
+    ]
+    has_active_audio = any(status in ("COPY", "EDIT") for status in audio_statuses)
+    has_edit_audio = any(status == "EDIT" for status in audio_statuses)
+    needs_ffmpeg = has_edit_audio or (has_active_audio and str(args.copy_container).lower() != "mka")
 
     ffmpeg = which_or_path(args.ffmpeg)
     ffprobe = which_or_path(args.ffprobe)
@@ -681,7 +587,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     opusenc = which_or_path(args.opusenc)
 
     # tool presence checks (best-effort)
-    for (tool, err_id) in [(ffmpeg, "ffmpeg_not_found"), (ffprobe, "ffprobe_not_found"), (mkvmerge, "mkvmerge_not_found"), (opusenc, "opusenc_not_found")]:
+    required_tools = []
+    if has_active_audio:
+        required_tools.extend([(ffprobe, "ffprobe_not_found"), (mkvmerge, "mkvmerge_not_found")])
+    if needs_ffmpeg:
+        required_tools.append((ffmpeg, "ffmpeg_not_found"))
+    if has_edit_audio:
+        required_tools.append((opusenc, "opusenc_not_found"))
+    for (tool, err_id) in required_tools:
         if shutil.which(tool) is None and not Path(tool).exists():
             write_error_marker(workdir, err_id)
             eprint(f"[{TOOL_NAME}] ERROR: tool not found: {tool}")
@@ -706,11 +619,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         machine_log["events"].append({"t": time.time(), **ev})
 
     try:
-        data = read_json(tracks_data)
-        tracks = data.get("tracks") if isinstance(data, dict) else None
-        if not isinstance(tracks, list):
-            raise AudioToolError("invalid_tracksjson", "tracks.json has no 'tracks' array")
-
         outputs: List[OutputEntry] = []
 
         for t in tracks:
@@ -749,6 +657,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
             # Probe source track info from tmp_in
             src_info = ffprobe_audio_info(ffprobe, tmp_in)
+            source_duration_ms = int(src_info.get("duration_ms") or 0)
             source_start_time_ms = int(src_info.get("start_time_ms") or 0)
 
             if status == "COPY":
@@ -782,6 +691,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         sample_rate=info.get("sample_rate"),
                         bitrate_kbps=info.get("bitrate_kbps"),
                         duration_ms=int(info.get("duration_ms") or 0),
+                        source_duration_ms=source_duration_ms,
                         source_start_time_ms=source_start_time_ms,
                         mux_delay_ms=0,
                         notes="skip_exists",
@@ -809,6 +719,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     sample_rate=info.get("sample_rate"),
                     bitrate_kbps=info.get("bitrate_kbps"),
                     duration_ms=int(info.get("duration_ms") or 0),
+                    source_duration_ms=source_duration_ms,
                     source_start_time_ms=source_start_time_ms,
                     mux_delay_ms=0,
                 ))
@@ -844,6 +755,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         sample_rate=info_o.get("sample_rate"),
                         bitrate_kbps=info_o.get("bitrate_kbps"),
                         duration_ms=int(info_o.get("duration_ms") or 0),
+                        source_duration_ms=source_duration_ms,
                         source_start_time_ms=source_start_time_ms,
                         mux_delay_ms=0,
                         notes="preserve_special_original_bitstream",
@@ -863,6 +775,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     sample_rate=info.get("sample_rate"),
                     bitrate_kbps=info.get("bitrate_kbps") or bitrate_kbps,
                     duration_ms=int(info.get("duration_ms") or 0),
+                    source_duration_ms=source_duration_ms,
                     source_start_time_ms=source_start_time_ms,
                     mux_delay_ms=source_start_time_ms,
                     notes="skip_exists",
@@ -900,6 +813,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 sample_rate=info.get("sample_rate"),
                 bitrate_kbps=info.get("bitrate_kbps") or bitrate_kbps,
                 duration_ms=int(info.get("duration_ms") or 0),
+                source_duration_ms=source_duration_ms,
                 source_start_time_ms=source_start_time_ms,
                 mux_delay_ms=source_start_time_ms,
             ))
@@ -923,7 +837,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 pass
 
         print(f"[{TOOL_NAME}] done. outputs={len(outputs)} manifest=00_meta/audio_manifest.json")
-        write_marker(workdir)
         return 0
 
     except AudioToolError as ex:
@@ -964,3 +877,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

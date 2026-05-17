@@ -2,24 +2,24 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import atexit
 import json
 import re
 import sys
-from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, TextIO, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from utils.pipeline_runtime import setup_stage_logging
 
 try:
     from fontTools.ttLib import TTFont, TTCollection  # type: ignore
     FONTTOOLS_OK = True
 except Exception:
     FONTTOOLS_OK = False
-
-STATE_DIR_NAME = ".state"
-ATTACH_MARKER = "ATTACHMENTS_CLEAN_DONE"
-
 
 # -----------------------------
 # Logging
@@ -36,102 +36,8 @@ def die(msg: str, code: int = 1) -> int:
     return code
 
 
-class TeeStream:
-    def __init__(self, stream: TextIO, log_file: TextIO) -> None:
-        self._stream = stream
-        self._log: Optional[TextIO] = log_file
-
-    def write(self, s: str) -> int:
-        try:
-            self._stream.write(s)
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.write(s)
-                self._log.flush()
-            except Exception:
-                self._log = None
-        return len(s)
-
-    def flush(self) -> None:
-        try:
-            self._stream.flush()
-        except Exception:
-            pass
-        if self._log is not None:
-            try:
-                self._log.flush()
-            except Exception:
-                self._log = None
-
-    def close_log(self) -> None:
-        if self._log is None:
-            return
-        try:
-            self._log.flush()
-        except Exception:
-            pass
-        try:
-            self._log.close()
-        except Exception:
-            pass
-        self._log = None
-
-    def isatty(self) -> bool:
-        return bool(getattr(self._stream, "isatty", lambda: False)())
-
-    @property
-    def encoding(self) -> str:
-        return getattr(self._stream, "encoding", "utf-8")
-
-
 def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
-    if not log_path:
-        return
-    p = Path(log_path)
-    if not p.is_absolute() and workdir is not None:
-        p = workdir / p
-    p.parent.mkdir(parents=True, exist_ok=True)
-    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    log_fh = p.open("a", encoding=enc, errors="replace")
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        log_fh.write(f"=== START attachments-cleaner {ts} ===\n")
-        log_fh.flush()
-    except Exception:
-        pass
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    tee_out = TeeStream(orig_stdout, log_fh)
-    tee_err = TeeStream(orig_stderr, log_fh)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-
-    def _cleanup() -> None:
-        ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            log_fh.write(f"=== END attachments-cleaner {ts_end} ===\n")
-            log_fh.flush()
-        except Exception:
-            pass
-        sys.stdout = orig_stdout
-        sys.stderr = orig_stderr
-        tee_out.close_log()
-        tee_err.close_log()
-
-    atexit.register(_cleanup)
-
-
-def marker_path(workdir: Path) -> Path:
-    return workdir / STATE_DIR_NAME / ATTACH_MARKER
-
-
-def write_marker(workdir: Path) -> None:
-    p = marker_path(workdir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("ok\n", encoding="utf-8")
+    setup_stage_logging(log_path, stage_name="attachments-cleaner", base_dir=workdir)
 
 
 # -----------------------------
@@ -404,11 +310,6 @@ def main() -> int:
     subs_dir = Path(args.subs)
     att_dir = Path(args.attachments)
     setup_logging(args.log, subs_dir.parent)
-    workdir = subs_dir.parent
-    marker = marker_path(workdir)
-    if marker.exists():
-        log(f"[skip] marker exists: {marker}")
-        return 0
 
     if not subs_dir.exists() or not subs_dir.is_dir():
         return die(f"Subs dir not found: {subs_dir}", 2)
@@ -445,8 +346,6 @@ def main() -> int:
     #     }
     #     report_path = Path(args.report) if args.report else (att_dir / "attachments_cleaner_report.json")
     #     report_path.write_text(json.dumps(report_obj, ensure_ascii=False, indent=2), encoding="utf-8")
-    #     if not args.dry_run:
-    #         write_marker(workdir)
     #     return 0
 
     log(f"Used font tokens (normalized): {len(used_fonts)}")
@@ -502,8 +401,6 @@ def main() -> int:
         warn(f"Failed to write report '{report_path}': {ex}")
 
     log("[ok]")
-    if not args.dry_run:
-        write_marker(workdir)
     return 0
 
 

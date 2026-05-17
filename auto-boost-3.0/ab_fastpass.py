@@ -63,6 +63,7 @@ def query_fastpass_hdr10_payload(*, input_file: Path, hdr_patch_script: Path) ->
 
 def run_fastpass_av1an(
     *,
+    av1an_exe: str,
     input_file: Path,
     fastpass_vpy: Optional[Path],
     fastpass_proxy: Optional[Path],
@@ -82,8 +83,13 @@ def run_fastpass_av1an(
     sc_only: bool,
     log_file: Optional[Path],
     log_level: Optional[str],
+    progress_jsonl: Optional[Path] = None,
     fastpass_hdr: bool = False,
     hdr_patch_script: Optional[Path] = None,
+    chunk_order: str = "",
+    encoder_path: str = "",
+    fast_interrupt: bool = False,
+    vspipe_args: Optional[List[str]] = None,
 ) -> None:
     """Build and execute the av1an fast-pass command (or sc-only)."""
     encoder = normalize_encoder(encoder)
@@ -93,7 +99,7 @@ def run_fastpass_av1an(
 
     av1an_input = fastpass_vpy if fastpass_vpy is not None else input_file
     cmd: List[str] = [
-        "av1an",
+        str(av1an_exe or "av1an"),
         "-i", str(av1an_input),
         "--temp", str(av1an_temp),
         "-y",
@@ -108,10 +114,16 @@ def run_fastpass_av1an(
         cmd.extend(["--log-level", str(log_level)])
     if log_file is not None:
         cmd.extend(["--log-file", str(log_file)])
+    if progress_jsonl is not None:
+        cmd.extend(["--progress-jsonl", str(progress_jsonl)])
     if fastpass_proxy is not None:
         cmd.extend(["--proxy", str(fastpass_proxy)])
-    if fastpass_vpy is not None or fastpass_proxy is not None:
-        cmd.extend(["--vspipe-args", f"src={input_file}"])
+    vspipe_arg_list = [str(item) for item in (vspipe_args or []) if str(item).strip()]
+    if (fastpass_vpy is not None or fastpass_proxy is not None) and not any(item.startswith("src=") for item in vspipe_arg_list):
+        vspipe_arg_list.insert(0, f"src={input_file}")
+    if vspipe_arg_list:
+        cmd.append("--vspipe-args")
+        cmd.extend(vspipe_arg_list)
 
     # Provide scenes file (skip scene detection) or emit scenes when --sc-only
     if scenes_path is not None:
@@ -127,11 +139,19 @@ def run_fastpass_av1an(
     # Muxing defaults from old scripts
     cmd.extend(["-m", "lsmash", "-c", "mkvmerge"])
     cmd.extend(["--chunk-order", "random"])
+    # Prepared for the fork-only chunk-order option, but fastpass stays on random for now.
+    # if str(chunk_order).strip():
+    #     cmd.extend(["--chunk-order", str(chunk_order).strip()])
+    if str(encoder_path).strip():
+        cmd.extend(["--encoder-path", str(encoder_path).strip()])
+    if fast_interrupt:
+        cmd.append("--fast-interrupt")
     cmd.extend(["--cache-mode", "temp"])
 
     # Encoder & encode settings (fast pass)
     cmd.extend(["-e", encoder, "--force"])
     cmd.extend(["-a","-an -sn"])
+    cmd.extend(["--resume"]) # TODO - resume fastpass if params not changed
 
     enc_params = build_fastpass_params(
         encoder=encoder,

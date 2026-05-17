@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import tqdm
 
@@ -45,7 +45,7 @@ def _unwrap_vs_output(out: object, vs_mod):
     return None
 
 
-def _load_vs_clip_from_vpy(vpy_path: Path, *, vpy_src: Path):
+def _load_vs_clip_from_vpy(vpy_path: Path, *, vpy_src: Path, vpy_args: Optional[Dict[str, str]] = None):
     """Execute a .vpy in-process and return its first output clip."""
     if not has_vapoursynth():
         raise RuntimeError("VapourSynth is not available (python module not found).")
@@ -74,6 +74,8 @@ def _load_vs_clip_from_vpy(vpy_path: Path, *, vpy_src: Path):
             "__name__": "__vapoursynth__",
             "src": str(vpy_src),
         }
+        if vpy_args:
+            init_globals.update({str(key): str(value) for key, value in vpy_args.items()})
         ns = runpy.run_path(str(vpy_path), init_globals=init_globals)
     finally:
         os.chdir(old_cwd)
@@ -115,14 +117,14 @@ def _load_vs_clip_from_vpy(vpy_path: Path, *, vpy_src: Path):
     )
 
 
-def load_vs_clip(path: Path, vs_source: str, *, vpy_src: Optional[Path] = None):
+def load_vs_clip(path: Path, vs_source: str, *, vpy_src: Optional[Path] = None, vpy_args: Optional[Dict[str, str]] = None):
     """Load a VapourSynth clip from a file or .vpy script."""
     import vapoursynth as vs  # type: ignore
 
     if path.suffix.lower() == ".vpy":
         if vpy_src is None:
             raise ValueError(f"Loading a .vpy requires vpy_src (original input path), but none was provided: {path}")
-        return _load_vs_clip_from_vpy(path, vpy_src=vpy_src)
+        return _load_vs_clip_from_vpy(path, vpy_src=vpy_src, vpy_args=vpy_args)
 
     core = vs.core
     req = (vs_source or "ffms2").lower().strip()
@@ -157,14 +159,14 @@ def load_vs_clip(path: Path, vs_source: str, *, vpy_src: Optional[Path] = None):
     raise RuntimeError(f"Could not load {path}. Last error: {last_err}")
 
 
-def compute_luma_samples(src_file: Path, skip: int, vs_source: str, *, vpy_src: Optional[Path] = None):
+def compute_luma_samples(src_file: Path, skip: int, vs_source: str, *, vpy_src: Optional[Path] = None, vpy_args: Optional[Dict[str, str]] = None):
     """Compute per-frame luma averages with optional sampling."""
     if not has_vapoursynth():
         raise RuntimeError("VapourSynth is not available (python module not found).")
     import vapoursynth as vs  # type: ignore
 
     core = vs.core
-    clip = load_vs_clip(src_file, vs_source, vpy_src=vpy_src)
+    clip = load_vs_clip(src_file, vs_source, vpy_src=vpy_src, vpy_args=vpy_args)
     if clip.format is None:
         raise RuntimeError("Unknown clip format for luma calculation.")
 

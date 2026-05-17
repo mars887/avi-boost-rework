@@ -3,26 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
-from ab_fs import ensure_dir, load_json
+from ab_fs import load_json
 from ab_scenes_io import sanitize_scenes_json
 from ab_ssimu2 import parse_ssimu2_log
-
-def state_dir(project_dir: Path) -> Path:
-    d = project_dir / ".state"
-    ensure_dir(d)
-    return d
-
-def marker_paths(project_dir: Path) -> Dict[str, Path]:
-    sd = state_dir(project_dir)
-    return {
-        "psd": sd / "PSD_FINISHED",
-        "fastpass": sd / "FASTPASS_COMPLETED",
-        "ssimu2": sd / "SSIMU2_COMPLETED",
-        "final": sd / "FINAL_SCENES_COMPLETED",
-        "rules": sd / "RULES_APPLIED",
-    }
 
 def is_valid_base_scenes(path: Path) -> bool:
     if not path.exists() or path.stat().st_size < 10:
