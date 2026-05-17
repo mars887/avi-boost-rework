@@ -6,6 +6,7 @@ import runpy
 import sys
 import ast
 import keyword
+import threading
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -350,41 +351,50 @@ def _run_pipeline_zones(args: SimpleNamespace, user_ns: Dict[str, Any], clip: An
     if not plan.default_function and not plan.rules:
         return _run_pipeline(args, user_ns, clip)
 
-    import vapoursynth as vs  # type: ignore
-
-    base_function = plan.default_function or "pipeline"
-    base = _run_named_pipeline(args, user_ns, clip, base_function)
-
-    total_frames = int(getattr(base, "num_frames", 0) or 0)
-    variant_indexes = [0] * total_frames
-    variants: List[Any] = [base]
-    variant_by_function: Dict[str, int] = {base_function: 0}
+    default_function = plan.default_function or "pipeline"
+    total_frames = int(getattr(clip, "num_frames", 0) or 0)
+    if total_frames <= 0:
+        return _run_named_pipeline(args, user_ns, clip, default_function)
+    frame_functions: List[str] = [default_function] * total_frames
 
     rule_ranges = _resolve_vpy_function_rule_ranges(
         plan,
-        clip=base,
+        clip=clip,
         source=Path(args.src).expanduser() if str(args.src or "").strip() else None,
     )
 
     for rule, ranges in zip(plan.rules, rule_ranges):
-        variant_index = variant_by_function.get(rule.function_name)
-        if variant_index is None:
-            variant = _run_named_pipeline(args, user_ns, clip, rule.function_name)
-            _validate_function_clip(base, variant, rule.function_name)
-            variant_index = len(variants)
-            variant_by_function[rule.function_name] = variant_index
-            variants.append(variant)
         for frame_range in ranges:
             for frame_no in range(frame_range.start, frame_range.end):
-                variant_indexes[frame_no] = variant_index
+                frame_functions[frame_no] = rule.function_name
 
-    if len(variants) == 1:
-        return base
+    if len(set(frame_functions)) == 1:
+        return _run_named_pipeline(args, user_ns, clip, frame_functions[0])
+
+    import vapoursynth as vs  # type: ignore
+
+    variant_cache: Dict[str, Any] = {}
+    variant_lock = threading.Lock()
+
+    def get_variant(function_name: str) -> Any:
+        cached = variant_cache.get(function_name)
+        if cached is not None:
+            return cached
+        with variant_lock:
+            cached = variant_cache.get(function_name)
+            if cached is not None:
+                return cached
+            variant = _run_named_pipeline(args, user_ns, clip, function_name)
+            _validate_function_clip(clip, variant, function_name)
+            variant_cache[function_name] = variant
+            return variant
 
     def select_frame(n: int) -> Any:
-        return variants[variant_indexes[n]]
+        if n < 0 or n >= total_frames:
+            return get_variant(default_function)
+        return get_variant(frame_functions[n])
 
-    return vs.core.std.FrameEval(base, select_frame)
+    return vs.core.std.FrameEval(clip, select_frame)
 
 
 def _run_pre_pipeline(args: SimpleNamespace, user_ns: Dict[str, Any], clip: Any) -> Any:

@@ -9,13 +9,17 @@ from utils.runner.api import RunnerLaunchConfig, RunnerRuntime
 from utils.runner.cli import build_arg_parser, run_headless
 from utils.runner.integrations import DISCORD_SECRET_HEADER, HttpRunnerIntegrationBridge
 from utils.runner.logs import RunnerLogLine
-from utils.runner.models import ActivePlanState, StageState
+from utils.runner.models import ActivePlanState, FinishedPlanState, StageState
 from utils.runner.session import SessionController, StageOutputFilter
 from utils.runner_state import (
     STAGE_AUTOBOOST_PSD_SCENE,
     STAGE_AUTOBOOST_SCENE,
     STAGE_FASTPASS,
+    STAGE_HDR_PATCH,
     STAGE_SSIMU2,
+    STAGE_ZONE_BOUNDARIES,
+    STAGE_ZONE_EDIT,
+    STAGE_ZONE_RECALC,
 )
 from utils.runner.terminal import TerminalScreen, has_terminal_repaint, strip_ansi
 
@@ -72,6 +76,46 @@ class RunnerRuntimeTest(unittest.TestCase):
             session_ids = [runtime.integration_session_id_for_source(source_dir) for source_dir in runtime.source_dirs]
             self.assertTrue(all(session_id.startswith(runtime.session_id) for session_id in session_ids))
             self.assertEqual(len(set(session_ids)), 2)
+
+    def test_zone_internal_stages_are_collapsed_in_snapshots(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            workdir = Path(temp_dir)
+            item = type(
+                "Item",
+                (),
+                {
+                    "name": "sample",
+                    "source": workdir / "source.mkv",
+                    "plan_path": workdir / "source.plan",
+                    "workdir": workdir,
+                    "mode": "full",
+                },
+            )()
+            active = ActivePlanState(
+                plan_run_id="run-a",
+                item=item,
+                stages=[
+                    StageState(STAGE_ZONE_BOUNDARIES, status="completed", started_at=1.0, ended_at=2.0),
+                    StageState(STAGE_ZONE_RECALC, status="started", started_at=3.0),
+                    StageState(STAGE_ZONE_EDIT),
+                    StageState(STAGE_HDR_PATCH),
+                ],
+            )
+
+            stages = active.snapshot()["stages"]
+            self.assertEqual([stage["name"] for stage in stages], [STAGE_ZONE_EDIT, STAGE_HDR_PATCH])
+            self.assertEqual(stages[0]["status"], "started")
+
+            failed = FinishedPlanState(
+                plan_run_id="run-a",
+                item=item,
+                status="failed",
+                started_at=1.0,
+                ended_at=2.0,
+                stage=STAGE_ZONE_RECALC,
+                message="failed",
+            )
+            self.assertEqual(failed.snapshot()["stage"], STAGE_ZONE_EDIT)
 
     def test_runtime_accepts_per_plan_mode_overrides(self) -> None:
         with TemporaryDirectory() as temp_dir:

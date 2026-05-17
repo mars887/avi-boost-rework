@@ -95,9 +95,9 @@ class VideoPrimary:
     no_dolby_vision: bool = False
     no_hdr10plus: bool = False
     attach_encode_info: bool = False
-    ab_multiplier: float = 0.7
-    ab_pos_dev: float = 5.0
-    ab_neg_dev: float = 4.0
+    ab_multiplier: Optional[float] = None
+    ab_pos_dev: Optional[float] = 5.0
+    ab_neg_dev: Optional[float] = 4.0
     ab_pos_multiplier: str = ""
     ab_neg_multiplier: str = ""
     avg_func: str = ""
@@ -442,7 +442,21 @@ def to_float(value: Any, default: float) -> float:
         return float(default)
 
 
+def to_optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in ("none", "null", "auto"):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
 def format_value(value: Any) -> str:
+    if value is None:
+        return ""
     if isinstance(value, float):
         text = f"{value:.6f}".rstrip("0").rstrip(".")
         return text if text else "0"
@@ -532,6 +546,7 @@ __all__ = [
     "bool_text",
     "parse_bool_value",
     "to_float",
+    "to_optional_float",
     "format_value",
     "coerce_scalar",
     "sanitize_component",

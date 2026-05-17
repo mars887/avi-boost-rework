@@ -33,10 +33,20 @@ cost = 5
 priority = 2
 requires = ["Fastpass"]
 
-[stages."Zone Edit"]
+[stages."Zone Boundaries"]
 cost = 2
 priority = 2
 requires = ["SSIMU2 Metrics", "Auto-Boost: Scene Detection", "Auto-Boost: PSD Scene Detection"]
+
+[stages."Zone CRF Recalc"]
+cost = 2
+priority = 2
+requires = ["Zone Boundaries"]
+
+[stages."Zone Edit"]
+cost = 2
+priority = 2
+requires = ["Zone CRF Recalc"]
 
 [stages."HDR Patch"]
 cost = 2

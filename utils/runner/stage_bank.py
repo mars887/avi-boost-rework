@@ -19,7 +19,9 @@ from utils.runner_state import (
     STAGE_MUX,
     STAGE_SSIMU2,
     STAGE_VERIFY,
+    STAGE_ZONE_BOUNDARIES,
     STAGE_ZONE_EDIT,
+    STAGE_ZONE_RECALC,
 )
 
 STAGE_BANK_CONFIG_FILE = ROOT_DIR / "StagesBankTree.toml"
@@ -56,6 +58,8 @@ KNOWN_STAGE_NAMES = {
     STAGE_AUTOBOOST_PSD_SCENE,
     STAGE_FASTPASS,
     STAGE_SSIMU2,
+    STAGE_ZONE_BOUNDARIES,
+    STAGE_ZONE_RECALC,
     STAGE_ZONE_EDIT,
     STAGE_HDR_PATCH,
     STAGE_MAINPASS,
@@ -80,10 +84,12 @@ DEFAULT_STAGE_BANK = StageBankConfig(
             requires=(STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE),
         ),
         STAGE_SSIMU2: StageBankStage(cost=5, requires=(STAGE_FASTPASS,)),
-        STAGE_ZONE_EDIT: StageBankStage(
+        STAGE_ZONE_BOUNDARIES: StageBankStage(
             cost=2,
             requires=(STAGE_SSIMU2, STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE),
         ),
+        STAGE_ZONE_RECALC: StageBankStage(cost=2, requires=(STAGE_ZONE_BOUNDARIES,)),
+        STAGE_ZONE_EDIT: StageBankStage(cost=2, requires=(STAGE_ZONE_RECALC,)),
         STAGE_HDR_PATCH: StageBankStage(cost=2, requires=(STAGE_ZONE_EDIT,)),
         STAGE_MAINPASS: StageBankStage(cost=10, priority=1, requires=(STAGE_HDR_PATCH,)),
         STAGE_AUDIO: StageBankStage(cost=2, requires=(STAGE_DEMUX,)),
@@ -225,7 +231,18 @@ def load_stage_bank_config(path: Path = STAGE_BANK_CONFIG_FILE) -> StageBankConf
 
 def effective_stage_dependencies(stage: str, stage_names: List[str], config: StageBankConfig) -> List[str]:
     available = set(stage_names)
-    return [dependency for dependency in config.stage_requires(stage) if dependency in available]
+    dependencies = [dependency for dependency in config.stage_requires(stage) if dependency in available]
+    if stage != STAGE_ZONE_EDIT or dependencies:
+        return dependencies
+    if STAGE_ZONE_RECALC in available:
+        return [STAGE_ZONE_RECALC]
+    if STAGE_ZONE_BOUNDARIES in available:
+        return [STAGE_ZONE_BOUNDARIES]
+    return [
+        dependency
+        for dependency in (STAGE_SSIMU2, STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE)
+        if dependency in available
+    ]
 
 
 def downstream_stage_names(stage: str, stage_names: List[str], config: StageBankConfig) -> List[str]:

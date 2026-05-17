@@ -13,7 +13,9 @@ from utils.runner_state import (
     STAGE_MUX,
     STAGE_SSIMU2,
     STAGE_VERIFY,
+    STAGE_ZONE_BOUNDARIES,
     STAGE_ZONE_EDIT,
+    STAGE_ZONE_RECALC,
 )
 
 from .api import RunnerIntegration, RunnerLaunchConfig, RunnerRuntime
@@ -66,7 +68,9 @@ __all__ = [
     "STAGE_MUX",
     "STAGE_SSIMU2",
     "STAGE_VERIFY",
+    "STAGE_ZONE_BOUNDARIES",
     "STAGE_ZONE_EDIT",
+    "STAGE_ZONE_RECALC",
     "SessionController",
     "StageBankConfig",
     "StageBankStage",

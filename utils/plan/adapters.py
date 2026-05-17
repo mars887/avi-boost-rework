@@ -28,6 +28,7 @@ from utils.plan.types import (
     params_map_to_tokens,
     parse_bool_value,
     to_float,
+    to_optional_float,
 )
 
 
@@ -177,9 +178,9 @@ def file_plan_from_gui_result(
         no_dolby_vision=bool(defaults.get("no_dolby_vision")),
         no_hdr10plus=bool(defaults.get("no_hdr10plus")),
         attach_encode_info=bool(defaults.get("attach_encode_info")),
-        ab_multiplier=float(defaults.get("ab_multiplier") or 0.7),
-        ab_pos_dev=float(defaults.get("ab_pos_dev") or 5.0),
-        ab_neg_dev=float(defaults.get("ab_neg_dev") or 4.0),
+        ab_multiplier=to_optional_float(defaults.get("ab_multiplier")),
+        ab_pos_dev=to_optional_float(defaults.get("ab_pos_dev")),
+        ab_neg_dev=to_optional_float(defaults.get("ab_neg_dev")),
         ab_pos_multiplier=str(defaults.get("ab_pos_multiplier") or ""),
         ab_neg_multiplier=str(defaults.get("ab_neg_multiplier") or ""),
         avg_func=str(

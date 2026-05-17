@@ -17,6 +17,8 @@ STAGE_AUTOBOOST_PSD_SCENE = "Auto-Boost: PSD Scene Detection"
 STAGE_FASTPASS = "Fastpass"
 STAGE_SSIMU2 = "SSIMU2 Metrics"
 STAGE_HDR_PATCH = "HDR Patch"
+STAGE_ZONE_BOUNDARIES = "Zone Boundaries"
+STAGE_ZONE_RECALC = "Zone CRF Recalc"
 STAGE_ZONE_EDIT = "Zone Edit"
 STAGE_MAINPASS = "Mainpass"
 STAGE_AUDIO = "Audio Tool"
@@ -25,6 +27,7 @@ STAGE_MUX = "Mux"
 CACHED_STAGE_MESSAGE = "cached"
 RUNNER_MANAGED_STATE_ENV = "PBBATCH_RUNNER_MANAGED_STATE"
 MIN_VALID_MEDIA_BYTES = 1024
+ZONE_EDIT_PIPELINE_STAGES = (STAGE_ZONE_BOUNDARIES, STAGE_ZONE_RECALC, STAGE_ZONE_EDIT)
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,15 @@ def autoboost_scene_stage(item: Any) -> str:
     return STAGE_AUTOBOOST_PSD_SCENE if scene_detection == "psd" else STAGE_AUTOBOOST_SCENE
 
 
+def is_zone_edit_pipeline_stage(stage: str) -> bool:
+    return str(stage or "") in ZONE_EDIT_PIPELINE_STAGES
+
+
+def public_stage_name(stage: str) -> str:
+    value = str(stage or "")
+    return STAGE_ZONE_EDIT if is_zone_edit_pipeline_stage(value) else value
+
+
 def display_stage_plan(item: Any) -> List[str]:
     stages = [STAGE_DEMUX, STAGE_ATTACHMENTS]
     if item.resolved.has_video_edit():
@@ -48,7 +60,7 @@ def display_stage_plan(item: Any) -> List[str]:
         if not item.resolved.plan.video.primary.no_fastpass:
             stages.extend([STAGE_FASTPASS, STAGE_SSIMU2])
         if item.mode == "full":
-            stages.extend([STAGE_ZONE_EDIT, STAGE_HDR_PATCH, STAGE_MAINPASS])
+            stages.extend([STAGE_ZONE_BOUNDARIES, STAGE_ZONE_RECALC, STAGE_ZONE_EDIT, STAGE_HDR_PATCH, STAGE_MAINPASS])
     if item.mode == "full":
         stages.extend([STAGE_AUDIO, STAGE_VERIFY, STAGE_MUX])
     return stages
@@ -152,6 +164,14 @@ def autoboost_stage4_scenes(item: Any) -> Path:
     return autoboost_project_dir(item) / name
 
 
+def zone_boundary_scenes(item: Any) -> Path:
+    return autoboost_project_dir(item) / "scenes-boundaries.json"
+
+
+def zone_recalced_scenes(item: Any) -> Path:
+    return autoboost_project_dir(item) / "scenes-recalc.json"
+
+
 def zone_edit_scenes(item: Any) -> Path:
     return autoboost_project_dir(item) / "scenes-zoned.json"
 
@@ -182,6 +202,10 @@ def stage_marker_path(item: Any, stage: str) -> Optional[Path]:
         return autoboost_state_dir(item) / "FASTPASS_COMPLETED"
     if stage == STAGE_SSIMU2:
         return autoboost_state_dir(item) / "SSIMU2_COMPLETED"
+    if stage == STAGE_ZONE_BOUNDARIES:
+        return state_dir / "ZONE_BOUNDARIES_DONE"
+    if stage == STAGE_ZONE_RECALC:
+        return state_dir / "ZONE_RECALC_DONE"
     if stage == STAGE_HDR_PATCH:
         return state_dir / "HDR_PATCH_DONE"
     if stage == STAGE_ZONE_EDIT:
@@ -208,6 +232,22 @@ def stage_marker_artifacts_valid(item: Any, stage: str) -> bool:
         return file_has_bytes(autoboost_fastpass_output(item), MIN_VALID_MEDIA_BYTES)
     if stage == STAGE_SSIMU2:
         return valid_ssimu2_log(autoboost_ssimu2_log(item))
+    if stage == STAGE_ZONE_BOUNDARIES:
+        source = autoboost_stage4_scenes(item)
+        boundaries = zone_boundary_scenes(item)
+        return (
+            valid_scenes_json(source, require_zone_overrides=True)
+            and valid_scenes_json(boundaries, require_zone_overrides=True)
+            and file_not_older_than(boundaries, source)
+        )
+    if stage == STAGE_ZONE_RECALC:
+        boundaries = zone_boundary_scenes(item)
+        recalced = zone_recalced_scenes(item)
+        return (
+            valid_scenes_json(boundaries, require_zone_overrides=True)
+            and valid_scenes_json(recalced, require_zone_overrides=True)
+            and file_not_older_than(recalced, boundaries)
+        )
     if stage == STAGE_HDR_PATCH:
         zoned = zone_edit_scenes(item)
         final = final_scenes(item)
@@ -217,7 +257,13 @@ def stage_marker_artifacts_valid(item: Any, stage: str) -> bool:
             and file_not_older_than(final, zoned)
         )
     if stage == STAGE_ZONE_EDIT:
-        return valid_scenes_json(zone_edit_scenes(item), require_zone_overrides=True)
+        recalced = zone_recalced_scenes(item)
+        zoned = zone_edit_scenes(item)
+        return (
+            valid_scenes_json(recalced, require_zone_overrides=True)
+            and valid_scenes_json(zoned, require_zone_overrides=True)
+            and file_not_older_than(zoned, recalced)
+        )
     if stage == STAGE_AUDIO:
         return valid_audio_manifest(item)
     if stage == STAGE_VERIFY:

@@ -5,6 +5,7 @@ import queue
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -63,6 +64,7 @@ from utils.runner_state import (
     STAGE_AUTOBOOST_SCENE,
     STAGE_SSIMU2,
     is_cached_stage_message,
+    public_stage_name,
 )
 
 from .api import RunnerLaunchConfig, RunnerRuntime
@@ -1444,6 +1446,7 @@ class RunnerMainWindow(QMainWindow):
         return block
 
     def _queue_log_line(self, line: RunnerLogLine) -> None:
+        line = self._public_console_log_line(line)
         key = f"{line.plan_run_id or 'session'}:{line.stage or line.stream}"
         block = self.console_blocks.get(key)
         if block is None:
@@ -1482,6 +1485,11 @@ class RunnerMainWindow(QMainWindow):
         plan_name = Path(line.plan).stem if line.plan else "Session"
         return f"{plan_name} | {line.stage or line.stream}"
 
+    @staticmethod
+    def _public_console_log_line(line: RunnerLogLine) -> RunnerLogLine:
+        stage = public_stage_name(line.stage)
+        return replace(line, stage=stage) if stage != line.stage else line
+
     def _close_console_block(self, block: ConsoleBlock) -> None:
         for key, candidate in list(self.console_blocks.items()):
             if candidate is block:
@@ -1500,7 +1508,7 @@ class RunnerMainWindow(QMainWindow):
 
     def _update_console_from_event(self, event: Dict[str, Any]) -> None:
         plan_run_id = str(event.get("plan_run_id") or "")
-        stage = str(event.get("stage") or "")
+        stage = public_stage_name(str(event.get("stage") or ""))
         if not plan_run_id or not stage:
             return
         block = self.console_blocks.get(f"{plan_run_id}:{stage}")

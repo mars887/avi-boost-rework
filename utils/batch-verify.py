@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.param_utils import apply_override
-from utils.plan_model import format_value, normalize_track_type, resolve_file_plan
+from utils.plan_model import format_value, normalize_track_type, resolve_file_plan, to_optional_float
 from utils.crop_resize import load_crop_resize_plan, validate_crop_resize_plan
 from utils.zoned_commands import ZONED_COMMAND_NAME, project_zone_command_lines
 
@@ -86,9 +86,9 @@ def build_plan_cfg(resolved_plan: Any) -> PipelineConfig:
     return PipelineConfig(
         fastpass_workers=int(primary.fastpass_workers),
         mainpass_workers=int(primary.mainpass_workers),
-        ab_multiplier=float(primary.ab_multiplier),
-        ab_pos_dev=float(primary.ab_pos_dev),
-        ab_neg_dev=float(primary.ab_neg_dev),
+        ab_multiplier=to_optional_float(primary.ab_multiplier),
+        ab_pos_dev=to_optional_float(primary.ab_pos_dev),
+        ab_neg_dev=to_optional_float(primary.ab_neg_dev),
         quality=float(primary.quality),
         fastpass_preset=str(primary.fastpass_preset or ""),
         fastpass=resolved_plan.build_fastpass_params_text(),

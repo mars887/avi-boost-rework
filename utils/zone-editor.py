@@ -276,8 +276,8 @@ class Action:
 
 @dataclass(frozen=True)
 class BoundaryOptions:
-    min_len: int = 0
-    min2_len: int = 0
+    min_len: int = 9
+    min2_len: int = 4
     magnet: int = 0
     threshold: int = 0
 
@@ -459,8 +459,8 @@ def parse_boundary_options(option_tokens: List[str]) -> BoundaryOptions:
             raise ValueError(f"Boundary option {key_text!r} must be >= 0")
         values[key_norm] = value
 
-    min_len = values["min_len"] if values["min_len"] is not None else 0
-    min2_len = values["min2_len"] if values["min2_len"] is not None else min_len
+    min_len = values["min_len"] if values["min_len"] is not None else 9
+    min2_len = values["min2_len"] if values["min2_len"] is not None else 4
     magnet = values["magnet"] if values["magnet"] is not None else 0
     threshold = values["threshold"] if values["threshold"] is not None else 0
     return BoundaryOptions(
@@ -1160,6 +1160,35 @@ def align_scene_boundaries_for_command(
     return selected_indexes
 
 
+def select_boundary_scenes_for_command(
+    scenes: List[Dict[str, Any]],
+    cmd: Command,
+) -> set[int]:
+    opts = cmd.boundary_options
+    if opts is None:
+        return set()
+
+    timeline = scene_timeline(scenes)
+    if timeline is None:
+        return set()
+    timeline_start, timeline_end = timeline
+
+    ranges = command_frame_ranges(cmd)
+    ranges = clip_ranges_to_timeline(ranges, timeline_start, timeline_end)
+    if not ranges:
+        return set()
+
+    bounds = scene_boundaries(scenes)
+    ranges = snap_ranges_to_scene_boundaries(ranges, bounds, opts)
+    ranges = merge_close_selector_ranges(ranges, opts)
+    if not ranges:
+        return set()
+
+    segments = split_scenes_for_boundary_ranges(scenes, ranges)
+    segments = merge_short_segments(segments, opts)
+    return {idx for idx, seg in enumerate(segments) if seg.selected}
+
+
 # ------------------------- scene matching -------------------------
 
 def overlap_len(a0: int, a1: int, b0: int, b1: int) -> int:
@@ -1327,7 +1356,12 @@ def apply_commands_to_scenes(
     *,
     param_step: Dict[str, Decimal],
     video: VideoInfo,
+    boundaries_only: bool = False,
+    params_only: bool = False,
 ) -> None:
+    if boundaries_only and params_only:
+        raise RuntimeError("--boundaries-only and --params-only cannot be used together")
+
     scenes = scenes_data.get("scenes") or []
     if not isinstance(scenes, list):
         raise RuntimeError("Invalid scenes.json: top-level 'scenes' must be a list.")
@@ -1344,7 +1378,22 @@ def apply_commands_to_scenes(
 
     for cmd_i, cmd in enumerate(commands, start=1):
         boundary_selected: Optional[set[int]] = None
-        if cmd.boundary_options is not None:
+        if boundaries_only:
+            if cmd.boundary_options is None:
+                continue
+            align_scene_boundaries_for_command(scenes, cmd, cmd_i)
+            for idx, sc in enumerate(scenes):
+                try:
+                    s0 = int(sc.get("start_frame"))
+                    s1 = int(sc.get("end_frame"))
+                except Exception:
+                    continue
+                ensure_scene_meta(sc, idx, s0, s1, video.fps)
+            continue
+
+        if cmd.boundary_options is not None and params_only:
+            boundary_selected = select_boundary_scenes_for_command(scenes, cmd)
+        elif cmd.boundary_options is not None:
             boundary_selected = align_scene_boundaries_for_command(scenes, cmd, cmd_i)
             for idx, sc in enumerate(scenes):
                 try:
@@ -1480,8 +1529,13 @@ def main(argv: Sequence[str]) -> int:
     )
     ap.add_argument("--no-vfr-warn", action="store_true", help="Do not warn when avg_frame_rate differs from r_frame_rate")
     ap.add_argument("--parse-check", action="store_true", help="Parse-check command(s) and exit without writing output.")
+    ap.add_argument("--boundaries-only", action="store_true", help="Apply only boundary edits from |...| commands; ignore all parameter actions.")
+    ap.add_argument("--params-only", action="store_true", help="Apply parameter actions without changing scene boundaries.")
     ap.add_argument("--log", default="", help="Optional log file path (relative to --out dir if not absolute)")
     args = ap.parse_args(list(argv))
+
+    if args.boundaries_only and args.params_only:
+        raise SystemExit("--boundaries-only and --params-only cannot be used together")
 
     if args.parse_check:
         if not args.source:
@@ -1534,7 +1588,14 @@ def main(argv: Sequence[str]) -> int:
     commands = parse_commands(raw_lines, video=video, total_frames=total_frames)
 
     # Apply
-    apply_commands_to_scenes(scenes_data, commands, param_step=DEFAULT_PARAM_STEP, video=video)
+    apply_commands_to_scenes(
+        scenes_data,
+        commands,
+        param_step=DEFAULT_PARAM_STEP,
+        video=video,
+        boundaries_only=bool(args.boundaries_only),
+        params_only=bool(args.params_only),
+    )
 
     # Save
     with open(out_path, "w", encoding="utf-8") as f:

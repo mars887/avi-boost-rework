@@ -66,6 +66,7 @@ from utils.plan.types import (
     sanitize_lang,
     strip_param_tokens,
     to_float,
+    to_optional_float,
 )
 
 __all__ = [
@@ -107,6 +108,7 @@ __all__ = [
     "bool_text",
     "parse_bool_value",
     "to_float",
+    "to_optional_float",
     "format_value",
     "coerce_scalar",
     "sanitize_component",

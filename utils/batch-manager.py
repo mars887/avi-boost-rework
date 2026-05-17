@@ -29,6 +29,7 @@ from utils.plan_model import (
     save_plan,
 )
 from utils.plan_support import collect_file_plan_paths, refresh_directory_support_files
+from utils.web_mp4 import make_web_mp4 as run_make_web_mp4
 from utils.zoned_commands import (
     LEGACY_CROP_RESIZE_COMMAND_NAME,
     LEGACY_ZONE_COMMAND_NAME,
@@ -523,23 +524,7 @@ def clear_run(group: SourceGroup) -> None:
 
 
 def make_web_mp4(group: SourceGroup) -> None:
-    if not group.result_mkv.exists():
-        print(f"[skip] missing result: {group.result_mkv}")
-        return
-    if group.result_mp4.exists():
-        print(f"[skip] mp4 exists: {group.result_mp4}")
-        return
-    cmd = [
-        "ffmpeg",
-        "-i", str(group.result_mkv),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        str(group.result_mp4),
-    ]
-    print("[cmd]", " ".join(cmd))
-    p = subprocess.run(cmd)
-    if p.returncode != 0:
-        print(f"[err] ffmpeg failed (code={p.returncode})")
+    run_make_web_mp4(group.result_mkv, group.result_mp4)
 
 
 def clear_stage_mux(group: SourceGroup) -> None:
@@ -557,9 +542,13 @@ def clear_stage_zoning(group: SourceGroup) -> None:
     clear_stage_mainpass(group)
     remove_path(group.workdir / "video" / "scenes-final.json")
     remove_path(group.workdir / "video" / "scenes-zoned.json")
+    remove_path(group.workdir / "video" / "scenes-recalc.json")
+    remove_path(group.workdir / "video" / "scenes-boundaries.json")
     remove_path(group.workdir / "video" / ".state" / "FINAL_SCENES_COMPLETED")
     remove_path(group.workdir / ".state" / "HDR_PATCH_DONE")
     remove_path(group.workdir / ".state" / "ZONE_EDIT_DONE")
+    remove_path(group.workdir / ".state" / "ZONE_RECALC_DONE")
+    remove_path(group.workdir / ".state" / "ZONE_BOUNDARIES_DONE")
 
 def clear_stage_crf_calc(group: SourceGroup) -> None:
     clear_stage_zoning(group)

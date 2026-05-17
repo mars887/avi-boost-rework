@@ -37,10 +37,13 @@ from utils.runner_state import (
     STAGE_MUX,
     STAGE_SSIMU2,
     STAGE_VERIFY,
+    STAGE_ZONE_BOUNDARIES,
     STAGE_ZONE_EDIT,
+    STAGE_ZONE_RECALC,
     clear_stage_marker,
     file_not_older_than,
     is_cached_stage_message,
+    public_stage_name,
     stage_completion_artifacts_valid,
     stage_resume_info,
     write_stage_marker,
@@ -84,6 +87,12 @@ CHILD_EVENT_ENV = "PBBATCH_RUNNER_CHILD_EVENTS_JSONL"
 SESSION_ID_ENV = "PBBATCH_RUNNER_SESSION_ID"
 PLAN_RUN_ID_ENV = "PBBATCH_RUNNER_PLAN_RUN_ID"
 TERMINAL_STAGE_STATUSES = {"completed", "failed", "skipped"}
+
+
+def _optional_arg_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 class WinPtyProcessAdapter:
@@ -451,17 +460,17 @@ class SessionController:
     def _current_stage_name(state: ActivePlanState) -> str:
         running = [stage for stage in state.stages if stage.status == "started"]
         if running:
-            return running[-1].name
+            return public_stage_name(running[-1].name)
         completed = [stage for stage in state.stages if stage.status == "completed"]
         if completed:
-            return completed[-1].name
+            return public_stage_name(completed[-1].name)
         return ""
 
     @staticmethod
     def _current_stage_names(state: ActivePlanState) -> str:
-        running = [stage.name for stage in state.stages if stage.status == "started"]
+        running = [public_stage_name(stage.name) for stage in state.stages if stage.status == "started"]
         if running:
-            return ", ".join(running)
+            return ", ".join(dict.fromkeys(running))
         return SessionController._current_stage_name(state)
 
     def request_pause_after_current(self, source_dir: str = "") -> None:
@@ -1354,7 +1363,7 @@ class SessionController:
         stage_message = self._stage_cached_message(item, stage)
         cached_before = bool(stage_message)
         with self.lock:
-            self.current_stage = stage
+            self.current_stage = public_stage_name(stage)
             active = self._active_state_for_item(item)
             plan_run_id = active.plan_run_id if active is not None else self.current_plan_run_id
         if cached_before:
@@ -1730,17 +1739,23 @@ class SessionController:
                 auto_boost_cmd.extend(["--fast-preset", str(primary.fastpass_preset)])
             if primary.preset:
                 auto_boost_cmd.extend(["--preset", str(primary.preset)])
-            if str(primary.ab_multiplier).strip():
-                auto_boost_cmd.extend(["-a", str(primary.ab_multiplier)])
-            elif str(primary.ab_pos_multiplier).strip() and str(primary.ab_neg_multiplier).strip():
-                auto_boost_cmd.extend(["--pos-dev-multiplier", str(primary.ab_pos_multiplier)])
-                auto_boost_cmd.extend(["--neg-dev-multiplier", str(primary.ab_neg_multiplier)])
-            if str(primary.ab_pos_dev).strip():
-                auto_boost_cmd.extend(["--max-positive-dev", str(primary.ab_pos_dev)])
-            if str(primary.ab_neg_dev).strip():
-                auto_boost_cmd.extend(["--max-negative-dev", str(primary.ab_neg_dev)])
-            if str(primary.avg_func).strip():
-                auto_boost_cmd.extend(["--avg-func", str(primary.avg_func).strip()])
+            ab_multiplier = _optional_arg_text(primary.ab_multiplier)
+            ab_pos_multiplier = _optional_arg_text(primary.ab_pos_multiplier)
+            ab_neg_multiplier = _optional_arg_text(primary.ab_neg_multiplier)
+            ab_pos_dev = _optional_arg_text(primary.ab_pos_dev)
+            ab_neg_dev = _optional_arg_text(primary.ab_neg_dev)
+            avg_func = _optional_arg_text(primary.avg_func)
+            if ab_multiplier:
+                auto_boost_cmd.extend(["-a", ab_multiplier])
+            elif ab_pos_multiplier and ab_neg_multiplier:
+                auto_boost_cmd.extend(["--pos-dev-multiplier", ab_pos_multiplier])
+                auto_boost_cmd.extend(["--neg-dev-multiplier", ab_neg_multiplier])
+            if ab_pos_dev:
+                auto_boost_cmd.extend(["--max-positive-dev", ab_pos_dev])
+            if ab_neg_dev:
+                auto_boost_cmd.extend(["--max-negative-dev", ab_neg_dev])
+            if avg_func:
+                auto_boost_cmd.extend(["--avg-func", avg_func])
             if details.fastpass_filter:
                 auto_boost_cmd.extend(["-f", str(details.fastpass_filter)])
 
@@ -1749,6 +1764,27 @@ class SessionController:
                 if item.mode == "fastpass":
                     cmd.append("--stop-before-stage4")
                 cmd.extend(["--run-stages", ",".join(run_stages)])
+                return cmd
+
+            def auto_boost_recalc_cmd(base_scenes: Path, out_scenes: Path) -> List[str]:
+                cmd = list(auto_boost_cmd)
+
+                def set_option(key: str, value: str) -> None:
+                    try:
+                        idx = cmd.index(key)
+                    except ValueError:
+                        cmd.extend([key, value])
+                        return
+                    if idx + 1 < len(cmd):
+                        cmd[idx + 1] = value
+                    else:
+                        cmd.append(value)
+
+                set_option("--sdm", "psd")
+                set_option("--base-scenes", str(base_scenes))
+                set_option("--out-scenes", str(out_scenes))
+                set_option("--log", str(log_dir / "04.5_zone_recalc.log"))
+                cmd.extend(["--run-stages", "base-scenes"])
                 return cmd
 
             scene_detection = str(primary.scene_detection or "").strip().lower()
@@ -1764,6 +1800,31 @@ class SessionController:
                 commands.append((STAGE_SSIMU2, auto_boost_cmd_for("ssimu2", "base-scenes")))
 
             if item.mode == "full":
+                boundary_scenes_path = workdir / "video" / "scenes-boundaries.json"
+                recalced_scenes_path = workdir / "video" / "scenes-recalc.json"
+                zoned_scenes_path = workdir / "video" / "scenes-zoned.json"
+
+                commands.append(
+                    (
+                        STAGE_ZONE_BOUNDARIES,
+                        [
+                            self.toolchain.vs_python_exe,
+                            str(UTILS_DIR / "zone-editor.py"),
+                            "--source",
+                            str(paths.source),
+                            "--scenes",
+                            str(workdir / "video" / "scenes.json"),
+                            "--out",
+                            str(boundary_scenes_path),
+                            "--command",
+                            str(paths.zone_file),
+                            "--boundaries-only",
+                            "--log",
+                            str(log_dir / "04_zone_boundaries.log"),
+                        ],
+                    )
+                )
+                commands.append((STAGE_ZONE_RECALC, auto_boost_recalc_cmd(boundary_scenes_path, recalced_scenes_path)))
                 commands.append(
                     (
                         STAGE_ZONE_EDIT,
@@ -1773,13 +1834,14 @@ class SessionController:
                             "--source",
                             str(paths.source),
                             "--scenes",
-                            str(workdir / "video" / "scenes.json"),
+                            str(recalced_scenes_path),
                             "--out",
-                            str(workdir / "video" / "scenes-zoned.json"),
+                            str(zoned_scenes_path),
                             "--command",
                             str(paths.zone_file),
+                            "--params-only",
                             "--log",
-                            str(log_dir / "04_zone_edit.log"),
+                            str(log_dir / "05_zone_edit.log"),
                         ],
                     )
                 )
@@ -1790,7 +1852,7 @@ class SessionController:
                     "--source",
                     str(paths.source),
                     "--scenes",
-                    str(workdir / "video" / "scenes-zoned.json"),
+                    str(zoned_scenes_path),
                     "--output",
                     str(workdir / "video" / "scenes-final.json"),
                     "--workdir",
@@ -1798,7 +1860,7 @@ class SessionController:
                     "--encoder",
                     str(primary.encoder),
                     "--log",
-                    str(log_dir / "05_hdr_patch.log"),
+                    str(log_dir / "05.5_hdr_patch.log"),
                 ]
                 if primary.strict_sdr_8bit:
                     hdr_cmd.append("--no-hdr10")

@@ -41,6 +41,7 @@ from utils.plan.types import (
     parse_bool_value,
     sanitize_component,
     to_float,
+    to_optional_float,
 )
 from utils.zoned_commands import zoned_command_path
 
@@ -170,6 +171,14 @@ def _toml_scalar(value: Any) -> str:
         text = f"{value:.6f}".rstrip("0").rstrip(".")
         return text if text else "0"
     return _toml_string(str(value))
+
+
+def _toml_optional_scalar(value: Any) -> str:
+    if value is None:
+        return _toml_string("")
+    if isinstance(value, str) and not value.strip():
+        return _toml_string("")
+    return _toml_scalar(value)
 
 
 def _convert_param_line_to_toml(raw_line: str) -> str:
@@ -419,9 +428,17 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
                 no_dolby_vision=parse_bool_value(video_color_data.get("no_dolby_vision", video_primary_data.get("no_dolby_vision")), False),
                 no_hdr10plus=parse_bool_value(video_color_data.get("no_hdr10plus", video_primary_data.get("no_hdr10plus")), False),
                 attach_encode_info=parse_bool_value(mux_data.get("attach_encode_info", video_primary_data.get("attach_encode_info")), False),
-                ab_multiplier=to_float(video_primary_data.get("ab_multiplier"), 0.7),
-                ab_pos_dev=to_float(video_primary_data.get("ab_pos_dev"), 5.0),
-                ab_neg_dev=to_float(video_primary_data.get("ab_neg_dev"), 4.0),
+                ab_multiplier=to_optional_float(video_primary_data.get("ab_multiplier")),
+                ab_pos_dev=(
+                    to_optional_float(video_primary_data.get("ab_pos_dev"))
+                    if "ab_pos_dev" in video_primary_data
+                    else None
+                ),
+                ab_neg_dev=(
+                    to_optional_float(video_primary_data.get("ab_neg_dev"))
+                    if "ab_neg_dev" in video_primary_data
+                    else None
+                ),
                 ab_pos_multiplier=str(video_primary_data.get("ab_pos_multiplier") or ""),
                 ab_neg_multiplier=str(video_primary_data.get("ab_neg_multiplier") or ""),
                 avg_func=str(
@@ -563,11 +580,11 @@ def _dump_file_plan(plan: FilePlan) -> str:
             "[video.primary]",
             f"fastpass_workers = {int(plan.video.primary.fastpass_workers)}",
             f"mainpass_workers = {int(plan.video.primary.mainpass_workers)}",
-            f"ab_pos_dev = {_toml_scalar(plan.video.primary.ab_pos_dev)}",
+            f"ab_pos_dev = {_toml_optional_scalar(plan.video.primary.ab_pos_dev)}",
             f"ab_pos_multiplier = {_toml_string(str(plan.video.primary.ab_pos_multiplier or ''))}",
-            f"ab_multiplier = {_toml_scalar(plan.video.primary.ab_multiplier)}",
+            f"ab_multiplier = {_toml_optional_scalar(plan.video.primary.ab_multiplier)}",
             f"ab_neg_multiplier = {_toml_string(str(plan.video.primary.ab_neg_multiplier or ''))}",
-            f"ab_neg_dev = {_toml_scalar(plan.video.primary.ab_neg_dev)}",
+            f"ab_neg_dev = {_toml_optional_scalar(plan.video.primary.ab_neg_dev)}",
             f"avg_func = {_toml_string(str(plan.video.primary.avg_func or ''))}",
             f"fastpass_preset = {_toml_scalar(coerce_scalar(plan.video.primary.fastpass_preset))}",
             "",

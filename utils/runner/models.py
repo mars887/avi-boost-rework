@@ -14,6 +14,11 @@ from utils.runner_source_info import (
     output_path_for_item,
     safe_file_size,
 )
+from utils.runner_state import (
+    CACHED_STAGE_MESSAGE,
+    is_zone_edit_pipeline_stage,
+    public_stage_name,
+)
 
 
 @dataclass
@@ -40,6 +45,81 @@ class StageState:
             "ended_at": self.ended_at,
             "elapsed_seconds": round(elapsed, 3),
         }
+
+
+def _first_nonzero(values: List[float]) -> float:
+    nonzero = [value for value in values if value > 0]
+    return min(nonzero) if nonzero else 0.0
+
+
+def _last_nonzero(values: List[float]) -> float:
+    nonzero = [value for value in values if value > 0]
+    return max(nonzero) if nonzero else 0.0
+
+
+def _visible_zone_edit_snapshot(stages: List[StageState]) -> Dict[str, Any]:
+    statuses = [str(stage.status or "pending").lower() for stage in stages]
+    failed = next((stage for stage in stages if str(stage.status or "").lower() == "failed"), None)
+    running = [stage for stage in stages if str(stage.status or "").lower() == "started"]
+    successful = {"completed", "skipped"}
+
+    if failed is not None:
+        status = "failed"
+        message = failed.message
+        progress = failed.progress
+        details = dict(failed.details)
+    elif running:
+        current = running[-1]
+        status = "started"
+        message = ""
+        progress = current.progress
+        details = dict(current.details)
+    elif statuses and all(status in successful for status in statuses):
+        status = "completed"
+        message = CACHED_STAGE_MESSAGE if all(stage.message == CACHED_STAGE_MESSAGE for stage in stages) else ""
+        progress = None
+        details = {}
+    elif any(status in successful for status in statuses):
+        status = "started"
+        message = ""
+        progress = None
+        details = {}
+    else:
+        status = "pending"
+        message = ""
+        progress = None
+        details = {}
+
+    started_at = _first_nonzero([float(stage.started_at or 0.0) for stage in stages])
+    ended_at = _last_nonzero([float(stage.ended_at or 0.0) for stage in stages]) if status in ("completed", "failed", "skipped") else 0.0
+    elapsed = 0.0
+    if started_at:
+        elapsed = (ended_at or time.time()) - started_at
+
+    return {
+        "name": public_stage_name(stages[0].name if stages else ""),
+        "status": status,
+        "message": message,
+        "progress": progress,
+        "details": details,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "elapsed_seconds": round(elapsed, 3),
+    }
+
+
+def visible_stage_snapshots(stages: List[StageState]) -> List[Dict[str, Any]]:
+    zone_stages = [stage for stage in stages if is_zone_edit_pipeline_stage(stage.name)]
+    emitted_zone = False
+    snapshots: List[Dict[str, Any]] = []
+    for stage in stages:
+        if is_zone_edit_pipeline_stage(stage.name):
+            if not emitted_zone:
+                snapshots.append(_visible_zone_edit_snapshot(zone_stages))
+                emitted_zone = True
+            continue
+        snapshots.append(stage.snapshot())
+    return snapshots
 
 
 @dataclass
@@ -87,7 +167,7 @@ class ActivePlanState:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "elapsed_seconds": round(elapsed, 3),
-            "stages": [stage.snapshot() for stage in self.stages],
+            "stages": visible_stage_snapshots(self.stages),
         }
 
 
@@ -124,7 +204,7 @@ class FinishedPlanState:
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "elapsed_seconds": round(max(0.0, self.ended_at - self.started_at), 3),
-            "stage": self.stage,
+            "stage": public_stage_name(self.stage),
             "message": self.message,
         }
 
