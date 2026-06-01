@@ -8,13 +8,12 @@ Entry-point CLI that wires the pipeline stages together.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
-
-import os
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -23,7 +22,7 @@ if ROOT not in sys.path:
 
 from ab_fastpass import run_fastpass_av1an
 from ab_encoder import normalize_encoder, resolve_preset
-from ab_fs import ensure_dir, ensure_exists, load_json, save_json, safe_unlink, touch, which_or_none
+from ab_fs import ensure_dir, ensure_exists, load_json, save_json, safe_unlink, which_or_none
 from ab_logging import eprint, setup_logging
 from ab_nvof import (
     build_nvof_schedule,
@@ -46,21 +45,92 @@ from ab_scenes_io import (
     sanitize_scenes_json,
     scenes_to_ranges,
     write_base_scenes_from_av1an,
+    write_single_scene_base,
     write_uniform_scenes,
 )
+from ab_runner_events import emit_runner_child_event
 from ab_ssimu2 import calculate_ssimu2
 from ab_state import (
     is_valid_base_scenes,
     is_valid_final_scenes,
     is_valid_ssimu2_log,
-    marker_paths,
 )
+
+
+def vspipe_args_to_dict(items: List[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for item in items or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if "=" not in text:
+            out[text] = ""
+            continue
+        key, value = text.split("=", 1)
+        key = key.strip()
+        if key:
+            out[key] = value
+    return out
+
+
+RUN_STAGE_ALIASES = {
+    "1": {1},
+    "stage1": {1},
+    "psd": {1},
+    "psd-scene": {1},
+    "psd-scene-detection": {1},
+    "none": {1},
+    "no-scene": {1},
+    "no-scene-detection": {1},
+    "2": {2},
+    "stage2": {2},
+    "fastpass": {2},
+    "fast-pass": {2},
+    "av1an-scene": {2},
+    "av1an-scene-detection": {2},
+    "3": {3},
+    "stage3": {3},
+    "ssimu2": {3},
+    "ssimu2-metrics": {3},
+    "metrics": {3},
+    "4": {4},
+    "stage4": {4},
+    "base-scenes": {4},
+    "base_scenes": {4},
+    "crf": {4},
+    "write-crf": {4},
+    "5": {5},
+    "stage5": {5},
+    "rules": {5},
+    "all": {1, 2, 3, 4, 5},
+}
+
+
+def resolve_run_stages(items: List[str], legacy_stage: int) -> set[int]:
+    if not items:
+        return {1, 2, 3, 4, 5} if int(legacy_stage) == 0 else {int(legacy_stage)}
+    out: set[int] = set()
+    for item in items:
+        for token in str(item or "").replace(",", " ").split():
+            key = token.strip().lower().replace("_", "-")
+            if not key:
+                continue
+            stages = RUN_STAGE_ALIASES.get(key)
+            if stages is None:
+                raise RuntimeError(f"Unknown --run-stages token: {token}")
+            out.update(stages)
+    if not out:
+        raise RuntimeError("--run-stages did not select any stages")
+    return out
+
 
 def main() -> int:
     """CLI entry point that orchestrates stages and resume logic."""
     parser = argparse.ArgumentParser(description="auto-boost 2.8.json + av1an fastpass + per-scene CRF zones + resume.")
     parser.add_argument("-s", "--stage", type=int, default=0,
-                        help="Stage: 0=all, 1=PSD scenes (sdm=psd), 2=fastpass, 3=metrics, 4=write base scenes.json, 5=apply rules.")
+                        help="Stage: 0=all, 1=scene setup (psd/none), 2=fastpass, 3=metrics, 4=write base scenes.json, 5=apply rules.")
+    parser.add_argument("--run-stages", action="append", default=[],
+                        help="Comma/space separated stage names to run: psd, none, fastpass, ssimu2, base-scenes, rules, all.")
     parser.add_argument("-i", "--input", required=True, help="Input video file (source).")
     parser.add_argument("-t", "--temp", default=None,
                         help="Project directory. Default: <input stem>_autoboost next to input.")
@@ -68,8 +138,8 @@ def main() -> int:
                         help="Optional log file path (relative to --temp if not absolute).")
     parser.add_argument("--force", action="store_true",
                         help="Start from scratch: clear resume markers and remove generated artifacts in the project dir.")
-    parser.add_argument("--sdm", choices=["psd", "av1an"], default="psd",
-                        help="Scene detection mode: psd (default, run PSD and pass --scenes) or av1an (use av1an internal detection).")
+    parser.add_argument("--sdm", choices=["psd", "av1an", "none"], default="psd",
+                        help="Scene detection mode: psd (default, run PSD and pass --scenes), av1an (internal detection), or none (single scene).")
     parser.add_argument("--no-fastpass", action="store_true",
                         help="Skip fast-pass and metrics; write uniform scenes with base CRF.")
     parser.add_argument("--stop-before-stage4", "--fastpass-only", action="store_true",
@@ -94,6 +164,10 @@ def main() -> int:
                         help="Optional .vpy path for fast-pass input (used for av1an -i). Adds --vspipe-args src=<input>.")
     parser.add_argument("--fastpass-proxy", default=None,
                         help="Optional av1an --proxy path for fast-pass. Adds --proxy and --vspipe-args src=<input>.")
+    parser.add_argument("--fastpass-vspipe-arg", action="append", default=[],
+                        help="Extra key=value argument forwarded to av1an --vspipe-args for --fastpass-vpy.")
+    parser.add_argument("--av1an", default="av1an",
+                        help="Path to av1an executable for fork-aware fast-pass invocation.")
     parser.add_argument("--encoder", default="svt-av1",
                         help="Encoder for fast-pass and scene overrides: svt-av1 (default), libx265/x265.")
     parser.add_argument("--workers", type=int, default=8,
@@ -121,6 +195,18 @@ def main() -> int:
                         help="av1an --log-file path. 'auto' => <project>/av1an.log, 'none' => disable.")
     parser.add_argument("--av1an-log-level", default="info",
                         help="av1an --log-level (e.g. info, debug, warn).")
+    parser.add_argument("--av1an-progress-jsonl", default="",
+                        help="Optional av1an --progress-jsonl sidecar path for machine-readable progress.")
+    parser.add_argument("--chunk-order", default=None,
+                        help="Fork-only av1an chunk order. Accepted but currently not applied to fast-pass.")
+    parser.add_argument("--encoder-path", default="",
+                        help="Fork-only av1an encoder executable override.")
+    parser.add_argument("--fast-interrupt", action="store_true",
+                        help="Fork-only av1an flag for faster interruption handling.")
+    parser.add_argument("--av1an-extra-split-sec", type=int, default=15,
+                        help="av1an --extra-split-sec for --sdm av1an.")
+    parser.add_argument("--av1an-min-scene-len", type=int, default=24,
+                        help="av1an --min-scene-len for --sdm av1an.")
 
     # Rules
     rules_group = parser.add_mutually_exclusive_group()
@@ -165,7 +251,7 @@ def main() -> int:
     parser.add_argument("--neg-dev-multiplier", type=float, default=None,
                         help="Multiplier used when adj is negative (requires --pos-dev-multiplier if set).")
     parser.add_argument("--avg-func", default="",
-                        help="Adjust metric avg: +N/-N (shift), !N (set), or target%percent (move toward target by percent).")
+                        help="Adjust metric avg: +N/-N (shift), !N (set), target%%percent, or downpercent%%target%%uppercent.")
 
     args = parser.parse_args()
     args.encoder = normalize_encoder(args.encoder)
@@ -174,8 +260,8 @@ def main() -> int:
 
     if args.rule_test and not args.verbose:
         args.verbose = True
-    if args.sdm == "av1an" and args.base_scenes:
-        raise RuntimeError("--base-scenes cannot be used with --sdm av1an (av1an generates scenes during stage 2).")
+    if args.sdm in ("av1an", "none") and args.base_scenes:
+        raise RuntimeError(f"--base-scenes cannot be used with --sdm {args.sdm}.")
 
     input_file = Path(args.input).expanduser().resolve()
     ensure_exists(input_file, "Input file")
@@ -198,6 +284,10 @@ def main() -> int:
     fastpass_out = Path(args.fastpass_out).expanduser().resolve() if args.fastpass_out else (fastpass_dir / f"{input_file.stem}.fastpass.mkv")
     fastpass_vpy = Path(args.fastpass_vpy).expanduser().resolve() if args.fastpass_vpy else None
     fastpass_proxy = Path(args.fastpass_proxy).expanduser().resolve() if args.fastpass_proxy else None
+    fastpass_vspipe_args = [str(item) for item in (args.fastpass_vspipe_arg or []) if str(item).strip()]
+    fastpass_vpy_args = vspipe_args_to_dict(fastpass_vspipe_args)
+    if fastpass_vpy is not None and "src" not in fastpass_vpy_args:
+        fastpass_vpy_args["src"] = str(input_file)
     hdr_patch_script = Path(args.hdr_patch_script).expanduser().resolve()
     if args.fastpass_hdr:
         ensure_exists(hdr_patch_script, "HDR patch script")
@@ -205,6 +295,7 @@ def main() -> int:
     # Metrics reference: if fast-pass input is a .vpy (may crop/scale), compare against that pipeline, not the original source.
     metrics_ref_src = fastpass_vpy if fastpass_vpy is not None else input_file
     metrics_ref_vpy_src = input_file if fastpass_vpy is not None else None
+    metrics_ref_vpy_args = fastpass_vpy_args if fastpass_vpy is not None else None
 
     ssimu2_log = fastpass_dir / f"{input_file.stem}_ssimu2.log"
 
@@ -218,14 +309,47 @@ def main() -> int:
         av1an_log_file = Path(args.av1an_log_file).expanduser()
         if not av1an_log_file.is_absolute():
             av1an_log_file = project_dir / av1an_log_file
+    av1an_progress_jsonl = Path(str(args.av1an_progress_jsonl)).expanduser() if str(args.av1an_progress_jsonl).strip() else None
+    if av1an_progress_jsonl is not None and not av1an_progress_jsonl.is_absolute():
+        av1an_progress_jsonl = project_dir / av1an_progress_jsonl
 
-    marks = marker_paths(project_dir)
+    run_stages = resolve_run_stages([str(item) for item in (args.run_stages or [])], int(args.stage))
+
+    def should_run(*stage_numbers: int) -> bool:
+        return bool(run_stages.intersection({int(n) for n in stage_numbers}))
+
+    def only_stage(stage_number: int) -> bool:
+        return run_stages == {int(stage_number)}
+
+    def is_single_scene_base_scenes(path: Path) -> bool:
+        if not path.exists():
+            return False
+        try:
+            obj = sanitize_scenes_json(load_json(path))
+            scenes = obj.get("scenes") or obj.get("split_scenes") or []
+            if len(scenes) != 1:
+                return False
+            scene = dict(scenes[0])
+            return (
+                int(obj.get("frames") or 0) > 0
+                and int(scene.get("start_frame")) == 0
+                and int(scene.get("end_frame")) == int(obj.get("frames"))
+            )
+        except Exception:
+            return False
+
+    def ensure_none_base_scenes() -> None:
+        if is_single_scene_base_scenes(base_scenes_path):
+            print(f"[resume] one-scene base scenes already completed: {base_scenes_path}")
+            return
+        write_single_scene_base(input_file, base_scenes_path)
 
     rule_name: Optional[str] = None
     compiled_rules: Optional[Any] = None
     required_metrics: List[str] = []
-    if args.stage in (0, 5):
+    if should_run(5):
         if args.rules or args.rules_inline:
+            eprint("[warn] rules execute as trusted Python code; do not run untrusted rule files.")
             if args.rules:
                 rules_path = Path(args.rules).expanduser().resolve()
                 ensure_exists(rules_path, "Rules file")
@@ -244,9 +368,7 @@ def main() -> int:
             eprint("[warn] --rules-required-metrics specified without --rules/--rules-inline; ignoring.")
 
     if args.force:
-        print("[force] clearing state markers and generated outputs...")
-        for mp in marks.values():
-            safe_unlink(mp)
+        print("[force] clearing generated outputs...")
 
         # Remove generated artifacts (do not remove user-provided --base-scenes).
         if not args.base_scenes:
@@ -265,24 +387,33 @@ def main() -> int:
         ensure_dir(av1an_temp)
 
     # Tool sanity checks (warnings only)
-    if not which_or_none("av1an"):
-        eprint("[warn] 'av1an' not found in PATH. Stages 2+ will fail unless you add it to PATH.")
+    if not which_or_none(str(args.av1an)):
+        eprint(f"[warn] av1an executable not found: {args.av1an}")
     # -----------------
     # Stage 1: PSD (scene detection)
     # -----------------
-    if args.stage in (0, 1):
+    if should_run(1):
         if args.sdm == "av1an":
-            if args.stage == 1:
+            if only_stage(1):
                 print("[skip] --sdm av1an uses av1an scene detection during stage 2.")
+        elif args.sdm == "none":
+            emit_runner_child_event("Auto-Boost: Scene Detection", "started", source=input_file, workdir=project_dir)
+            try:
+                ensure_none_base_scenes()
+            except Exception as exc:
+                emit_runner_child_event("Auto-Boost: Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                raise
+            emit_runner_child_event("Auto-Boost: Scene Detection", "completed", source=input_file, workdir=project_dir)
         else:
             if args.base_scenes:
                 print(f"[skip] using existing base scenes: {base_scenes_path}")
                 if not is_valid_base_scenes(base_scenes_path):
                     raise RuntimeError("--base-scenes provided but is not a valid scenes.json (or cannot be sanitized).")
-                touch(marks["psd"])
+                emit_runner_child_event("Auto-Boost: PSD Scene Detection", "completed", message="using_existing_base_scenes", source=input_file, workdir=project_dir)
             else:
-                if marks["psd"].exists() and is_valid_base_scenes(base_scenes_path):
+                if is_valid_base_scenes(base_scenes_path):
                     print(f"[resume] PSD already completed: {base_scenes_path}")
+                    emit_runner_child_event("Auto-Boost: PSD Scene Detection", "completed", message="resume", source=input_file, workdir=project_dir)
                 else:
                     psd_script = Path(args.psd_script).expanduser()
                     if not psd_script.exists():
@@ -290,92 +421,142 @@ def main() -> int:
                         if cand.exists():
                             psd_script = cand
                     psd_python = Path(args.psd_python).expanduser() if args.psd_python else None
-                    run_psd(psd_script=psd_script, psd_python=psd_python, input_file=input_file,
-                            base_scenes_path=base_scenes_path, extra_args=args.psd_args)
-                    touch(marks["psd"])
+                    emit_runner_child_event("Auto-Boost: PSD Scene Detection", "started", source=input_file, workdir=project_dir)
+                    try:
+                        run_psd(psd_script=psd_script, psd_python=psd_python, input_file=input_file,
+                                base_scenes_path=base_scenes_path, extra_args=args.psd_args)
+                    except Exception as exc:
+                        emit_runner_child_event("Auto-Boost: PSD Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                        raise
+                    emit_runner_child_event("Auto-Boost: PSD Scene Detection", "completed", source=input_file, workdir=project_dir)
 
     # -----------------
     # Stage 2: fast-pass
     # -----------------
-    if args.stage in (0, 2):
-        if args.no_fastpass and args.sdm == "psd":
-            print("[skip] no-fastpass enabled; fast-pass skipped for sdm=psd.")
+    if should_run(2):
+        if args.no_fastpass and args.sdm in ("psd", "none"):
+            print(f"[skip] no-fastpass enabled; fast-pass skipped for sdm={args.sdm}.")
+            emit_runner_child_event("Fastpass", "skipped", message="no_fastpass", source=input_file, workdir=project_dir)
         else:
             if args.no_fastpass and args.sdm == "av1an":
                 scenes_hint = av1an_temp / "scenes.json"
-                if marks["fastpass"].exists() and scenes_hint.exists():
+                if scenes_hint.exists():
                     print(f"[resume] scene-only already completed: {scenes_hint}")
+                    emit_runner_child_event("Auto-Boost: Scene Detection", "completed", message="resume", source=input_file, workdir=project_dir)
                 else:
                     if fastpass_vpy is not None:
                         ensure_exists(fastpass_vpy, "Fast-pass vpy")
                     if fastpass_proxy is not None:
                         ensure_exists(fastpass_proxy, "Fast-pass proxy")
-                    run_fastpass_av1an(
-                        input_file=input_file,
-                        fastpass_vpy=fastpass_vpy,
-                        fastpass_proxy=fastpass_proxy,
-                        output_file=fastpass_out,
-                        scenes_path=base_scenes_path,
-                        av1an_temp=av1an_temp,
-                        sdm=str(args.sdm),
-                        workers=int(args.workers),
-                        lp=int(args.lp),
-                        fast_preset=fastpass_preset,
-                        fast_crf=float(args.quality),
-                        encoder=str(args.encoder),
-                        video_params=str(args.video_params),
-                        ffmpeg_arg=str(args.ffmpeg),
-                        verbose=bool(args.verbose),
-                        keep=bool(args.keep),
-                        sc_only=True,
-                        log_file=av1an_log_file,
-                        log_level=(
-                            None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
-                            else str(args.av1an_log_level).strip()
-                        ),
-                        fastpass_hdr=bool(args.fastpass_hdr),
-                        hdr_patch_script=hdr_patch_script,
-                    )
-                    touch(marks["fastpass"])
+                    emit_runner_child_event("Auto-Boost: Scene Detection", "started", source=input_file, workdir=project_dir)
+                    try:
+                        run_fastpass_av1an(
+                            av1an_exe=str(args.av1an),
+                            input_file=input_file,
+                            fastpass_vpy=fastpass_vpy,
+                            fastpass_proxy=fastpass_proxy,
+                            output_file=fastpass_out,
+                            scenes_path=base_scenes_path,
+                            av1an_temp=av1an_temp,
+                            sdm=str(args.sdm),
+                            workers=int(args.workers),
+                            lp=int(args.lp),
+                            fast_preset=fastpass_preset,
+                            fast_crf=float(args.quality),
+                            encoder=str(args.encoder),
+                            video_params=str(args.video_params),
+                            ffmpeg_arg=str(args.ffmpeg),
+                            verbose=bool(args.verbose),
+                            keep=bool(args.keep),
+                            sc_only=True,
+                            log_file=av1an_log_file,
+                            log_level=(
+                                None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
+                                else str(args.av1an_log_level).strip()
+                            ),
+                            progress_jsonl=av1an_progress_jsonl,
+                            fastpass_hdr=bool(args.fastpass_hdr),
+                            hdr_patch_script=hdr_patch_script,
+                            chunk_order=str(args.chunk_order or ""),
+                            encoder_path=str(args.encoder_path or ""),
+                            fast_interrupt=bool(args.fast_interrupt),
+                            vspipe_args=fastpass_vspipe_args,
+                            av1an_extra_split_sec=int(args.av1an_extra_split_sec),
+                            av1an_min_scene_len=int(args.av1an_min_scene_len),
+                        )
+                    except Exception as exc:
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                        raise
+                    emit_runner_child_event("Auto-Boost: Scene Detection", "completed", source=input_file, workdir=project_dir)
             else:
-                if marks["fastpass"].exists() and fastpass_out.exists() and fastpass_out.stat().st_size > 0:
+                if fastpass_out.exists() and fastpass_out.stat().st_size > 0:
                     print(f"[resume] fast-pass already completed: {fastpass_out}")
+                    if args.sdm == "av1an":
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "completed", message="resume", source=input_file, workdir=project_dir)
+                    emit_runner_child_event("Fastpass", "completed", message="resume", source=input_file, workdir=project_dir)
                 else:
+                    if args.sdm == "none":
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "started", source=input_file, workdir=project_dir)
+                        try:
+                            ensure_none_base_scenes()
+                        except Exception as exc:
+                            emit_runner_child_event("Auto-Boost: Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                            raise
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "completed", source=input_file, workdir=project_dir)
                     if fastpass_vpy is not None:
                         ensure_exists(fastpass_vpy, "Fast-pass vpy")
                     if fastpass_proxy is not None:
                         ensure_exists(fastpass_proxy, "Fast-pass proxy")
-                    run_fastpass_av1an(
-                        input_file=input_file,
-                        fastpass_vpy=fastpass_vpy,
-                        fastpass_proxy=fastpass_proxy,
-                        output_file=fastpass_out,
-                        scenes_path=base_scenes_path,
-                        av1an_temp=av1an_temp,
-                        sdm=str(args.sdm),
-                        workers=int(args.workers),
-                        lp=int(args.lp),
-                        fast_preset=fastpass_preset,
-                        fast_crf=float(args.quality),
-                        encoder=str(args.encoder),
-                        video_params=str(args.video_params),
-                        ffmpeg_arg=str(args.ffmpeg),
-                        verbose=bool(args.verbose),
-                        keep=bool(args.keep),
-                        sc_only=False,
-                        log_file=av1an_log_file,
-                        log_level=(
-                            None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
-                            else str(args.av1an_log_level).strip()
-                        ),
-                        fastpass_hdr=bool(args.fastpass_hdr),
-                        hdr_patch_script=hdr_patch_script,
-                    )
-                    touch(marks["fastpass"])
+                    if args.sdm == "av1an":
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "started", source=input_file, workdir=project_dir)
+                    emit_runner_child_event("Fastpass", "started", source=input_file, workdir=project_dir)
+                    try:
+                        run_fastpass_av1an(
+                            av1an_exe=str(args.av1an),
+                            input_file=input_file,
+                            fastpass_vpy=fastpass_vpy,
+                            fastpass_proxy=fastpass_proxy,
+                            output_file=fastpass_out,
+                            scenes_path=(base_scenes_path if args.sdm in ("psd", "none") else None),
+                            av1an_temp=av1an_temp,
+                            sdm=str(args.sdm),
+                            workers=int(args.workers),
+                            lp=int(args.lp),
+                            fast_preset=fastpass_preset,
+                            fast_crf=float(args.quality),
+                            encoder=str(args.encoder),
+                            video_params=str(args.video_params),
+                            ffmpeg_arg=str(args.ffmpeg),
+                            verbose=bool(args.verbose),
+                            keep=bool(args.keep),
+                            sc_only=False,
+                            log_file=av1an_log_file,
+                            log_level=(
+                                None if str(args.av1an_log_level).strip().lower() in ("", "none", "off", "false", "0")
+                                else str(args.av1an_log_level).strip()
+                            ),
+                            progress_jsonl=av1an_progress_jsonl,
+                            fastpass_hdr=bool(args.fastpass_hdr),
+                            hdr_patch_script=hdr_patch_script,
+                            chunk_order=str(args.chunk_order or ""),
+                            encoder_path=str(args.encoder_path or ""),
+                            fast_interrupt=bool(args.fast_interrupt),
+                            vspipe_args=fastpass_vspipe_args,
+                            av1an_extra_split_sec=int(args.av1an_extra_split_sec),
+                            av1an_min_scene_len=int(args.av1an_min_scene_len),
+                        )
+                    except Exception as exc:
+                        if args.sdm == "av1an":
+                            emit_runner_child_event("Auto-Boost: Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                        emit_runner_child_event("Fastpass", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                        raise
+                    if args.sdm == "av1an":
+                        emit_runner_child_event("Auto-Boost: Scene Detection", "completed", source=input_file, workdir=project_dir)
+                    emit_runner_child_event("Fastpass", "completed", source=input_file, workdir=project_dir)
 
     frames_count = 0
     scene_ranges: List[Tuple[int, int]] = []
-    if args.stage in (0, 3, 4, 5):
+    if should_run(3, 4, 5):
         if args.sdm == "av1an":
             if base_scenes_path.exists():
                 raw = load_json(base_scenes_path)
@@ -389,6 +570,8 @@ def main() -> int:
                     if not is_valid_base_scenes(base_scenes_path):
                         raise
                     eprint(f"[warn] {exc}. Using existing base scenes: {base_scenes_path}")
+        elif args.sdm == "none" and not is_single_scene_base_scenes(base_scenes_path):
+            ensure_none_base_scenes()
         ensure_exists(base_scenes_path, "Base scenes.json")
         base_scenes_obj = sanitize_scenes_json(load_json(base_scenes_path))
         frames_count = int(base_scenes_obj["frames"])
@@ -397,108 +580,126 @@ def main() -> int:
     # -----------------
     # Stage 3: metrics
     # -----------------
-    if args.stage in (0, 3):
+    if should_run(3):
         if args.no_fastpass:
             print("[skip] no-fastpass enabled; metrics skipped.")
+            emit_runner_child_event("SSIMU2 Metrics", "skipped", message="no_fastpass", source=input_file, workdir=project_dir)
         else:
             ensure_exists(fastpass_out, "Fast-pass output")
 
-            if marks["ssimu2"].exists() and is_valid_ssimu2_log(ssimu2_log):
+            if is_valid_ssimu2_log(ssimu2_log):
                 print(f"[resume] SSIMU2 already completed: {ssimu2_log}")
+                emit_runner_child_event("SSIMU2 Metrics", "completed", message="resume", source=input_file, workdir=project_dir)
             else:
-                calculate_ssimu2(
-                    src_file=metrics_ref_src,
-                    enc_file=fastpass_out,
-                    out_path=ssimu2_log,
-                    frames_count=frames_count,
-                    skip=int(args.skip),
-                    backend=str(args.ssimu2_backend),
-                    vs_source=str(args.vs_source),
-                    vpy_src=metrics_ref_vpy_src,
-                )
-                touch(marks["ssimu2"])
+                emit_runner_child_event("SSIMU2 Metrics", "started", source=input_file, workdir=project_dir)
+                try:
+                    calculate_ssimu2(
+                        src_file=metrics_ref_src,
+                        enc_file=fastpass_out,
+                        out_path=ssimu2_log,
+                        frames_count=frames_count,
+                        skip=int(args.skip),
+                        backend=str(args.ssimu2_backend),
+                        vs_source=str(args.vs_source),
+                        vpy_src=metrics_ref_vpy_src,
+                        vpy_args=metrics_ref_vpy_args,
+                    )
+                except Exception as exc:
+                    emit_runner_child_event("SSIMU2 Metrics", "failed", message=str(exc), source=input_file, workdir=project_dir)
+                    raise
+                emit_runner_child_event("SSIMU2 Metrics", "completed", source=input_file, workdir=project_dir)
 
     # -----------------
     # Stage 4: base scenes
     # -----------------
     stage4_out_scenes_path = preview_scenes_path if args.stop_before_stage4 else out_scenes_path
-    if args.stage in (0, 4):
-        if args.stop_before_stage4:
-            stage4_ready = is_valid_final_scenes(stage4_out_scenes_path)
-        else:
-            stage4_ready = marks["final"].exists() and is_valid_final_scenes(stage4_out_scenes_path)
-
-        if stage4_ready:
+    if should_run(4):
+        try:
             if args.stop_before_stage4:
-                print(f"[resume] preview scenes already written: {stage4_out_scenes_path}")
+                stage4_ready = is_valid_final_scenes(stage4_out_scenes_path)
             else:
-                print(f"[resume] base scenes already written: {stage4_out_scenes_path}")
-        else:
-            if args.no_fastpass:
-                write_uniform_scenes(
-                    base_scenes_path=base_scenes_path,
-                    out_scenes_path=stage4_out_scenes_path,
-                    encoder=str(args.encoder),
-                    base_crf=float(args.quality),
-                    final_preset=final_preset,
-                    video_params=str(args.video_params),
-                    final_override=str(args.final_override),
-                )
-            else:
-                _, per_chunk_5, avg_total = compute_chunk_5p_single_metric(
-                    scene_ranges=scene_ranges,
-                    ssimu2_path=ssimu2_log,
-                )
-                
-                avg_total_adj = apply_avg_func(avg_total, args.avg_func)
-                if str(args.avg_func).strip():
-                    print(f"[avg-func] {avg_total} -> {avg_total_adj} ({args.avg_func})")
+                stage4_ready = is_valid_final_scenes(stage4_out_scenes_path)
+            if stage4_ready and args.sdm == "none" and not is_single_scene_base_scenes(stage4_out_scenes_path):
+                stage4_ready = False
 
-                aggressive_val = args.aggressive
-                pos_val = args.pos_dev_multiplier
-                neg_val = args.neg_dev_multiplier
-                if aggressive_val is not None:
-                    pos_dev_multiplier = float(aggressive_val)
-                    neg_dev_multiplier = float(aggressive_val)
+            if stage4_ready:
+                if args.stop_before_stage4:
+                    print(f"[resume] preview scenes already written: {stage4_out_scenes_path}")
                 else:
-                    if (pos_val is None) != (neg_val is None):
-                        raise RuntimeError(
-                            "Specify either --aggressive or both --pos-dev-multiplier and --neg-dev-multiplier."
-                        )
-                    if pos_val is None and neg_val is None:
-                        pos_dev_multiplier = 1.0
-                        neg_dev_multiplier = 1.0
-                    else:
-                        pos_dev_multiplier = float(pos_val)
-                        neg_dev_multiplier = float(neg_val)
-
-                apply_crf_adjustments_to_scenes(
-                    base_scenes_path=base_scenes_path,
-                    out_scenes_path=stage4_out_scenes_path,
-                    scene_ranges=scene_ranges,
-                    per_chunk_5=per_chunk_5,
-                    avg_total=avg_total_adj,
-                    encoder=str(args.encoder),
-                    base_crf=float(args.quality),
-                    pos_dev_multiplier=pos_dev_multiplier,
-                    neg_dev_multiplier=neg_dev_multiplier,
-                    deviation=float(args.deviation),
-                    max_positive_dev=args.max_positive_dev,
-                    max_negative_dev=args.max_negative_dev,
-                    final_preset=final_preset,
-                    video_params=str(args.video_params),
-                    final_override=str(args.final_override)
-                )
-            if args.stop_before_stage4:
-                print(f"[ok] preview scenes written: {stage4_out_scenes_path}")
+                    print(f"[resume] base scenes already written: {stage4_out_scenes_path}")
             else:
-                touch(marks["final"])
+                if args.no_fastpass:
+                    write_uniform_scenes(
+                        base_scenes_path=base_scenes_path,
+                        out_scenes_path=stage4_out_scenes_path,
+                        encoder=str(args.encoder),
+                        base_crf=float(args.quality),
+                        final_preset=final_preset,
+                        video_params=str(args.video_params),
+                        final_override=str(args.final_override),
+                    )
+                else:
+                    _, per_chunk_5, avg_total = compute_chunk_5p_single_metric(
+                        scene_ranges=scene_ranges,
+                        ssimu2_path=ssimu2_log,
+                    )
+
+                    avg_total_adj = apply_avg_func(avg_total, args.avg_func)
+                    if str(args.avg_func).strip():
+                        print(f"[avg-func] {avg_total} -> {avg_total_adj} ({args.avg_func})")
+
+                    aggressive_val = args.aggressive
+                    pos_val = args.pos_dev_multiplier
+                    neg_val = args.neg_dev_multiplier
+                    if aggressive_val is not None:
+                        pos_dev_multiplier = float(aggressive_val)
+                        neg_dev_multiplier = float(aggressive_val)
+                    else:
+                        if (pos_val is None) != (neg_val is None):
+                            raise RuntimeError(
+                                "Specify either --aggressive or both --pos-dev-multiplier and --neg-dev-multiplier."
+                            )
+                        if pos_val is None and neg_val is None:
+                            pos_dev_multiplier = 1.0
+                            neg_dev_multiplier = 1.0
+                        else:
+                            pos_dev_multiplier = float(pos_val)
+                            neg_dev_multiplier = float(neg_val)
+
+                    apply_crf_adjustments_to_scenes(
+                        base_scenes_path=base_scenes_path,
+                        out_scenes_path=stage4_out_scenes_path,
+                        scene_ranges=scene_ranges,
+                        per_chunk_5=per_chunk_5,
+                        avg_total=avg_total_adj,
+                        encoder=str(args.encoder),
+                        base_crf=float(args.quality),
+                        pos_dev_multiplier=pos_dev_multiplier,
+                        neg_dev_multiplier=neg_dev_multiplier,
+                        deviation=float(args.deviation),
+                        max_positive_dev=args.max_positive_dev,
+                        max_negative_dev=args.max_negative_dev,
+                        final_preset=final_preset,
+                        video_params=str(args.video_params),
+                        final_override=str(args.final_override)
+                    )
+                if args.stop_before_stage4:
+                    print(f"[ok] preview scenes written: {stage4_out_scenes_path}")
+        except Exception as exc:
+            emit_runner_child_event(
+                "SSIMU2 Metrics",
+                "failed",
+                message=f"base-scenes: {exc}",
+                source=input_file,
+                workdir=project_dir,
+            )
+            raise
 
     if args.stop_before_stage4:
         print(f"Base scenes    : {base_scenes_path}")
         print(f"Fast-pass      : {fastpass_out}")
         print(f"SSIMU2 log     : {ssimu2_log}")
-        if args.stage in (0, 4):
+        if should_run(4):
             print("[stop] requested stop before stage 5; preview scenes prepared.")
             print(f"Preview scenes : {preview_scenes_path}")
         else:
@@ -508,12 +709,12 @@ def main() -> int:
     # -----------------
     # Stage 5: apply rules
     # -----------------
-    if args.stage in (0, 5):
+    if should_run(5):
         if compiled_rules is None:
-            if args.stage == 5:
+            if only_stage(5):
                 print("[skip] no rules provided for stage 5.")
         else:
-            if marks["rules"].exists() and is_valid_final_scenes(out_scenes_path):
+            if is_valid_final_scenes(out_scenes_path):
                 print(f"[resume] rules already applied: {out_scenes_path}")
             else:
                 ensure_exists(out_scenes_path, "Base scenes.json (Stage 4 output)")
@@ -600,7 +801,6 @@ def main() -> int:
                     return 0
 
                 save_json(out_scenes_path, updated_obj)
-                touch(marks["rules"])
                 print(f"[ok] rules applied: {out_scenes_path}")
 
     print("\nDone.")
