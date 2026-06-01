@@ -1,6 +1,8 @@
 import os
 import shlex
+import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -9,12 +11,16 @@ if str(ROOT) not in sys.path:
 
 from utils.plan_model import (
     CHUNK_ORDER_OPTIONS,
+    DEFAULT_AV1AN_EXTRA_SPLIT_SEC,
+    DEFAULT_AV1AN_MIN_SCENE_LEN,
     DEFAULT_CHUNK_ORDER,
     DEFAULT_FASTPASS_PARAMS,
     DEFAULT_MAINPASS_PARAMS,
     DEFAULT_QUALITY,
     DEFAULT_SOURCE_LOADER,
     DEFAULT_VIDEO_ENCODER,
+    PSD_SCENE_DETECTION_OPTION_SPECS,
+    SCENE_DETECTION_OPTIONS,
     SOURCE_LOADER_OPTIONS,
     build_summary_rows,
     file_plan_from_gui_result,
@@ -69,6 +75,50 @@ APP_BUTTON_FONT = ("Segoe UI Semibold", 11)
 PARAM_GLUE = "\u00a0"
 ENCODER_PATH_INFO_PREFIX = "[scan]"
 
+
+def psd_scene_detection_fallback_defaults():
+    return {
+        str(spec["name"]): str(int(spec["default"]))
+        for spec in PSD_SCENE_DETECTION_OPTION_SPECS
+    }
+
+
+def load_psd_scene_detection_defaults(python_exe="", psd_script="", *, timeout=5.0):
+    defaults = psd_scene_detection_fallback_defaults()
+    py = str(python_exe or sys.executable)
+    script = str(psd_script or "").strip()
+    if not script:
+        return defaults
+    try:
+        proc = subprocess.run(
+            [py, script, "--get-config"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except Exception:
+        return defaults
+    if proc.returncode != 0:
+        return defaults
+    try:
+        data = tomllib.loads(proc.stdout or "")
+    except Exception:
+        return defaults
+    for spec in PSD_SCENE_DETECTION_OPTION_SPECS:
+        name = str(spec["name"])
+        config_key = str(spec["config_key"])
+        if config_key not in data:
+            continue
+        try:
+            defaults[name] = str(int(data[config_key]))
+        except Exception:
+            continue
+    return defaults
+
 STRICT_SDR_8BIT_PARAMS = {
     "svt-av1": {
         "--matrix-coefficients": "1",
@@ -118,6 +168,8 @@ class DefaultSettings:
         fastpass="",
         mainpass="",
         scene_detection="",
+        av1an_extra_split_sec=DEFAULT_AV1AN_EXTRA_SPLIT_SEC,
+        av1an_min_scene_len=DEFAULT_AV1AN_MIN_SCENE_LEN,
         chunk_order=DEFAULT_CHUNK_ORDER,
         encoder_path="",
         no_fastpass=False,
@@ -151,6 +203,7 @@ class DefaultSettings:
         use_disk_cache=False,
         attach_encode_info=False,
         note="",
+        **psd_scene_detection_values,
     ):
         self.params = params or ""
         self.last_params = last_params or ""
@@ -158,9 +211,14 @@ class DefaultSettings:
         self.fastpass = fastpass or ""
         self.mainpass = mainpass or ""
         sd = (scene_detection or "").strip().lower()
-        if sd not in ("psd", "av1an"):
+        if sd not in SCENE_DETECTION_OPTIONS:
             sd = "av1an"
         self.scene_detection = sd
+        self.av1an_extra_split_sec = str(parse_int_value(av1an_extra_split_sec, DEFAULT_AV1AN_EXTRA_SPLIT_SEC))
+        self.av1an_min_scene_len = str(parse_int_value(av1an_min_scene_len, DEFAULT_AV1AN_MIN_SCENE_LEN))
+        for spec in PSD_SCENE_DETECTION_OPTION_SPECS:
+            name = str(spec["name"])
+            setattr(self, name, str(parse_int_value(psd_scene_detection_values.get(name), int(spec["default"]))))
         self.chunk_order = str(chunk_order or DEFAULT_CHUNK_ORDER).strip() or DEFAULT_CHUNK_ORDER
         if self.chunk_order not in CHUNK_ORDER_OPTIONS:
             self.chunk_order = DEFAULT_CHUNK_ORDER
@@ -443,6 +501,12 @@ def build_results(files, tracks_by_file, settings, defaults):
     default_fastpass = defaults.fastpass
     default_mainpass = defaults.mainpass
     default_scene_detection = defaults.scene_detection
+    default_av1an_extra_split_sec = defaults.av1an_extra_split_sec
+    default_av1an_min_scene_len = defaults.av1an_min_scene_len
+    default_psd_scene_detection = {
+        str(spec["name"]): getattr(defaults, str(spec["name"]))
+        for spec in PSD_SCENE_DETECTION_OPTION_SPECS
+    }
     default_no_fastpass = defaults.no_fastpass
     default_fastpass_hdr = defaults.fastpass_hdr
     default_strict_sdr_8bit = defaults.strict_sdr_8bit
@@ -606,6 +670,15 @@ def build_results(files, tracks_by_file, settings, defaults):
                 track_mux["fastpass"] = default_fastpass
                 track_mux["mainpass"] = default_mainpass
                 track_mux["sceneDetection"] = default_scene_detection
+                track_mux["av1anExtraSplitSec"] = default_av1an_extra_split_sec
+                track_mux["av1anMinSceneLen"] = default_av1an_min_scene_len
+                track_mux["psdSceneDetectionExtraSplit"] = default_psd_scene_detection["psd_scene_detection_extra_split"]
+                track_mux["psdSceneDetection0042StillSceneExtraSplit"] = default_psd_scene_detection["psd_scene_detection_0042_still_scene_extra_split"]
+                track_mux["psdSceneDetection0012StillSceneExtraSplit"] = default_psd_scene_detection["psd_scene_detection_0012_still_scene_extra_split"]
+                track_mux["psdSceneDetectionMinSceneLen"] = default_psd_scene_detection["psd_scene_detection_min_scene_len"]
+                track_mux["psdSceneDetection18TargetSplit"] = default_psd_scene_detection["psd_scene_detection_18_target_split"]
+                track_mux["psdSceneDetection12TargetSplit"] = default_psd_scene_detection["psd_scene_detection_12_target_split"]
+                track_mux["psdSceneDetection27ExtraTargetSplit"] = default_psd_scene_detection["psd_scene_detection_27_extra_target_split"]
                 track_mux["noFastpass"] = "true" if default_no_fastpass else "false"
                 track_mux["fastpassHdr"] = "true" if default_fastpass_hdr else "false"
                 track_mux["strictSdr8bit"] = "true" if default_strict_sdr_8bit else "false"
@@ -693,13 +766,15 @@ def build_default_defaults_dict():
     fastpass_tokens.extend(["--crf", str(int(DEFAULT_QUALITY) if float(DEFAULT_QUALITY).is_integer() else DEFAULT_QUALITY)])
     mainpass_tokens = params_map_to_tokens(DEFAULT_MAINPASS_PARAMS)
     mainpass_tokens.extend(["--crf", str(int(DEFAULT_QUALITY) if float(DEFAULT_QUALITY).is_integer() else DEFAULT_QUALITY)])
-    return {
+    defaults = {
         "params": " ".join(str(token) for token in fastpass_tokens),
         "last_params": " ".join(str(token) for token in mainpass_tokens),
         "zoning": "",
         "fastpass": "",
         "mainpass": "",
         "scene_detection": "av1an",
+        "av1an_extra_split_sec": str(DEFAULT_AV1AN_EXTRA_SPLIT_SEC),
+        "av1an_min_scene_len": str(DEFAULT_AV1AN_MIN_SCENE_LEN),
         "chunk_order": DEFAULT_CHUNK_ORDER,
         "encoder_path": "",
         "no_fastpass": False,
@@ -734,6 +809,12 @@ def build_default_defaults_dict():
         "attach_encode_info": False,
         "note": "",
     }
+    try:
+        toolchain = load_toolchain()
+        defaults.update(load_psd_scene_detection_defaults(toolchain.vs_python_exe, toolchain.psd_script))
+    except Exception:
+        defaults.update(psd_scene_detection_fallback_defaults())
+    return defaults
 
 
 def load_gui_data_from_paths(raw_paths):
@@ -818,13 +899,17 @@ __all__ = [
     "DEFAULT_CHUNK_ORDER",
     "DEFAULT_SOURCE_LOADER",
     "DEFAULT_OPTIONS",
+    "DEFAULT_AV1AN_EXTRA_SPLIT_SEC",
+    "DEFAULT_AV1AN_MIN_SCENE_LEN",
     "DEFAULT_VIDEO_ENCODER",
     "DefaultSettings",
     "ENCODER_PATH_INFO_PREFIX",
     "LEGACY_PORTABLE_DIR",
     "MODE_OPTIONS",
     "PARAM_GLUE",
+    "PSD_SCENE_DETECTION_OPTION_SPECS",
     "STRICT_SDR_8BIT_PARAMS",
+    "SCENE_DETECTION_OPTIONS",
     "SOURCE_LOADER_OPTIONS",
     "SUB_MODE_OPTIONS",
     "TYPE_OPTIONS",
@@ -847,12 +932,14 @@ __all__ = [
     "list_portable_encoder_binaries",
     "load_file_plan",
     "load_gui_data_from_paths",
+    "load_psd_scene_detection_defaults",
     "load_toolchain",
     "normalize_encoder",
     "normalize_type",
     "parse_bool_value",
     "parse_id_rule",
     "parse_int_value",
+    "psd_scene_detection_fallback_defaults",
     "parse_params_string",
     "plan_path_for_source",
     "probe_source_tracks",

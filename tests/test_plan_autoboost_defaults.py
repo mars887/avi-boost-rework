@@ -7,10 +7,10 @@ from utils.pipeline_runtime import Toolchain
 from utils.plan_model import resolve_file_plan
 from utils.runner.models import QueueItem
 from utils.runner.session import SessionController
-from utils.runner_state import STAGE_FASTPASS
+from utils.runner_state import STAGE_AUTOBOOST_PSD_SCENE, STAGE_AUTOBOOST_SCENE, STAGE_FASTPASS
 
 
-def write_video_plan(path: Path, extra_primary: str = "") -> None:
+def write_video_plan(path: Path, extra_primary: str = "", extra_pipeline: str = "") -> None:
     path.write_text(
         "\n".join(
             [
@@ -22,6 +22,9 @@ def write_video_plan(path: Path, extra_primary: str = "") -> None:
                 "",
                 "[video.primary]",
                 extra_primary.strip(),
+                "",
+                "[video.pipeline]",
+                extra_pipeline.strip(),
                 "",
                 "[video]",
                 "track_id = 0",
@@ -37,7 +40,7 @@ def write_video_plan(path: Path, extra_primary: str = "") -> None:
     )
 
 
-def build_fastpass_command(plan_path: Path) -> list[str]:
+def build_commands(plan_path: Path, *, mode: str = "fastpass") -> list[tuple[str, list[str]]]:
     resolved = resolve_file_plan(plan_path)
     controller = object.__new__(SessionController)
     controller.toolchain = Toolchain(
@@ -49,8 +52,12 @@ def build_fastpass_command(plan_path: Path) -> list[str]:
     controller.av1an_fork_enabled = False
     controller.av1an_progress_jsonl_enabled = False
 
-    item = QueueItem(resolved=resolved, mode="fastpass")
-    commands = controller._build_item_commands(item)
+    item = QueueItem(resolved=resolved, mode=mode)
+    return controller._build_item_commands(item)
+
+
+def build_fastpass_command(plan_path: Path) -> list[str]:
+    commands = build_commands(plan_path)
     for stage, cmd in commands:
         if stage == STAGE_FASTPASS:
             return cmd
@@ -116,6 +123,71 @@ ab_neg_dev = 4
             self.assertNotIn("--neg-dev-multiplier", cmd)
             self.assertIn("--max-positive-dev", cmd)
             self.assertIn("--max-negative-dev", cmd)
+
+    def test_av1an_scene_detection_knobs_are_emitted(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan_path = root / "source.plan"
+            write_video_plan(
+                plan_path,
+                extra_pipeline="""
+scene_detection = "av1an"
+av1an_extra_split_sec = 22
+av1an_min_scene_len = 48
+""",
+            )
+
+            cmd = build_fastpass_command(plan_path)
+
+            self.assertEqual(cmd[cmd.index("--sdm") + 1], "av1an")
+            self.assertEqual(cmd[cmd.index("--av1an-extra-split-sec") + 1], "22")
+            self.assertEqual(cmd[cmd.index("--av1an-min-scene-len") + 1], "48")
+
+    def test_none_scene_detection_builds_single_scene_stage_for_no_fastpass(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan_path = root / "source.plan"
+            write_video_plan(
+                plan_path,
+                extra_pipeline="""
+scene_detection = "none"
+no_fastpass = true
+""",
+            )
+
+            commands = build_commands(plan_path)
+
+            stage, cmd = next((item for item in commands if item[0] == STAGE_AUTOBOOST_SCENE), (None, []))
+            self.assertEqual(stage, STAGE_AUTOBOOST_SCENE)
+            self.assertEqual(cmd[cmd.index("--sdm") + 1], "none")
+            self.assertEqual(cmd[cmd.index("--run-stages") + 1], "none,base-scenes")
+
+    def test_psd_scene_detection_knobs_are_forwarded_as_psd_args(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            plan_path = root / "source.plan"
+            write_video_plan(
+                plan_path,
+                extra_pipeline="""
+scene_detection = "psd"
+psd_scene_detection_extra_split = 333
+psd_scene_detection_min_scene_len = 21
+psd_scene_detection_18_target_split = 35
+psd_scene_detection_12_target_split = 101
+psd_scene_detection_27_extra_target_split = 165
+""",
+            )
+
+            commands = build_commands(plan_path)
+
+            stage, cmd = next((item for item in commands if item[0] == STAGE_AUTOBOOST_PSD_SCENE), (None, []))
+            self.assertEqual(stage, STAGE_AUTOBOOST_PSD_SCENE)
+            self.assertEqual(cmd[cmd.index("--sdm") + 1], "psd")
+            psd_args = cmd[cmd.index("--psd-args") + 1]
+            self.assertIn("--scene-detection-extra-split 333", psd_args)
+            self.assertIn("--scene-detection-min-scene-len 21", psd_args)
+            self.assertIn("--scene-detection-18-target-split 35", psd_args)
+            self.assertNotIn("--scene-detection-vapoursynth-range", psd_args)
 
 
 if __name__ == "__main__":

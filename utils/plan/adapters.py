@@ -7,9 +7,12 @@ from typing import Any, Dict, List, Optional, Sequence
 from utils.plan.io import load_file_plan, plan_path_for_source, resolve_paths
 from utils.plan.types import (
     DEFAULT_QUALITY,
+    DEFAULT_AV1AN_EXTRA_SPLIT_SEC,
+    DEFAULT_AV1AN_MIN_SCENE_LEN,
     DEFAULT_SCENE_DETECTION,
     DEFAULT_CHUNK_ORDER,
     DEFAULT_SOURCE_LOADER,
+    PSD_SCENE_DETECTION_OPTION_SPECS,
     AudioPlan,
     FilePlan,
     PlanMeta,
@@ -23,11 +26,13 @@ from utils.plan.types import (
     format_value,
     normalize_encoder,
     normalize_chunk_order,
+    normalize_scene_detection,
     normalize_source_loader,
     normalize_track_type,
     params_map_to_tokens,
     parse_bool_value,
     to_float,
+    to_int,
     to_optional_float,
 )
 
@@ -50,6 +55,12 @@ def gui_defaults_from_file_plan(plan: FilePlan) -> Dict[str, Any]:
         "last_params": subprocess.list2cmdline([str(x) for x in mainpass_tokens]),
         "encoder": primary.encoder,
         "scene_detection": primary.scene_detection,
+        "av1an_extra_split_sec": str(primary.av1an_extra_split_sec),
+        "av1an_min_scene_len": str(primary.av1an_min_scene_len),
+        **{
+            str(spec["name"]): str(getattr(primary, str(spec["name"])))
+            for spec in PSD_SCENE_DETECTION_OPTION_SPECS
+        },
         "chunk_order": primary.chunk_order,
         "encoder_path": primary.encoder_path,
         "quality": primary.quality,
@@ -171,7 +182,7 @@ def file_plan_from_gui_result(
 
     video_primary = VideoPrimary(
         encoder=normalize_encoder(defaults.get("encoder")),
-        scene_detection=str(defaults.get("scene_detection") or DEFAULT_SCENE_DETECTION),
+        scene_detection=normalize_scene_detection(defaults.get("scene_detection") or DEFAULT_SCENE_DETECTION),
         quality=float(defaults.get("quality") or DEFAULT_QUALITY),
         chunk_order=normalize_chunk_order(defaults.get("chunk_order") or DEFAULT_CHUNK_ORDER),
         encoder_path=str(defaults.get("encoder_path") or ""),
@@ -185,6 +196,12 @@ def file_plan_from_gui_result(
         no_dolby_vision=bool(defaults.get("no_dolby_vision")),
         no_hdr10plus=bool(defaults.get("no_hdr10plus")),
         attach_encode_info=bool(defaults.get("attach_encode_info")),
+        av1an_extra_split_sec=to_int(defaults.get("av1an_extra_split_sec"), DEFAULT_AV1AN_EXTRA_SPLIT_SEC),
+        av1an_min_scene_len=to_int(defaults.get("av1an_min_scene_len"), DEFAULT_AV1AN_MIN_SCENE_LEN),
+        **{
+            str(spec["name"]): to_int(defaults.get(str(spec["name"])), int(spec["default"]))
+            for spec in PSD_SCENE_DETECTION_OPTION_SPECS
+        },
         ab_multiplier=to_optional_float(defaults.get("ab_multiplier")),
         ab_pos_dev=to_optional_float(defaults.get("ab_pos_dev")),
         ab_neg_dev=to_optional_float(defaults.get("ab_neg_dev")),

@@ -15,6 +15,74 @@ BATCH_PLAN_TYPE = "batch"
 PLAN_SUFFIX = ".plan"
 DEFAULT_VIDEO_ENCODER = "svt-av1"
 DEFAULT_SCENE_DETECTION = "av1an"
+SCENE_DETECTION_OPTIONS = ("psd", "av1an", "none")
+DEFAULT_AV1AN_EXTRA_SPLIT_SEC = 15
+DEFAULT_AV1AN_MIN_SCENE_LEN = 24
+DEFAULT_PSD_SCENE_DETECTION_EXTRA_SPLIT = 241
+DEFAULT_PSD_SCENE_DETECTION_0042_STILL_SCENE_EXTRA_SPLIT = 289
+DEFAULT_PSD_SCENE_DETECTION_0012_STILL_SCENE_EXTRA_SPLIT = 385
+DEFAULT_PSD_SCENE_DETECTION_MIN_SCENE_LEN = 17
+DEFAULT_PSD_SCENE_DETECTION_18_TARGET_SPLIT = 33
+DEFAULT_PSD_SCENE_DETECTION_12_TARGET_SPLIT = 97
+DEFAULT_PSD_SCENE_DETECTION_27_EXTRA_TARGET_SPLIT = 161
+PSD_SCENE_DETECTION_OPTION_SPECS = (
+    {
+        "name": "psd_scene_detection_extra_split",
+        "config_key": "scene_detection_extra_split",
+        "flag": "--scene-detection-extra-split",
+        "camel": "psdSceneDetectionExtraSplit",
+        "label": "Extra Split",
+        "default": DEFAULT_PSD_SCENE_DETECTION_EXTRA_SPLIT,
+    },
+    {
+        "name": "psd_scene_detection_0042_still_scene_extra_split",
+        "config_key": "scene_detection_0042_still_scene_extra_split",
+        "flag": "--scene-detection-0042-still-scene-extra-split",
+        "camel": "psdSceneDetection0042StillSceneExtraSplit",
+        "label": "Still 0.0042",
+        "default": DEFAULT_PSD_SCENE_DETECTION_0042_STILL_SCENE_EXTRA_SPLIT,
+    },
+    {
+        "name": "psd_scene_detection_0012_still_scene_extra_split",
+        "config_key": "scene_detection_0012_still_scene_extra_split",
+        "flag": "--scene-detection-0012-still-scene-extra-split",
+        "camel": "psdSceneDetection0012StillSceneExtraSplit",
+        "label": "Still 0.0012",
+        "default": DEFAULT_PSD_SCENE_DETECTION_0012_STILL_SCENE_EXTRA_SPLIT,
+    },
+    {
+        "name": "psd_scene_detection_min_scene_len",
+        "config_key": "scene_detection_min_scene_len",
+        "flag": "--scene-detection-min-scene-len",
+        "camel": "psdSceneDetectionMinSceneLen",
+        "label": "Min Len",
+        "default": DEFAULT_PSD_SCENE_DETECTION_MIN_SCENE_LEN,
+    },
+    {
+        "name": "psd_scene_detection_18_target_split",
+        "config_key": "scene_detection_18_target_split",
+        "flag": "--scene-detection-18-target-split",
+        "camel": "psdSceneDetection18TargetSplit",
+        "label": "18 Target",
+        "default": DEFAULT_PSD_SCENE_DETECTION_18_TARGET_SPLIT,
+    },
+    {
+        "name": "psd_scene_detection_12_target_split",
+        "config_key": "scene_detection_12_target_split",
+        "flag": "--scene-detection-12-target-split",
+        "camel": "psdSceneDetection12TargetSplit",
+        "label": "12 Target",
+        "default": DEFAULT_PSD_SCENE_DETECTION_12_TARGET_SPLIT,
+    },
+    {
+        "name": "psd_scene_detection_27_extra_target_split",
+        "config_key": "scene_detection_27_extra_target_split",
+        "flag": "--scene-detection-27-extra-target-split",
+        "camel": "psdSceneDetection27ExtraTargetSplit",
+        "label": "27 Target",
+        "default": DEFAULT_PSD_SCENE_DETECTION_27_EXTRA_TARGET_SPLIT,
+    },
+)
 DEFAULT_QUALITY = 30.0
 DEFAULT_CHUNK_ORDER = "long-biased-random"
 DEFAULT_SOURCE_LOADER = "ffms2"
@@ -95,6 +163,15 @@ class VideoPrimary:
     no_dolby_vision: bool = False
     no_hdr10plus: bool = False
     attach_encode_info: bool = False
+    av1an_extra_split_sec: int = DEFAULT_AV1AN_EXTRA_SPLIT_SEC
+    av1an_min_scene_len: int = DEFAULT_AV1AN_MIN_SCENE_LEN
+    psd_scene_detection_extra_split: int = DEFAULT_PSD_SCENE_DETECTION_EXTRA_SPLIT
+    psd_scene_detection_0042_still_scene_extra_split: int = DEFAULT_PSD_SCENE_DETECTION_0042_STILL_SCENE_EXTRA_SPLIT
+    psd_scene_detection_0012_still_scene_extra_split: int = DEFAULT_PSD_SCENE_DETECTION_0012_STILL_SCENE_EXTRA_SPLIT
+    psd_scene_detection_min_scene_len: int = DEFAULT_PSD_SCENE_DETECTION_MIN_SCENE_LEN
+    psd_scene_detection_18_target_split: int = DEFAULT_PSD_SCENE_DETECTION_18_TARGET_SPLIT
+    psd_scene_detection_12_target_split: int = DEFAULT_PSD_SCENE_DETECTION_12_TARGET_SPLIT
+    psd_scene_detection_27_extra_target_split: int = DEFAULT_PSD_SCENE_DETECTION_27_EXTRA_TARGET_SPLIT
     ab_multiplier: Optional[float] = None
     ab_pos_dev: Optional[float] = 5.0
     ab_neg_dev: Optional[float] = 4.0
@@ -252,6 +329,12 @@ class ResolvedFilePlan:
             "quality": format_value(primary.quality),
             "chunk_order": str(primary.chunk_order or ""),
             "encoder_path": str(primary.encoder_path or ""),
+            "av1an_extra_split_sec": str(primary.av1an_extra_split_sec),
+            "av1an_min_scene_len": str(primary.av1an_min_scene_len),
+            **{
+                str(spec["name"]): str(getattr(primary, str(spec["name"])))
+                for spec in PSD_SCENE_DETECTION_OPTION_SPECS
+            },
             "fastpass_preset": str(primary.fastpass_preset or ""),
             "preset": str(primary.preset or ""),
             "fastpass_params": {key: format_value(value) for key, value in video.fastpass_params.items()},
@@ -263,6 +346,15 @@ class ResolvedFilePlan:
             "sceneDetection": primary.scene_detection,
             "chunkOrder": str(primary.chunk_order or ""),
             "encoderPath": str(primary.encoder_path or ""),
+            "av1anExtraSplitSec": str(primary.av1an_extra_split_sec),
+            "av1anMinSceneLen": str(primary.av1an_min_scene_len),
+            "psdSceneDetectionExtraSplit": str(primary.psd_scene_detection_extra_split),
+            "psdSceneDetection0042StillSceneExtraSplit": str(primary.psd_scene_detection_0042_still_scene_extra_split),
+            "psdSceneDetection0012StillSceneExtraSplit": str(primary.psd_scene_detection_0012_still_scene_extra_split),
+            "psdSceneDetectionMinSceneLen": str(primary.psd_scene_detection_min_scene_len),
+            "psdSceneDetection18TargetSplit": str(primary.psd_scene_detection_18_target_split),
+            "psdSceneDetection12TargetSplit": str(primary.psd_scene_detection_12_target_split),
+            "psdSceneDetection27ExtraTargetSplit": str(primary.psd_scene_detection_27_extra_target_split),
             "noFastpass": bool_text(primary.no_fastpass),
             "fastpassHdr": bool_text(primary.fastpass_hdr),
             "strictSdr8bit": bool_text(primary.strict_sdr_8bit),
@@ -421,6 +513,13 @@ def normalize_chunk_order(value: Any) -> str:
     return DEFAULT_CHUNK_ORDER
 
 
+def normalize_scene_detection(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in SCENE_DETECTION_OPTIONS:
+        return raw
+    return DEFAULT_SCENE_DETECTION
+
+
 def normalize_source_loader(value: Any) -> str:
     raw = str(value or "").strip().lower()
     if raw in ("bestsource", "best-source"):
@@ -454,6 +553,13 @@ def to_float(value: Any, default: float) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def to_int(value: Any, default: int) -> int:
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return int(default)
 
 
 def to_optional_float(value: Any) -> Optional[float]:
@@ -528,6 +634,17 @@ __all__ = [
     "PLAN_SUFFIX",
     "DEFAULT_VIDEO_ENCODER",
     "DEFAULT_SCENE_DETECTION",
+    "SCENE_DETECTION_OPTIONS",
+    "DEFAULT_AV1AN_EXTRA_SPLIT_SEC",
+    "DEFAULT_AV1AN_MIN_SCENE_LEN",
+    "DEFAULT_PSD_SCENE_DETECTION_EXTRA_SPLIT",
+    "DEFAULT_PSD_SCENE_DETECTION_0042_STILL_SCENE_EXTRA_SPLIT",
+    "DEFAULT_PSD_SCENE_DETECTION_0012_STILL_SCENE_EXTRA_SPLIT",
+    "DEFAULT_PSD_SCENE_DETECTION_MIN_SCENE_LEN",
+    "DEFAULT_PSD_SCENE_DETECTION_18_TARGET_SPLIT",
+    "DEFAULT_PSD_SCENE_DETECTION_12_TARGET_SPLIT",
+    "DEFAULT_PSD_SCENE_DETECTION_27_EXTRA_TARGET_SPLIT",
+    "PSD_SCENE_DETECTION_OPTION_SPECS",
     "DEFAULT_QUALITY",
     "DEFAULT_CHUNK_ORDER",
     "DEFAULT_SOURCE_LOADER",
@@ -555,11 +672,13 @@ __all__ = [
     "default_video_experimental",
     "normalize_track_type",
     "normalize_encoder",
+    "normalize_scene_detection",
     "normalize_chunk_order",
     "normalize_source_loader",
     "bool_text",
     "parse_bool_value",
     "to_float",
+    "to_int",
     "to_optional_float",
     "format_value",
     "coerce_scalar",

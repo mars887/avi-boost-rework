@@ -25,6 +25,7 @@ from utils.track_gui_shared import (
     APP_SURFACE,
     APP_SURFACE_ALT,
     APP_TEXT,
+    PSD_SCENE_DETECTION_OPTION_SPECS,
     build_default_defaults_dict,
 )
 
@@ -62,6 +63,9 @@ DEFAULT_GROUP_KEYS: Dict[str, Tuple[str, ...]] = {
     "pipeline_core": (
         "encoder",
         "scene_detection",
+        "av1an_extra_split_sec",
+        "av1an_min_scene_len",
+        *(str(spec["name"]) for spec in PSD_SCENE_DETECTION_OPTION_SPECS),
         "chunk_order",
         "encoder_path",
         "no_fastpass",

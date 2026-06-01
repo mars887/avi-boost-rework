@@ -104,6 +104,26 @@ def valid_scenes_json(path: Path, *, require_zone_overrides: bool = False) -> bo
     return True
 
 
+def valid_single_scene_json(path: Path, *, require_zone_overrides: bool = False) -> bool:
+    obj = load_json_object(path)
+    if obj is None:
+        return False
+    scenes = obj.get("scenes") or obj.get("split_scenes") or []
+    if not isinstance(scenes, list) or len(scenes) != 1 or not isinstance(scenes[0], dict):
+        return False
+    try:
+        frames = int(obj.get("frames") or 0)
+        start = int(scenes[0].get("start_frame"))
+        end = int(scenes[0].get("end_frame"))
+    except Exception:
+        return False
+    if frames <= 0 or start != 0 or end != frames:
+        return False
+    if require_zone_overrides and not scenes[0].get("zone_overrides"):
+        return False
+    return True
+
+
 def valid_ssimu2_log(path: Path) -> bool:
     if not file_has_bytes(path, 10):
         return False
@@ -227,6 +247,9 @@ def stage_marker_artifacts_valid(item: Any, stage: str) -> bool:
     if stage == STAGE_AUTOBOOST_PSD_SCENE:
         return valid_scenes_json(autoboost_base_scenes(item))
     if stage == STAGE_AUTOBOOST_SCENE:
+        scene_detection = str(item.resolved.plan.video.primary.scene_detection or "").strip().lower()
+        if scene_detection == "none":
+            return valid_single_scene_json(autoboost_base_scenes(item))
         return valid_scenes_json(autoboost_base_scenes(item)) or valid_scenes_json(autoboost_av1an_scenes(item))
     if stage == STAGE_FASTPASS:
         return file_has_bytes(autoboost_fastpass_output(item), MIN_VALID_MEDIA_BYTES)
@@ -287,11 +310,21 @@ def stage_marker_artifacts_valid(item: Any, stage: str) -> bool:
 def stage_completion_artifacts_valid(item: Any, stage: str) -> bool:
     primary = item.resolved.plan.video.primary
     if stage in (STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE) and primary.no_fastpass:
+        if str(primary.scene_detection or "").strip().lower() == "none":
+            return stage_marker_artifacts_valid(item, stage) and valid_single_scene_json(
+                autoboost_stage4_scenes(item),
+                require_zone_overrides=True,
+            )
         return stage_marker_artifacts_valid(item, stage) and valid_scenes_json(
             autoboost_stage4_scenes(item),
             require_zone_overrides=True,
         )
     if stage == STAGE_SSIMU2:
+        if str(primary.scene_detection or "").strip().lower() == "none":
+            return stage_marker_artifacts_valid(item, stage) and valid_single_scene_json(
+                autoboost_stage4_scenes(item),
+                require_zone_overrides=True,
+            )
         return stage_marker_artifacts_valid(item, stage) and valid_scenes_json(
             autoboost_stage4_scenes(item),
             require_zone_overrides=True,

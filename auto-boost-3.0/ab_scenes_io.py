@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -55,6 +58,80 @@ def sanitize_scenes_json(obj: Dict[str, Any]) -> Dict[str, Any]:
 def scenes_to_ranges(scenes_obj: Dict[str, Any]) -> List[Tuple[int, int]]:
     scenes = scenes_obj.get("split_scenes") or scenes_obj.get("scenes") or []
     return [(int(s["start_frame"]), int(s["end_frame"])) for s in scenes]
+
+
+def _parse_rate(value: Any) -> Optional[Fraction]:
+    text = str(value or "").strip()
+    if not text or text in ("0", "0/0"):
+        return None
+    try:
+        rate = Fraction(text)
+    except Exception:
+        try:
+            rate = Fraction(str(float(text)))
+        except Exception:
+            return None
+    return rate if rate > 0 else None
+
+
+def probe_video_frame_count(input_file: Path) -> int:
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-count_frames",
+        "-show_entries", "stream=nb_read_frames,nb_frames,duration,avg_frame_rate,r_frame_rate",
+        "-of", "json",
+        str(input_file),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffprobe not found; required for --sdm none scene generation.") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip() or f"exit code {proc.returncode}"
+        raise RuntimeError(f"ffprobe failed while counting source frames: {detail}")
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ffprobe returned invalid JSON while counting source frames: {exc}") from exc
+    streams = payload.get("streams") or []
+    if not streams:
+        raise RuntimeError("ffprobe returned no video stream while counting source frames.")
+    stream = dict(streams[0])
+    for key in ("nb_read_frames", "nb_frames"):
+        raw = stream.get(key)
+        if raw not in (None, "", "N/A"):
+            try:
+                frames = int(raw)
+            except Exception:
+                frames = 0
+            if frames > 0:
+                return frames
+    duration = stream.get("duration")
+    rate = _parse_rate(stream.get("avg_frame_rate")) or _parse_rate(stream.get("r_frame_rate"))
+    if duration not in (None, "", "N/A") and rate is not None:
+        frames = round(float(duration) * float(rate))
+        if frames > 0:
+            return int(frames)
+    raise RuntimeError("Unable to determine source frame count for --sdm none.")
+
+
+def write_single_scene_base(input_file: Path, base_scenes_path: Path) -> None:
+    frames = probe_video_frame_count(input_file)
+    scene = {"start_frame": 0, "end_frame": int(frames), "zone_overrides": None}
+    obj = {"frames": int(frames), "scenes": [dict(scene)], "split_scenes": [dict(scene)]}
+    ensure_dir(base_scenes_path.parent)
+    save_json(base_scenes_path, obj)
+    print(f"[ok] one-scene base scenes.json written: {base_scenes_path}")
 
 
 def write_base_scenes_from_av1an(av1an_temp: Path, base_scenes_path: Path) -> None:

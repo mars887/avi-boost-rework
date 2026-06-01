@@ -10,6 +10,8 @@ from utils.plan.summary import probe_source_tracks
 from utils.plan.types import (
     BATCH_PLAN_TYPE,
     DEFAULT_MAINPASS_PARAMS,
+    DEFAULT_AV1AN_EXTRA_SPLIT_SEC,
+    DEFAULT_AV1AN_MIN_SCENE_LEN,
     DEFAULT_CHUNK_ORDER,
     DEFAULT_SOURCE_LOADER,
     DEFAULT_QUALITY,
@@ -19,6 +21,7 @@ from utils.plan.types import (
     FILE_PLAN_TYPE,
     PLAN_FORMAT_VERSION,
     PLAN_SUFFIX,
+    PSD_SCENE_DETECTION_OPTION_SPECS,
     AudioPlan,
     BatchPlan,
     BatchPlanItem,
@@ -37,10 +40,12 @@ from utils.plan.types import (
     format_value,
     normalize_encoder,
     normalize_chunk_order,
+    normalize_scene_detection,
     normalize_source_loader,
     parse_bool_value,
     sanitize_component,
     to_float,
+    to_int,
     to_optional_float,
 )
 from utils.zoned_commands import zoned_command_path
@@ -409,6 +414,14 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
     if preset_value is None:
         preset_value = video_primary_data.get("preset")
 
+    def pipeline_int(name: str, default: int, *aliases: str) -> int:
+        for key in (name, *aliases):
+            if key in video_pipeline_data:
+                return to_int(video_pipeline_data.get(key), default)
+            if key in video_primary_data:
+                return to_int(video_primary_data.get(key), default)
+        return int(default)
+
     return FilePlan(
         format_version=format_version,
         plan_type=plan_type,
@@ -429,7 +442,7 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
             action=str(video_data.get("action") or "edit").lower(),
             primary=VideoPrimary(
                 encoder=normalize_encoder(video_pipeline_data.get("encoder") or video_primary_data.get("encoder")),
-                scene_detection=str(video_pipeline_data.get("scene_detection") or video_primary_data.get("scene_detection") or DEFAULT_SCENE_DETECTION),
+                scene_detection=normalize_scene_detection(video_pipeline_data.get("scene_detection") or video_primary_data.get("scene_detection") or DEFAULT_SCENE_DETECTION),
                 quality=to_float(quality_value, DEFAULT_QUALITY),
                 chunk_order=normalize_chunk_order(video_pipeline_data.get("chunk_order") or video_primary_data.get("chunk_order") or DEFAULT_CHUNK_ORDER),
                 encoder_path=str(video_pipeline_data.get("encoder_path") or video_primary_data.get("encoder_path") or ""),
@@ -443,6 +456,31 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
                 no_dolby_vision=parse_bool_value(video_color_data.get("no_dolby_vision", video_primary_data.get("no_dolby_vision")), False),
                 no_hdr10plus=parse_bool_value(video_color_data.get("no_hdr10plus", video_primary_data.get("no_hdr10plus")), False),
                 attach_encode_info=parse_bool_value(mux_data.get("attach_encode_info", video_primary_data.get("attach_encode_info")), False),
+                av1an_extra_split_sec=to_int(
+                    video_pipeline_data.get(
+                        "av1an_extra_split_sec",
+                        video_primary_data.get("av1an_extra_split_sec", DEFAULT_AV1AN_EXTRA_SPLIT_SEC),
+                    ),
+                    DEFAULT_AV1AN_EXTRA_SPLIT_SEC,
+                ),
+                av1an_min_scene_len=to_int(
+                    video_pipeline_data.get(
+                        "av1an_min_scene_len",
+                        video_pipeline_data.get(
+                            "av1an_min_scene_frames",
+                            video_primary_data.get("av1an_min_scene_len", DEFAULT_AV1AN_MIN_SCENE_LEN),
+                        ),
+                    ),
+                    DEFAULT_AV1AN_MIN_SCENE_LEN,
+                ),
+                **{
+                    str(spec["name"]): pipeline_int(
+                        str(spec["name"]),
+                        int(spec["default"]),
+                        str(spec["config_key"]),
+                    )
+                    for spec in PSD_SCENE_DETECTION_OPTION_SPECS
+                },
                 ab_multiplier=to_optional_float(video_primary_data.get("ab_multiplier")),
                 ab_pos_dev=(
                     to_optional_float(video_primary_data.get("ab_pos_dev"))
@@ -616,6 +654,12 @@ def _dump_file_plan(plan: FilePlan) -> str:
             "[video.pipeline]",
             f"encoder = {_toml_string(plan.video.primary.encoder)}",
             f"scene_detection = {_toml_string(plan.video.primary.scene_detection)}",
+            f"av1an_extra_split_sec = {int(plan.video.primary.av1an_extra_split_sec)}",
+            f"av1an_min_scene_len = {int(plan.video.primary.av1an_min_scene_len)}",
+            *[
+                f"{spec['name']} = {int(getattr(plan.video.primary, str(spec['name'])))}"
+                for spec in PSD_SCENE_DETECTION_OPTION_SPECS
+            ],
             f"chunk_order = {_toml_string(plan.video.primary.chunk_order)}",
             f"encoder_path = {_toml_string(plan.video.primary.encoder_path)}",
             f"no_fastpass = {_toml_scalar(plan.video.primary.no_fastpass)}",

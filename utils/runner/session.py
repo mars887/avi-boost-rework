@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from utils.pipeline_runtime import AUTOBOOST_DIR, ROOT_DIR, UTILS_DIR, ensure_dir, is_mars_av1an_fork, load_toolchain
-from utils.plan_model import RunnerEvent
+from utils.plan_model import PSD_SCENE_DETECTION_OPTION_SPECS, RunnerEvent
 from utils.runner_source_info import (
     item_inputs_changed,
     mark_source_info_clean,
@@ -67,6 +67,19 @@ from .terminal import TerminalScreen, decode_visible_ansi_escapes, has_terminal_
 FAST_INTERRUPT = False
 WRAPPER_VPY = ROOT_DIR / "wrapper.vpy"
 MIN_REUSABLE_OUTPUT_BYTES = 1024
+
+def psd_scene_detection_args(primary: Any) -> List[str]:
+    args: List[str] = []
+    for spec in PSD_SCENE_DETECTION_OPTION_SPECS:
+        value = getattr(primary, str(spec["name"]), None)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        args.extend([str(spec["flag"]), text])
+    return args
+
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 PERCENT_RE = re.compile(r"(?<!\d)(100(?:\.0+)?|[0-9]{1,2}(?:\.[0-9]+)?)\s*%")
@@ -1717,14 +1730,21 @@ class SessionController:
             ]
             if self.av1an_progress_jsonl_enabled:
                 auto_boost_cmd.extend(["--av1an-progress-jsonl", str(log_dir / "03.1_fastpass.progress.jsonl")])
+            scene_detection = str(primary.scene_detection or "").strip().lower()
+            if scene_detection == "av1an":
+                auto_boost_cmd.extend(["--av1an-extra-split-sec", str(primary.av1an_extra_split_sec)])
+                auto_boost_cmd.extend(["--av1an-min-scene-len", str(primary.av1an_min_scene_len)])
             if self.av1an_fork_enabled:
                 auto_boost_cmd.extend(["--chunk-order", str(primary.chunk_order or "")])
                 if str(primary.encoder_path or "").strip():
                     auto_boost_cmd.extend(["--encoder-path", str(primary.encoder_path)])
                 if FAST_INTERRUPT:
                     auto_boost_cmd.append("--fast-interrupt")
-            if str(primary.scene_detection or "").strip().lower() == "psd":
+            if scene_detection == "psd":
                 auto_boost_cmd.extend(["--psd-script", self.toolchain.psd_script])
+                psd_args = psd_scene_detection_args(primary)
+                if psd_args:
+                    auto_boost_cmd.extend(["--psd-args", subprocess.list2cmdline(psd_args)])
             if primary.no_fastpass:
                 auto_boost_cmd.append("--no-fastpass")
             if primary.fastpass_hdr:
@@ -1787,10 +1807,11 @@ class SessionController:
                 cmd.extend(["--run-stages", "base-scenes"])
                 return cmd
 
-            scene_detection = str(primary.scene_detection or "").strip().lower()
             if primary.no_fastpass:
                 if scene_detection == "psd":
                     commands.append((STAGE_AUTOBOOST_PSD_SCENE, auto_boost_cmd_for("psd", "base-scenes")))
+                elif scene_detection == "none":
+                    commands.append((STAGE_AUTOBOOST_SCENE, auto_boost_cmd_for("none", "base-scenes")))
                 else:
                     commands.append((STAGE_AUTOBOOST_SCENE, auto_boost_cmd_for("fastpass", "base-scenes")))
             else:

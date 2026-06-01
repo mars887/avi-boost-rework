@@ -30,6 +30,8 @@ from utils.track_gui_shared import (
     APP_WARNING,
     AUDIO_MODE_OPTIONS,
     CHUNK_ORDER_OPTIONS,
+    DEFAULT_AV1AN_EXTRA_SPLIT_SEC,
+    DEFAULT_AV1AN_MIN_SCENE_LEN,
     DEFAULT_CHUNK_ORDER,
     DEFAULT_SOURCE_LOADER,
     DEFAULT_OPTIONS,
@@ -38,6 +40,8 @@ from utils.track_gui_shared import (
     ENCODER_PATH_INFO_PREFIX,
     LEGACY_PORTABLE_DIR,
     MODE_OPTIONS,
+    PSD_SCENE_DETECTION_OPTION_SPECS,
+    SCENE_DETECTION_OPTIONS,
     SOURCE_LOADER_OPTIONS,
     SUB_MODE_OPTIONS,
     TYPE_OPTIONS,
@@ -51,6 +55,7 @@ from utils.track_gui_shared import (
     is_mars_av1an_fork,
     list_portable_encoder_binaries,
     load_gui_data_from_paths,
+    load_psd_scene_detection_defaults,
     load_toolchain,
     normalize_encoder,
     normalize_type,
@@ -68,6 +73,11 @@ class TrackConfigGui:
         self.files = data.get("files") or []
         self.summary = data.get("summary") or []
         defaults_raw = data.get("defaults") or {}
+        toolchain = load_toolchain()
+        self.psd_scene_detection_defaults = load_psd_scene_detection_defaults(
+            toolchain.vs_python_exe,
+            toolchain.psd_script,
+        )
         self.defaults = DefaultSettings(
             params=defaults_raw.get("params") or "",
             last_params=defaults_raw.get("lastParams") or defaults_raw.get("last_params") or "",
@@ -75,6 +85,18 @@ class TrackConfigGui:
             fastpass=defaults_raw.get("fastpass") or defaults_raw.get("fastpass_filter") or "",
             mainpass=defaults_raw.get("mainpass") or defaults_raw.get("mainpass_filter") or "",
             scene_detection=defaults_raw.get("sceneDetection") or defaults_raw.get("scene_detection") or "",
+            av1an_extra_split_sec=(
+                defaults_raw.get("av1anExtraSplitSec")
+                or defaults_raw.get("av1an_extra_split_sec")
+                or DEFAULT_AV1AN_EXTRA_SPLIT_SEC
+            ),
+            av1an_min_scene_len=(
+                defaults_raw.get("av1anMinSceneLen")
+                or defaults_raw.get("av1anMinSceneFrames")
+                or defaults_raw.get("av1an_min_scene_len")
+                or defaults_raw.get("av1an_min_scene_frames")
+                or DEFAULT_AV1AN_MIN_SCENE_LEN
+            ),
             chunk_order=defaults_raw.get("chunkOrder") or defaults_raw.get("chunk_order") or DEFAULT_CHUNK_ORDER,
             encoder_path=defaults_raw.get("encoderPath") or defaults_raw.get("encoder_path") or "",
             no_fastpass=defaults_raw.get("noFastpass") or defaults_raw.get("no_fastpass") or False,
@@ -126,6 +148,15 @@ class TrackConfigGui:
             ),
             attach_encode_info=defaults_raw["attachEncodeInfo"] if "attachEncodeInfo" in defaults_raw else defaults_raw.get("attach_encode_info", False),
             note=defaults_raw.get("note") or "",
+            **{
+                str(spec["name"]): (
+                    defaults_raw.get(str(spec.get("camel") or ""))
+                    or defaults_raw.get(str(spec["name"]))
+                    or self.psd_scene_detection_defaults.get(str(spec["name"]))
+                    or spec["default"]
+                )
+                for spec in PSD_SCENE_DETECTION_OPTION_SPECS
+            },
         )
         self.plan_paths = data.get("planPaths") or {}
         self.output_mode = data.get("outputMode") or "plans"
@@ -133,7 +164,6 @@ class TrackConfigGui:
         self._encoder_path_choices = []
         self._encoder_path_info_value = f"{ENCODER_PATH_INFO_PREFIX} {LEGACY_PORTABLE_DIR}"
         self._last_encoder_path_choice = ""
-        toolchain = load_toolchain()
         self.av1an_exe = toolchain.av1an_exe
         self.av1an_fork_enabled = is_mars_av1an_fork(self.av1an_exe)
 
@@ -214,7 +244,9 @@ class TrackConfigGui:
         style.configure("GoodChip.TLabel", background="#133426", foreground=APP_SUCCESS, font=("Segoe UI Semibold", 10), padding=(10, 5))
         style.configure("WarnChip.TLabel", background="#3a2a12", foreground=APP_WARNING, font=("Segoe UI Semibold", 10), padding=(10, 5))
         style.configure("TEntry", fieldbackground=APP_INPUT, foreground=APP_TEXT, insertcolor=APP_TEXT, bordercolor=APP_BORDER, lightcolor=APP_BORDER, darkcolor=APP_BORDER, padding=6)
+        style.configure("TSpinbox", fieldbackground=APP_INPUT, foreground=APP_TEXT, insertcolor=APP_TEXT, background=APP_INPUT, arrowcolor=APP_ACCENT, bordercolor=APP_BORDER, lightcolor=APP_BORDER, darkcolor=APP_BORDER, padding=6)
         style.configure("TCombobox", fieldbackground=APP_INPUT, foreground=APP_TEXT, background=APP_INPUT, arrowcolor=APP_ACCENT, bordercolor=APP_BORDER, lightcolor=APP_BORDER, darkcolor=APP_BORDER, padding=4)
+        style.map("TSpinbox", fieldbackground=[("readonly", APP_INPUT)], foreground=[("disabled", APP_MUTED), ("readonly", APP_TEXT)])
         style.map("TCombobox", fieldbackground=[("readonly", APP_INPUT)], foreground=[("readonly", APP_TEXT)], selectbackground=[("readonly", APP_INPUT)])
         style.configure("TCheckbutton", background=APP_CARD, foreground=APP_TEXT, font=APP_BODY_FONT)
         style.map("TCheckbutton", background=[("active", APP_CARD)], foreground=[("active", APP_ACCENT)])
@@ -301,6 +333,22 @@ class TrackConfigGui:
         entry = ttk.Entry(parent, **entry_options)
         entry.grid(row=row, column=column * 2 + 1, sticky=tk.EW, pady=6)
         return entry
+
+    def _build_labeled_spinbox(self, parent, row, column, label, variable, *, from_=0, to=9999, width=28):
+        ttk.Label(parent, text=label, style="SectionLabel.TLabel").grid(row=row, column=column * 2, sticky=tk.W, padx=(0, 8), pady=6)
+        spin = ttk.Spinbox(
+            parent,
+            from_=from_,
+            to=to,
+            increment=1,
+            textvariable=variable,
+            width=width,
+            validate="key",
+            validatecommand=self._int_vcmd,
+            style="TSpinbox",
+        )
+        spin.grid(row=row, column=column * 2 + 1, sticky=tk.EW, pady=6)
+        return spin
 
     def _build_labeled_combo(self, parent, row, column, label, variable, values, *, width=26, state="readonly"):
         ttk.Label(parent, text=label, style="SectionLabel.TLabel").grid(row=row, column=column * 2, sticky=tk.W, padx=(0, 8), pady=6)
@@ -565,14 +613,17 @@ class TrackConfigGui:
         notebook.pack(fill=tk.BOTH, expand=True)
 
         video_tab = ttk.Frame(notebook, style="Surface.TFrame")
+        additional_tab = ttk.Frame(notebook, style="Surface.TFrame")
         experimental_tab = ttk.Frame(notebook, style="Surface.TFrame")
         tracks_tab = ttk.Frame(notebook, style="Surface.TFrame")
 
         notebook.add(video_tab, text="Video Pipeline")
+        notebook.add(additional_tab, text="Additional Config")
         notebook.add(experimental_tab, text="Experimental")
         notebook.add(tracks_tab, text="Track Rules")
 
         self._build_video_tab(video_tab)
+        self._build_additional_config_tab(additional_tab)
         self._build_experimental_tab(experimental_tab)
         self._build_tracks_tab(tracks_tab)
 
@@ -586,6 +637,11 @@ class TrackConfigGui:
         self.default_fastpass_var = tk.StringVar(value=self.defaults.fastpass)
         self.default_mainpass_var = tk.StringVar(value=self.defaults.mainpass)
         self.scene_detection_var = tk.StringVar(value=self.defaults.scene_detection or "av1an")
+        self.av1an_extra_split_sec_var = tk.StringVar(value=self.defaults.av1an_extra_split_sec or str(DEFAULT_AV1AN_EXTRA_SPLIT_SEC))
+        self.av1an_min_scene_len_var = tk.StringVar(value=self.defaults.av1an_min_scene_len or str(DEFAULT_AV1AN_MIN_SCENE_LEN))
+        for spec in PSD_SCENE_DETECTION_OPTION_SPECS:
+            name = str(spec["name"])
+            setattr(self, f"{name}_var", tk.StringVar(value=getattr(self.defaults, name)))
         self.encoder_var = tk.StringVar(value=self.defaults.encoder or DEFAULT_VIDEO_ENCODER)
         self.chunk_order_var = tk.StringVar(value=self.defaults.chunk_order or DEFAULT_CHUNK_ORDER)
         self.encoder_path_var = tk.StringVar(value=self.defaults.encoder_path)
@@ -662,7 +718,7 @@ class TrackConfigGui:
             columns=2,
         )
         core_section.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
-        self._build_labeled_combo(core_section, row, 0, "Scene detection", self.scene_detection_var, ["psd", "av1an"], width=24)
+        self._build_labeled_combo(core_section, row, 0, "Scene detection", self.scene_detection_var, list(SCENE_DETECTION_OPTIONS), width=24)
         if self.av1an_fork_enabled:
             self._build_labeled_combo(core_section, row, 1, "Chunk order", self.chunk_order_var, CHUNK_ORDER_OPTIONS, width=24)
             row += 1
@@ -750,7 +806,7 @@ class TrackConfigGui:
 
         self.default_fastpass_var.trace_add("write", self.on_defaults_change)
         self.default_mainpass_var.trace_add("write", self.on_defaults_change)
-        self.scene_detection_var.trace_add("write", self.on_defaults_change)
+        self.scene_detection_var.trace_add("write", self.on_scene_detection_change)
         self.encoder_var.trace_add("write", self.on_encoder_change)
         if self.av1an_fork_enabled:
             self.chunk_order_var.trace_add("write", self.on_defaults_change)
@@ -774,6 +830,29 @@ class TrackConfigGui:
         self.ab_multiplier_var.trace_add("write", self.on_ab_multiplier_change)
         self.ab_pos_multiplier_var.trace_add("write", self.on_ab_pos_multiplier_change)
         self.ab_neg_multiplier_var.trace_add("write", self.on_ab_pos_multiplier_change)
+
+    def _build_additional_config_tab(self, frame):
+        content = self._create_scrollable_area(frame)
+        grid = ttk.Frame(content, style="Surface.TFrame", padding=(6, 6, 6, 16))
+        grid.pack(fill=tk.BOTH, expand=True)
+        grid.columnconfigure(0, weight=1)
+
+        scene_section, row = self._build_section(
+            grid,
+            title="Scene Detection",
+            columns=2,
+        )
+        scene_section.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.scene_detection_config_body = ttk.Frame(scene_section, style="Card.TFrame")
+        self.scene_detection_config_body.grid(row=row, column=0, columnspan=4, sticky="nsew")
+        self.scene_detection_config_body.columnconfigure(1, weight=1)
+        self.scene_detection_config_body.columnconfigure(3, weight=1)
+
+        self.av1an_extra_split_sec_var.trace_add("write", self.on_defaults_change)
+        self.av1an_min_scene_len_var.trace_add("write", self.on_defaults_change)
+        for spec in PSD_SCENE_DETECTION_OPTION_SPECS:
+            getattr(self, f"{spec['name']}_var").trace_add("write", self.on_defaults_change)
+        self._refresh_scene_detection_config()
 
     def _build_experimental_tab(self, frame):
         content = self._create_scrollable_area(frame)
@@ -1134,6 +1213,16 @@ class TrackConfigGui:
             fastpass=self._get_var_value("default_fastpass_var"),
             mainpass=self._get_var_value("default_mainpass_var"),
             scene_detection=self._get_var_value("scene_detection_var"),
+            av1an_extra_split_sec=self._get_var_value("av1an_extra_split_sec_var") or str(DEFAULT_AV1AN_EXTRA_SPLIT_SEC),
+            av1an_min_scene_len=self._get_var_value("av1an_min_scene_len_var") or str(DEFAULT_AV1AN_MIN_SCENE_LEN),
+            **{
+                str(spec["name"]): (
+                    self._get_var_value(f"{spec['name']}_var")
+                    or self.psd_scene_detection_defaults.get(str(spec["name"]))
+                    or spec["default"]
+                )
+                for spec in PSD_SCENE_DETECTION_OPTION_SPECS
+            },
             encoder=self._get_var_value("encoder_var"),
             chunk_order=chunk_order_value,
             encoder_path=encoder_path_value,
@@ -1407,6 +1496,32 @@ class TrackConfigGui:
         self.defaults = self._current_defaults()
         self._refresh_results()
 
+    def _refresh_scene_detection_config(self):
+        body = getattr(self, "scene_detection_config_body", None)
+        if body is None:
+            return
+        for child in body.winfo_children():
+            child.destroy()
+        mode = self.scene_detection_var.get().strip().lower() if hasattr(self, "scene_detection_var") else ""
+        if mode == "av1an":
+            self._build_labeled_spinbox(body, 0, 0, "Max Scene Seconds", self.av1an_extra_split_sec_var, from_=0, to=3600)
+            self._build_labeled_spinbox(body, 0, 1, "Min Scene Frames", self.av1an_min_scene_len_var, from_=1, to=100000)
+        elif mode == "psd":
+            for index, spec in enumerate(PSD_SCENE_DETECTION_OPTION_SPECS):
+                self._build_labeled_spinbox(
+                    body,
+                    index // 2,
+                    index % 2,
+                    str(spec["label"]),
+                    getattr(self, f"{spec['name']}_var"),
+                    from_=1,
+                    to=100000,
+                )
+
+    def on_scene_detection_change(self, *_args):
+        self._refresh_scene_detection_config()
+        self.on_defaults_change()
+
     def on_av1an_decoupled_change(self, *_args):
         self._refresh_av1an_decoupled_state()
         self.on_defaults_change()
@@ -1602,6 +1717,8 @@ class TrackConfigGui:
             "fastpass_filter": self.defaults.fastpass,
             "mainpass_filter": self.defaults.mainpass,
             "scene_detection": self.defaults.scene_detection,
+            "av1an_extra_split_sec": self.defaults.av1an_extra_split_sec,
+            "av1an_min_scene_len": self.defaults.av1an_min_scene_len,
             "chunk_order": self.defaults.chunk_order,
             "encoder_path": self.defaults.encoder_path,
             "no_fastpass": self.defaults.no_fastpass,
@@ -1634,6 +1751,9 @@ class TrackConfigGui:
             "attach_encode_info": self.defaults.attach_encode_info,
             "note": self.defaults.note,
         }
+        for spec in PSD_SCENE_DETECTION_OPTION_SPECS:
+            name = str(spec["name"])
+            defaults_map[name] = getattr(self.defaults, name)
         saved = []
         for file_path, tracks in result.items():
             source_path = Path(file_path)

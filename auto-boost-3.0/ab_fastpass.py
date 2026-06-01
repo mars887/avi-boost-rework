@@ -90,10 +90,13 @@ def run_fastpass_av1an(
     encoder_path: str = "",
     fast_interrupt: bool = False,
     vspipe_args: Optional[List[str]] = None,
+    av1an_extra_split_sec: int = 15,
+    av1an_min_scene_len: int = 24,
 ) -> None:
     """Build and execute the av1an fast-pass command (or sc-only)."""
     encoder = normalize_encoder(encoder)
-    if scenes_path is not None and str(sdm).strip().lower() == "psd":
+    sdm_mode = str(sdm).strip().lower()
+    if scenes_path is not None and sdm_mode in ("psd", "none"):
         ensure_exists(scenes_path, "Base scenes.json")
     ensure_dir(av1an_temp)
 
@@ -128,12 +131,18 @@ def run_fastpass_av1an(
     # Provide scenes file (skip scene detection) or emit scenes when --sc-only
     if scenes_path is not None:
         cmd.extend(["--scenes", str(scenes_path)])
-        if str(sdm).strip().lower() == "psd":
+        if sdm_mode == "psd":
             cmd.extend(["--extra-split-sec", "30"])
-        else:
-            cmd.extend(["--extra-split-sec", "15"])
+        elif sdm_mode == "av1an":
+            if int(av1an_extra_split_sec) > 0:
+                cmd.extend(["--extra-split-sec", str(int(av1an_extra_split_sec))])
+            if int(av1an_min_scene_len) > 0:
+                cmd.extend(["--min-scene-len", str(int(av1an_min_scene_len))])
     else:
-        cmd.extend(["--extra-split-sec", "15"])
+        if int(av1an_extra_split_sec) > 0:
+            cmd.extend(["--extra-split-sec", str(int(av1an_extra_split_sec))])
+        if int(av1an_min_scene_len) > 0:
+            cmd.extend(["--min-scene-len", str(int(av1an_min_scene_len))])
 
 
     # Muxing defaults from old scripts
