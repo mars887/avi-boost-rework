@@ -938,6 +938,11 @@ class SessionController:
         if getattr(self, "_console_ansi_ready", False):
             return
         self._console_ansi_ready = True
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
         if os.name != "nt":
             return
         try:

@@ -15,6 +15,7 @@ from typing import Any, Iterable, List, Optional, Sequence, TextIO
 ROOT_DIR = Path(__file__).resolve().parent.parent
 UTILS_DIR = ROOT_DIR / "utils"
 AUTOBOOST_DIR = ROOT_DIR / "auto-boost-3.0"
+PROJECT_PSD_SCRIPT = ROOT_DIR / "Progressive-Scene-Detection.py"
 
 LEGACY_PORTABLE_DIR = Path(r"C:\vapoursynth\vapoursynth-portable")
 LEGACY_PYTHON_EXE = Path(r"C:\Python313\python.exe")
@@ -63,8 +64,8 @@ def load_toolchain() -> Toolchain:
     )
     psd_script = (
         os.environ.get("PBBATCH_PSD_SCRIPT")
-        or _first_existing([LEGACY_PSD_SCRIPT, "Progressive-Scene-Detection.py"])
-        or "Progressive-Scene-Detection.py"
+        or _first_existing([PROJECT_PSD_SCRIPT, LEGACY_PSD_SCRIPT, "Progressive-Scene-Detection.py"])
+        or str(PROJECT_PSD_SCRIPT)
     )
     return Toolchain(
         python_exe=str(python_exe),

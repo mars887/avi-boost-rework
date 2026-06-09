@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+DEFAULT_PSD_SCRIPT = Path(ROOT).parent / "Progressive-Scene-Detection.py"
 
 
 from ab_fastpass import run_fastpass_av1an
@@ -71,6 +72,20 @@ def vspipe_args_to_dict(items: List[str]) -> Dict[str, str]:
         if key:
             out[key] = value
     return out
+
+
+def vspipe_args_has_key(items: List[str], key: str) -> bool:
+    wanted = str(key or "").strip()
+    if not wanted:
+        return False
+    for item in items or []:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        item_key = text.split("=", 1)[0].strip()
+        if item_key == wanted:
+            return True
+    return False
 
 
 RUN_STAGE_ALIASES = {
@@ -146,8 +161,8 @@ def main() -> int:
                         help="Write Stage 4 draft to scenes-preview.json and stop before Stage 5 (useful for two-pass batch).")
 
     # PSD
-    parser.add_argument("--psd-script", default="Progressive-Scene-Detection.py",
-                        help="Path to Progressive-Scene-Detection.py (PSD). Default: Progressive-Scene-Detection.py (cwd).")
+    parser.add_argument("--psd-script", default=str(DEFAULT_PSD_SCRIPT),
+                        help="Path to Progressive-Scene-Detection.py (PSD). Default: project-local script.")
     parser.add_argument("--psd-python", default=None,
                         help="Python executable for PSD. Default: current Python.")
     parser.add_argument("--psd-args", default="",
@@ -161,9 +176,9 @@ def main() -> int:
     parser.add_argument("--fastpass-out", default=None,
                         help="Fast-pass output file. Default: <project>/<stem>.fastpass.mkv")
     parser.add_argument("--fastpass-vpy", default=None,
-                        help="Optional .vpy path for fast-pass input (used for av1an -i). Adds --vspipe-args src=<input>.")
+                        help="Optional .vpy path for fast-pass input (used for av1an -i, and PSD when no proxy is set). Adds --vspipe-args src=<input>.")
     parser.add_argument("--fastpass-proxy", default=None,
-                        help="Optional av1an --proxy path for fast-pass. Adds --proxy and --vspipe-args src=<input>.")
+                        help="Optional av1an --proxy path for fast-pass. PSD uses this as its input when --sdm psd. Adds --proxy and --vspipe-args src=<input>.")
     parser.add_argument("--fastpass-vspipe-arg", action="append", default=[],
                         help="Extra key=value argument forwarded to av1an --vspipe-args for --fastpass-vpy.")
     parser.add_argument("--av1an", default="av1an",
@@ -288,6 +303,10 @@ def main() -> int:
     fastpass_vpy_args = vspipe_args_to_dict(fastpass_vspipe_args)
     if fastpass_vpy is not None and "src" not in fastpass_vpy_args:
         fastpass_vpy_args["src"] = str(input_file)
+    psd_input_file = fastpass_proxy if fastpass_proxy is not None else (fastpass_vpy if fastpass_vpy is not None else input_file)
+    psd_vspipe_args = list(fastpass_vspipe_args)
+    if psd_input_file.suffix.lower() == ".vpy" and not vspipe_args_has_key(psd_vspipe_args, "src"):
+        psd_vspipe_args.insert(0, f"src={input_file}")
     hdr_patch_script = Path(args.hdr_patch_script).expanduser().resolve()
     if args.fastpass_hdr:
         ensure_exists(hdr_patch_script, "HDR patch script")
@@ -417,14 +436,19 @@ def main() -> int:
                 else:
                     psd_script = Path(args.psd_script).expanduser()
                     if not psd_script.exists():
-                        cand = project_dir / psd_script
-                        if cand.exists():
+                        candidates = (project_dir / psd_script, Path(ROOT) / psd_script, Path(ROOT).parent / psd_script)
+                        for cand in candidates:
+                            if not cand.exists():
+                                continue
                             psd_script = cand
+                            break
                     psd_python = Path(args.psd_python).expanduser() if args.psd_python else None
                     emit_runner_child_event("Auto-Boost: PSD Scene Detection", "started", source=input_file, workdir=project_dir)
                     try:
-                        run_psd(psd_script=psd_script, psd_python=psd_python, input_file=input_file,
-                                base_scenes_path=base_scenes_path, extra_args=args.psd_args)
+                        run_psd(psd_script=psd_script, psd_python=psd_python, input_file=psd_input_file,
+                                base_scenes_path=base_scenes_path, extra_args=args.psd_args,
+                                vspipe_args=psd_vspipe_args if psd_input_file.suffix.lower() == ".vpy" else None,
+                                event_source=input_file)
                     except Exception as exc:
                         emit_runner_child_event("Auto-Boost: PSD Scene Detection", "failed", message=str(exc), source=input_file, workdir=project_dir)
                         raise
