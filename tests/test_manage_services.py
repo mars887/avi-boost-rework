@@ -1,0 +1,648 @@
+import json
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from utils.manage import av1an_state, reset as manage_reset
+from utils.manage.analytics import collect_pass_rows, sort_pass_rows, SortSpec
+from utils.manage.av1an_state import (
+    ChunkPatch,
+    FrameRange,
+    MoveTarget,
+    chunk_name,
+    load_chunks,
+    load_done,
+    merge_chunks,
+    move_chunks,
+    reindex_chunks_transactionally,
+    reshape_chunk_range,
+    save_chunks,
+    sort_chunks,
+    split_chunk,
+    swap_chunks,
+    update_chunk_params,
+)
+from utils.manage.config import (
+    compute_config_fingerprint,
+    confirm_fingerprint,
+    stale_config_warnings,
+    validate_zone_text,
+)
+from utils.manage.context import context_from_plan, context_from_workdir
+from utils.manage.discovery import discover_workdirs, is_workdir, resolve_argument_to_refs
+from utils.manage.scenes import (
+    SceneSelector,
+    ZonePatch,
+    load_scene_file,
+    patch_scene_region,
+    rebuild_split_scenes_for_chunks,
+    validate_scene_file,
+)
+from utils.manage.status import (
+    STATE_COMPLETED,
+    STATE_NOT_STARTED,
+    STATE_STALE_MARKER,
+    get_stage_statuses,
+    is_runner_active,
+    summarize_workdir,
+)
+from utils.manage.store import WorkdirStore, import_workdir_files
+from utils.plan import FilePlan, PlanMeta, PlanPaths, VideoPlan, save_plan
+from utils.runner_state import (
+    STAGE_DEMUX,
+    STAGE_FASTPASS,
+    STAGE_MAINPASS,
+    STAGE_MUX,
+    STAGE_SSIMU2,
+    STAGE_VERIFY,
+    STAGE_ZONE_BOUNDARIES,
+)
+
+
+def write_json(path: Path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def make_chunk(index: int, start: int, end: int, temp: str, **extra):
+    chunk = {
+        "temp": temp,
+        "index": index,
+        "input": {"path": "x", "video_params": []},
+        "proxy": None,
+        "output_ext": "ivf",
+        "start_frame": start,
+        "end_frame": end,
+        "frame_rate": 24.0,
+        "passes": 1,
+        "video_params": ["--crf", "30"],
+        "encoder": "svt-av1",
+        "pb_debug": {"keep": True},
+    }
+    chunk.update(extra)
+    return chunk
+
+
+class ManageFixture:
+    """Temp source dir + plan + workdir with av1an fastpass state."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        self.source = self.root / "episode.mkv"
+        self.source.write_bytes(b"\x00" * 2048)
+        plan = FilePlan(
+            meta=PlanMeta(name="episode"),
+            paths=PlanPaths(source="episode.mkv"),
+            video=VideoPlan(track_id=0, action="edit"),
+        )
+        self.plan_path = self.root / "episode.plan"
+        save_plan(plan, self.plan_path)
+        self.workdir = self.root / "episode"
+
+        self.state_dir = self.workdir / ".state"
+        self.meta_dir = self.workdir / "00_meta"
+        self.video_dir = self.workdir / "video"
+        self.video_state = self.video_dir / ".state"
+        self.fastpass = self.video_dir / "fastpass"
+        self.mainpass = self.video_dir / "mainpass"
+        for directory in (
+            self.state_dir,
+            self.meta_dir,
+            self.video_state,
+            self.fastpass / "encode",
+            self.fastpass / "split",
+            self.mainpass / "encode",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        (self.workdir / "zoned_command.txt").write_text("", encoding="utf-8")
+
+        temp = str(self.fastpass)
+        chunks = [
+            make_chunk(0, 0, 100, temp),
+            make_chunk(1, 100, 200, temp),
+            make_chunk(2, 200, 300, temp),
+        ]
+        write_json(self.fastpass / "chunks.json", chunks)
+        write_json(
+            self.fastpass / "done.json",
+            {
+                "frames": 300,
+                "done": {
+                    "00000": {"frames": 100, "size_bytes": 11},
+                    "00001": {"frames": 100, "size_bytes": 22},
+                    "00002": {"frames": 100, "size_bytes": 33},
+                },
+                "audio_done": False,
+                "pb_extra": 1,
+            },
+        )
+        for index in range(3):
+            (self.fastpass / "encode" / f"{chunk_name(index)}.ivf").write_bytes(b"v" * (10 + index))
+        (self.fastpass / "split" / "00002_fpf.log").write_text("fpf", encoding="utf-8")
+        (self.fastpass / "split" / "v_00002_probe.bin").write_bytes(b"p")
+        (self.fastpass / "split" / "2.json").write_text("{}", encoding="utf-8")
+
+        scenes = {
+            "frames": 300,
+            "scenes": [
+                {"start_frame": 0, "end_frame": 100, "zone_overrides": None},
+                {"start_frame": 100, "end_frame": 200, "zone_overrides": None},
+                {"start_frame": 200, "end_frame": 300, "zone_overrides": None},
+            ],
+            "split_scenes": [
+                {
+                    "start_frame": 0,
+                    "end_frame": 100,
+                    "zone_overrides": {"video_params": ["--crf", "28"], "min_scene_len": 24},
+                },
+                {
+                    "start_frame": 100,
+                    "end_frame": 200,
+                    "zone_overrides": {"video_params": ["--crf", "30"], "min_scene_len": 24},
+                },
+                {
+                    "start_frame": 200,
+                    "end_frame": 300,
+                    "zone_overrides": {"video_params": ["--crf", "32"], "min_scene_len": 24},
+                },
+            ],
+            "pb_meta": {"keep": "yes"},
+        }
+        write_json(self.video_dir / "scenes.json", scenes)
+        write_json(self.fastpass / "scenes.json", scenes)
+
+        # completed early stages
+        (self.state_dir / "DEMUX_DONE").write_text("ok\n", encoding="utf-8")
+        write_json(self.meta_dir / "demux_manifest.json", {"source": str(self.source), "subs": []})
+        (self.video_state / "FASTPASS_COMPLETED").write_text("ok\n", encoding="utf-8")
+        (self.video_state / "SSIMU2_COMPLETED").write_text("ok\n", encoding="utf-8")
+        (self.fastpass / "episode.fastpass.mkv").write_bytes(b"f" * 2048)
+        (self.fastpass / "episode_ssimu2.log").write_text(
+            "skip: 3\n0: 70.5\n3: 71.2\n6: 69.0\n99: 80.0\n", encoding="utf-8"
+        )
+        write_json(
+            self.meta_dir / "source_info.json",
+            {"source": str(self.source), "plan": str(self.plan_path)},
+        )
+        events = [
+            {
+                "event": "runner",
+                "plan": str(self.plan_path),
+                "mode": "full",
+                "stage": STAGE_DEMUX,
+                "status": "completed",
+                "message": "",
+                "timestamp": 100.0,
+                "session_id": "s1",
+                "plan_run_id": "r1",
+                "source": str(self.source),
+                "workdir": str(self.workdir),
+                "progress": -1.0,
+                "started_at": 90.0,
+                "ended_at": 100.0,
+                "elapsed_seconds": 10.0,
+            }
+        ]
+        with (self.meta_dir / "runner_events.jsonl").open("w", encoding="utf-8") as fh:
+            for event in events:
+                fh.write(json.dumps(event) + "\n")
+
+    def context(self):
+        return context_from_plan(self.plan_path)
+
+
+class ContextDiscoveryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_context_from_plan(self) -> None:
+        ctx = self.fixture.context()
+        self.assertEqual(ctx.workdir, self.fixture.workdir)
+        self.assertEqual(ctx.mode, "full")
+        self.assertIn(STAGE_FASTPASS, ctx.stage_names)
+        self.assertIn(STAGE_MAINPASS, ctx.stage_names)
+
+    def test_context_from_workdir_recovers_plan(self) -> None:
+        ctx = context_from_workdir(self.fixture.workdir)
+        self.assertIsNotNone(ctx.resolved_plan)
+        self.assertEqual(ctx.plan_path, self.fixture.plan_path)
+
+    def test_context_from_workdir_without_plan(self) -> None:
+        self.fixture.plan_path.unlink()
+        (self.fixture.meta_dir / "source_info.json").unlink()
+        ctx = context_from_workdir(self.fixture.workdir)
+        self.assertIsNone(ctx.resolved_plan)
+        self.assertTrue(ctx.stage_names)
+        self.assertTrue(any("best-effort" in warning for warning in ctx.warnings))
+
+    def test_discovery_workdir_and_plan(self) -> None:
+        refs = resolve_argument_to_refs(self.fixture.workdir)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0].workdir, self.fixture.workdir)
+        self.assertEqual(refs[0].plan_path, self.fixture.plan_path)
+
+        refs = resolve_argument_to_refs(self.fixture.plan_path)
+        self.assertEqual(refs[0].workdir, self.fixture.workdir)
+
+        refs = discover_workdirs([str(self.fixture.root)])
+        self.assertEqual(len(refs), 1)
+
+    def test_is_workdir(self) -> None:
+        self.assertTrue(is_workdir(self.fixture.workdir))
+        self.assertFalse(is_workdir(self.fixture.root / "missing"))
+
+
+class StatusTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.ctx = self.fixture.context()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_runner_not_active(self) -> None:
+        self.assertFalse(is_runner_active(self.ctx))
+
+    def test_stage_states(self) -> None:
+        statuses = {status.name: status for status in get_stage_statuses(self.ctx)}
+        self.assertEqual(statuses[STAGE_DEMUX].state, STATE_COMPLETED)
+        self.assertEqual(statuses[STAGE_MAINPASS].state, STATE_NOT_STARTED)
+        # fastpass artifacts valid -> completed
+        self.assertEqual(statuses[STAGE_FASTPASS].state, STATE_COMPLETED)
+
+    def test_stale_marker_detection(self) -> None:
+        (self.fixture.meta_dir / "demux_manifest.json").unlink()
+        statuses = {status.name: status for status in get_stage_statuses(self.ctx)}
+        self.assertEqual(statuses[STAGE_DEMUX].state, STATE_STALE_MARKER)
+
+    def test_summary(self) -> None:
+        summary = summarize_workdir(self.ctx)
+        self.assertEqual(summary.mode, "full")
+        self.assertGreater(summary.total_stages, 5)
+        self.assertFalse(summary.runner.active)
+
+
+class StoreTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_docs_and_events(self) -> None:
+        store = WorkdirStore(Path(self._tmp.name) / "store.sqlite")
+        with store:
+            store.put_doc("ui_state", "tab", {"value": "Status"})
+            self.assertEqual(store.get_doc("ui_state", "tab"), {"value": "Status"})
+            store.put_doc("ui_state", "tab", {"value": "Scenes"})
+            self.assertEqual(store.get_doc("ui_state", "tab"), {"value": "Scenes"})
+            store.append_event("stage_events", {"stage": "Demux", "status": "completed", "timestamp": 1.0})
+            store.append_event("stage_events", {"stage": "Demux", "status": "failed", "timestamp": 2.0})
+            latest = store.latest_event("stage_events", stage="Demux")
+            self.assertEqual(latest["status"], "failed")
+
+    def test_transaction_rollback(self) -> None:
+        store = WorkdirStore(Path(self._tmp.name) / "store.sqlite")
+        with store:
+            store.put_doc("docs", "keep", {"value": 1})
+            with self.assertRaises(RuntimeError):
+                with store.transaction():
+                    store.put_doc("docs", "keep", {"value": 2})
+                    raise RuntimeError("boom")
+            self.assertEqual(store.get_doc("docs", "keep"), {"value": 1})
+
+    def test_import_jsonl_tail(self) -> None:
+        store = WorkdirStore(Path(self._tmp.name) / "store.sqlite")
+        with store:
+            stats = import_workdir_files(store, self.fixture.workdir)
+            self.assertEqual(stats["runner_events"], 1)
+            # second import reads nothing new
+            stats = import_workdir_files(store, self.fixture.workdir)
+            self.assertEqual(stats["runner_events"], 0)
+            # append one more line -> only the tail is read
+            with (self.fixture.meta_dir / "runner_events.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"stage": "Fastpass", "status": "started", "timestamp": 3.0}) + "\n")
+            stats = import_workdir_files(store, self.fixture.workdir)
+            self.assertEqual(stats["runner_events"], 1)
+            events = store.events("stage_events")
+            self.assertEqual(len(events), 2)
+
+
+class ChunksDoneTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.pass_dir = self.fixture.fastpass
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_parse_and_save_roundtrip(self) -> None:
+        chunks = load_chunks(self.pass_dir)
+        self.assertEqual([chunk.index for chunk in chunks], [0, 1, 2])
+        save_chunks(self.pass_dir, chunks)
+        raw = json.loads((self.pass_dir / "chunks.json").read_text(encoding="utf-8"))
+        self.assertIsInstance(raw, list)
+        self.assertEqual(raw[0]["pb_debug"], {"keep": True})  # unknown fields preserved
+
+        done = load_done(self.pass_dir)
+        self.assertEqual(done.frames, 300)
+        self.assertTrue(done.is_done(1))
+        self.assertEqual(done.data["pb_extra"], 1)
+
+    def test_mark_chunk_not_done_delete(self) -> None:
+        av1an_state.mark_chunk_not_done(self.pass_dir, 2, policy="delete")
+        done = load_done(self.pass_dir)
+        self.assertFalse(done.is_done(2))
+        self.assertEqual(done.frames, 300)  # project frame count untouched
+        self.assertFalse((self.pass_dir / "encode" / "00002.ivf").exists())
+        self.assertFalse((self.pass_dir / "split" / "00002_fpf.log").exists())
+        self.assertFalse((self.pass_dir / "split" / "v_00002_probe.bin").exists())
+        self.assertFalse((self.pass_dir / "split" / "2.json").exists())
+
+    def test_mark_chunk_not_done_quarantine(self) -> None:
+        av1an_state.mark_chunk_not_done(self.pass_dir, 1, policy="quarantine")
+        self.assertFalse((self.pass_dir / "encode" / "00001.ivf").exists())
+        quarantined = list((self.pass_dir / "encode").glob("00001_deleted-*.ivf"))
+        self.assertEqual(len(quarantined), 1)
+
+    def test_swap_and_move(self) -> None:
+        swap_chunks(self.pass_dir, 0, 2)
+        self.assertEqual([chunk.index for chunk in load_chunks(self.pass_dir)], [2, 1, 0])
+        move_chunks(self.pass_dir, [1], MoveTarget(kind="start"))
+        self.assertEqual([chunk.index for chunk in load_chunks(self.pass_dir)], [1, 2, 0])
+        move_chunks(self.pass_dir, [1, 2], MoveTarget(kind="after", anchor_index=0), order="descending")
+        self.assertEqual([chunk.index for chunk in load_chunks(self.pass_dir)], [0, 2, 1])
+
+    def test_sort(self) -> None:
+        sort_chunks(self.pass_dir, "long-to-short")
+        self.assertEqual(len(load_chunks(self.pass_dir)), 3)
+        sort_chunks(self.pass_dir, "sequential")
+        self.assertEqual([chunk.start_frame for chunk in load_chunks(self.pass_dir)], [0, 100, 200])
+        sort_chunks(self.pass_dir, "ssimu2", key_values={0: 70.0, 1: 60.0, 2: 80.0})
+        self.assertEqual([chunk.index for chunk in load_chunks(self.pass_dir)], [1, 0, 2])
+
+    def test_update_chunk_params_resets_done(self) -> None:
+        was_done = update_chunk_params(self.pass_dir, 0, ChunkPatch(video_params=["--crf", "20"]))
+        self.assertTrue(was_done)
+        done = load_done(self.pass_dir)
+        self.assertFalse(done.is_done(0))
+        chunks = load_chunks(self.pass_dir)
+        self.assertEqual(chunks[0].video_params, ["--crf", "20"])
+        self.assertFalse((self.pass_dir / "encode" / "00000.ivf").exists())
+
+
+class GeometryTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.pass_dir = self.fixture.fastpass
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_reindex(self) -> None:
+        result = reindex_chunks_transactionally(self.pass_dir, {1: 5, 2: 6})
+        self.assertEqual(result.mapping, {1: 5, 2: 6})
+        chunks = {chunk.index for chunk in load_chunks(self.pass_dir)}
+        self.assertEqual(chunks, {0, 5, 6})
+        done = load_done(self.pass_dir)
+        self.assertEqual(set(done.done.keys()), {"00000", "00005", "00006"})
+        self.assertTrue((self.pass_dir / "encode" / "00005.ivf").exists())
+        self.assertTrue((self.pass_dir / "encode" / "00006.ivf").exists())
+        self.assertTrue((self.pass_dir / "split" / "00006_fpf.log").exists())
+        self.assertTrue((self.pass_dir / "split" / "v_00006_probe.bin").exists())
+        self.assertTrue((self.pass_dir / "split" / "6.json").exists())
+
+    def test_split_chunk(self) -> None:
+        result = split_chunk(self.pass_dir, 1, 150)
+        self.assertEqual(result.reset_indices, [1])
+        self.assertEqual(result.new_indices, [2])
+        chunks = load_chunks(self.pass_dir)
+        self.assertEqual(
+            [(chunk.index, chunk.start_frame, chunk.end_frame) for chunk in chunks],
+            [(0, 0, 100), (1, 100, 150), (2, 150, 200), (3, 200, 300)],
+        )
+        done = load_done(self.pass_dir)
+        # chunk 0 untouched, old chunk 2 remapped to 3 with state preserved
+        self.assertTrue(done.is_done(0))
+        self.assertFalse(done.is_done(1))
+        self.assertFalse(done.is_done(2))
+        self.assertTrue(done.is_done(3))
+        self.assertTrue((self.pass_dir / "encode" / "00003.ivf").exists())
+        self.assertFalse((self.pass_dir / "encode" / "00001.ivf").exists())
+        self.assertTrue((self.pass_dir / "split" / "00003_fpf.log").exists())
+
+    def test_merge_chunks(self) -> None:
+        split_chunk(self.pass_dir, 1, 150)  # 0,1,2,3
+        result = merge_chunks(self.pass_dir, [1, 2])
+        self.assertEqual(result.new_indices, [1])
+        chunks = load_chunks(self.pass_dir)
+        self.assertEqual(
+            [(chunk.index, chunk.start_frame, chunk.end_frame) for chunk in chunks],
+            [(0, 0, 100), (1, 100, 200), (2, 200, 300)],
+        )
+        done = load_done(self.pass_dir)
+        self.assertTrue(done.is_done(0))
+        self.assertFalse(done.is_done(1))
+        self.assertTrue(done.is_done(2))  # remapped from 3
+        self.assertTrue((self.pass_dir / "encode" / "00002.ivf").exists())
+
+    def test_merge_requires_adjacency(self) -> None:
+        with self.assertRaises(av1an_state.Av1anStateError):
+            merge_chunks(self.pass_dir, [0, 2])
+
+    def test_reshape_range(self) -> None:
+        result = reshape_chunk_range(self.pass_dir, FrameRange(50, 250))
+        chunks = load_chunks(self.pass_dir)
+        ranges = sorted((chunk.start_frame, chunk.end_frame) for chunk in chunks)
+        self.assertEqual(ranges, [(0, 50), (50, 250), (250, 300)])
+        self.assertTrue(result.reset_indices)
+
+    def test_rebuild_split_scenes(self) -> None:
+        split_chunk(self.pass_dir, 1, 150)
+        chunks = load_chunks(self.pass_dir)
+        scene_path = self.fixture.video_dir / "scenes.json"
+        rebuild_split_scenes_for_chunks(scene_path, chunks)
+        scene_file = load_scene_file(scene_path)
+        self.assertEqual(
+            [(scene["start_frame"], scene["end_frame"]) for scene in scene_file.split_scenes],
+            [(0, 100), (100, 150), (150, 200), (200, 300)],
+        )
+        # zone overrides inherited from covering old scene
+        self.assertEqual(scene_file.split_scenes[2]["zone_overrides"]["video_params"], ["--crf", "30"])
+        self.assertEqual(scene_file.data["pb_meta"], {"keep": "yes"})
+
+
+class ScenesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.scene_path = self.fixture.video_dir / "scenes.json"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_validate_ok(self) -> None:
+        issues = validate_scene_file(load_scene_file(self.scene_path))
+        self.assertFalse([issue for issue in issues if issue.is_error])
+
+    def test_validate_errors(self) -> None:
+        scene_file = load_scene_file(self.scene_path)
+        scene_file.split_scenes[1]["end_frame"] = 90  # end <= start
+        issues = validate_scene_file(scene_file)
+        self.assertTrue(any(issue.is_error for issue in issues))
+
+    def test_patch_zone(self) -> None:
+        result = patch_scene_region(
+            self.scene_path,
+            SceneSelector(start_frame=100, end_frame=200),
+            ZonePatch(video_params=["--crf", "25"]),
+        )
+        self.assertEqual(result.patched_positions, [1])
+        scene_file = load_scene_file(self.scene_path)
+        self.assertEqual(scene_file.split_scenes[1]["zone_overrides"]["video_params"], ["--crf", "25"])
+        self.assertEqual(scene_file.split_scenes[0]["zone_overrides"]["video_params"], ["--crf", "28"])
+
+
+class ResetTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.ctx = self.fixture.context()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_preview_downstream(self) -> None:
+        plan = manage_reset.preview_stage_reset(self.ctx, STAGE_FASTPASS, chain=True)
+        self.assertIn(STAGE_FASTPASS, plan.stages)
+        self.assertIn(STAGE_SSIMU2, plan.stages)
+        self.assertIn(STAGE_MAINPASS, plan.stages)
+        self.assertIn(STAGE_MUX, plan.stages)
+        paths = {str(action.path).lower() for action in plan.actions}
+        self.assertIn(str(self.fixture.fastpass).lower(), paths)
+        self.assertIn(str(self.fixture.mainpass).lower(), paths)
+
+    def test_preview_single_stage(self) -> None:
+        plan = manage_reset.preview_stage_reset(self.ctx, STAGE_MUX, chain=False)
+        self.assertEqual(plan.stages, [STAGE_MUX])
+        # final output must not be deleted
+        final = str(self.fixture.source.parent / "episode-av1.mkv").lower()
+        self.assertNotIn(final, {str(action.path).lower() for action in plan.actions})
+
+    def test_reset_stage_chain(self) -> None:
+        (self.fixture.video_dir / "video-final.mkv").write_bytes(b"x" * 2048)
+        result = manage_reset.reset_stage(self.ctx, STAGE_FASTPASS, chain=True)
+        self.assertFalse(self.fixture.fastpass.exists())
+        self.assertFalse((self.fixture.video_dir / "video-final.mkv").exists())
+        self.assertFalse((self.fixture.video_state / "FASTPASS_COMPLETED").exists())
+        self.assertFalse((self.fixture.video_state / "SSIMU2_COMPLETED").exists())
+        self.assertTrue(result.changed_paths)
+        # audit event written
+        events_file = self.fixture.meta_dir / "manage_events.jsonl"
+        self.assertTrue(events_file.exists())
+        event = json.loads(events_file.read_text(encoding="utf-8").splitlines()[-1])
+        self.assertEqual(event["operation"], "reset_chain")
+        # backup manifest exists and references backed up json
+        backups = list((self.fixture.meta_dir / "manage_backups").iterdir())
+        self.assertEqual(len(backups), 1)
+        manifest = json.loads((backups[0] / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["operation"], "reset_chain")
+
+    def test_reset_chunk_fastpass(self) -> None:
+        result = manage_reset.reset_chunk(self.ctx, "fastpass", 1)
+        done = load_done(self.fixture.fastpass)
+        self.assertFalse(done.is_done(1))
+        self.assertTrue(done.is_done(0))
+        # default fastpass policy deletes the encode output
+        self.assertFalse((self.fixture.fastpass / "encode" / "00001.ivf").exists())
+        # downstream invalidated
+        self.assertFalse((self.fixture.video_state / "FASTPASS_COMPLETED").exists())
+        self.assertFalse((self.fixture.video_state / "SSIMU2_COMPLETED").exists())
+        self.assertFalse((self.fixture.fastpass / "episode.fastpass.mkv").exists())
+        self.assertFalse((self.fixture.fastpass / "episode_ssimu2.log").exists())
+        self.assertFalse(self.fixture.mainpass.exists())
+        self.assertTrue(result.backup_manifest is None or result.backup_manifest.exists())
+
+    def test_reset_blocked_when_runner_active(self) -> None:
+        import os
+
+        lock = self.fixture.source.parent / ".pbbatch_runner.lock"
+        lock.write_text(json.dumps({"session_id": "s", "pid": os.getpid()}), encoding="utf-8")
+        with self.assertRaises(manage_reset.ResetBlockedError):
+            manage_reset.reset_stage(self.ctx, STAGE_MUX)
+
+    def test_zone_boundaries_registry(self) -> None:
+        actions = manage_reset.stage_reset_actions(self.ctx, STAGE_ZONE_BOUNDARIES)
+        paths = {action.path.name for action in actions}
+        self.assertIn("ZONE_BOUNDARIES_DONE", paths)
+        self.assertIn("scenes-boundaries.json", paths)
+
+
+class ConfigTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.ctx = self.fixture.context()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_fingerprint_change_detection(self) -> None:
+        confirm_fingerprint(self.ctx)
+        self.assertEqual(stale_config_warnings(self.ctx), [])
+        self.fixture.plan_path.write_text(
+            self.fixture.plan_path.read_text(encoding="utf-8") + "\n# touched\n",
+            encoding="utf-8",
+        )
+        warnings = stale_config_warnings(self.ctx)
+        self.assertTrue(any(warning.kind == "plan" for warning in warnings))
+
+    def test_fingerprint_fields(self) -> None:
+        fingerprint = compute_config_fingerprint(self.ctx)
+        self.assertTrue(fingerprint.plan_sha256)
+        self.assertEqual(fingerprint.source_path, str(self.fixture.source))
+        self.assertGreater(fingerprint.source_size, 0)
+
+    def test_zone_text_validation(self) -> None:
+        issues = validate_zone_text(self.ctx, "0 100 - --crf 25\n# comment\n")
+        self.assertFalse([issue for issue in issues if issue.is_error])
+        issues = validate_zone_text(self.ctx, "0 100 --crf 25\n")  # no separator
+        self.assertTrue(any(issue.is_error for issue in issues))
+
+
+class AnalyticsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.ctx = self.fixture.context()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_collect_rows(self) -> None:
+        result = collect_pass_rows(self.ctx, "fastpass")
+        self.assertEqual(len(result.rows), 3)
+        row = result.rows[0]
+        self.assertEqual(row.index, 0)
+        self.assertTrue(row.done)
+        self.assertEqual(row.frames, 100)
+        self.assertEqual(row.crf, 30.0)
+        self.assertIsNotNone(row.bitrate_kbps)
+        self.assertIsNotNone(row.ssimu2_avg)
+
+    def test_sort_rows(self) -> None:
+        result = collect_pass_rows(self.ctx, "fastpass")
+        rows = sort_pass_rows(result.rows, SortSpec(field="output_size", descending=True))
+        self.assertEqual([row.index for row in rows], [2, 1, 0])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -527,43 +527,76 @@ def make_web_mp4(group: SourceGroup) -> None:
     run_make_web_mp4(group.result_mkv, group.result_mp4)
 
 
+def _manage_context_for_group(group: SourceGroup):
+    from utils.manage.context import context_from_plan, context_from_workdir
+
+    if group.plan_path.exists():
+        try:
+            return context_from_plan(group.plan_path)
+        except Exception as exc:
+            print(f"[warn] failed to load plan {group.plan_path}: {exc}; using workdir context")
+    return context_from_workdir(group.workdir)
+
+
+def _run_stage_reset(group: SourceGroup, stage: str, *, chain: bool = True) -> None:
+    """Shared reset path with manage mode: registry + backups + audit log."""
+    from utils.manage import reset as manage_reset
+
+    if not group.workdir.exists():
+        print(f"[skip] workdir missing: {group.workdir}")
+        return
+    ctx = _manage_context_for_group(group)
+    try:
+        result = manage_reset.reset_stage(ctx, stage, chain=chain)
+    except manage_reset.ResetBlockedError as exc:
+        print(f"[err] {exc}")
+        return
+    for path in result.changed_paths:
+        print(f"[del] {path}")
+    if not result.changed_paths:
+        print("[skip] nothing to remove")
+
+
 def clear_stage_mux(group: SourceGroup) -> None:
-    remove_path(group.workdir / ".state" / "MUX_DONE")
+    from utils.runner_state import STAGE_MUX
+
+    _run_stage_reset(group, STAGE_MUX)
 
 
 def clear_stage_mainpass(group: SourceGroup) -> None:
-    clear_stage_mux(group)
-    remove_path(group.workdir / "video" / "mainpass")
-    remove_path(group.workdir / "video" / "video-final.mkv")
-    remove_path(group.workdir / ".state" / "VERIFY_DONE")
+    from utils.runner_state import STAGE_MAINPASS
+
+    _run_stage_reset(group, STAGE_MAINPASS)
 
 
 def clear_stage_zoning(group: SourceGroup) -> None:
-    clear_stage_mainpass(group)
-    remove_path(group.workdir / "video" / "scenes-final.json")
-    remove_path(group.workdir / "video" / "scenes-zoned.json")
-    remove_path(group.workdir / "video" / "scenes-recalc.json")
-    remove_path(group.workdir / "video" / "scenes-boundaries.json")
-    remove_path(group.workdir / "video" / ".state" / "FINAL_SCENES_COMPLETED")
-    remove_path(group.workdir / ".state" / "HDR_PATCH_DONE")
-    remove_path(group.workdir / ".state" / "ZONE_EDIT_DONE")
-    remove_path(group.workdir / ".state" / "ZONE_RECALC_DONE")
-    remove_path(group.workdir / ".state" / "ZONE_BOUNDARIES_DONE")
+    from utils.runner_state import STAGE_ZONE_BOUNDARIES
+
+    _run_stage_reset(group, STAGE_ZONE_BOUNDARIES)
+
 
 def clear_stage_crf_calc(group: SourceGroup) -> None:
-    clear_stage_zoning(group)
-    remove_path(group.workdir / ".state" / "HDR_PATCH_DONE")
-    remove_path(group.workdir / "video" / "scenes-hdr.json")
-    remove_path(group.workdir / "video" / "scenes.json")
+    from utils.manage import reset as manage_reset
+
+    if not group.workdir.exists():
+        print(f"[skip] workdir missing: {group.workdir}")
+        return
+    ctx = _manage_context_for_group(group)
+    try:
+        result = manage_reset.reset_crf_recalc(ctx)
+    except manage_reset.ResetBlockedError as exc:
+        print(f"[err] {exc}")
+        return
+    for path in result.changed_paths:
+        print(f"[del] {path}")
+    if not result.changed_paths:
+        print("[skip] nothing to remove")
+
 
 def clear_stage_fastpass(group: SourceGroup) -> None:
-    clear_stage_zoning(group)
-    remove_path(group.workdir / ".state" / "HDR_PATCH_DONE")
-    remove_path(group.workdir / "video" / ".state" / "FASTPASS_COMPLETED")
-    remove_path(group.workdir / "video" / ".state" / "SSIMU2_COMPLETED")
-    remove_path(group.workdir / "video" / "scenes-hdr.json")
-    remove_path(group.workdir / "video" / "scenes.json")
-    remove_path(group.workdir / "video" / "fastpass")
+    from utils.runner_state import STAGE_FASTPASS
+
+    _run_stage_reset(group, STAGE_FASTPASS)
 
 
 def full_clear_workdir(group: SourceGroup) -> None:
