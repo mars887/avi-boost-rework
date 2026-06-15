@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -39,7 +40,14 @@ from PySide6.QtWidgets import (
 from utils.pipeline_runtime import ROOT_DIR, load_toolchain
 from utils.plan import FilePlan
 
-from utils.manage import analytics, av1an_state, config as manage_config, reset as manage_reset, scenes as manage_scenes
+from utils.manage import (
+    analytics,
+    av1an_state,
+    config as manage_config,
+    reset as manage_reset,
+    scenes as manage_scenes,
+    zone_patch,
+)
 from utils.manage.av1an_state import FrameRange, MoveTarget
 from utils.manage.backup import ManageTransaction, list_backups
 from utils.manage.context import WorkdirContext
@@ -143,6 +151,34 @@ def parse_time_or_frame(text: str, fps: float) -> Optional[int]:
     if fps <= 0:
         return None
     return int(round(seconds * fps))
+
+
+def _fmt_dur0(seconds: float) -> str:
+    return fmt_duration(seconds) if seconds > 0 else "0:00"
+
+
+def format_chunk_stats(rows: Sequence["analytics.PassChunkRow"]) -> str:
+    """Progress summary for a set of chunks.
+
+    ``done\\total - done_time\\total_time | encoded size: X(?) | avg bitrate: Y(?)``
+    where size/bitrate cover only finished chunks and a trailing ``?`` marks that
+    the set still has unfinished chunks (so the figure is partial).
+    """
+    total = len(rows)
+    done_rows = [row for row in rows if row.done]
+    done_count = len(done_rows)
+    partial = "?" if done_count < total else ""
+    done_seconds = sum(row.duration_seconds for row in done_rows)
+    total_seconds = sum(row.duration_seconds for row in rows)
+    done_size = sum(row.output_size for row in done_rows)
+    if done_seconds > 0:
+        bitrate = f"{done_size * 8 / 1000.0 / done_seconds:.0f} kbps{partial}"
+    else:
+        bitrate = f"-{partial}"
+    return (
+        f"chunks: {done_count}\\{total} - {_fmt_dur0(done_seconds)}\\{_fmt_dur0(total_seconds)} "
+        f"| encoded size: {fmt_size(done_size)}{partial} | avg bitrate: {bitrate}"
+    )
 
 
 @dataclass
@@ -251,7 +287,9 @@ def widget_row(*widgets: QWidget, spacing: int = 8) -> QWidget:
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(spacing)
     for widget in widgets:
-        layout.addWidget(widget)
+        # bottom-align so plain buttons/checkboxes line up with the input part
+        # of labeled() fields instead of floating at mid-height
+        layout.addWidget(widget, 0, Qt.AlignmentFlag.AlignBottom)
     layout.addStretch(1)
     return host
 
@@ -289,6 +327,30 @@ def make_table(headers: Sequence[str]) -> QTableWidget:
     return table
 
 
+def fit_table(table: QTableWidget, stretch_column: Optional[int] = None) -> None:
+    """Size columns to content and let one column absorb the remaining width."""
+    table.resizeColumnsToContents()
+    if stretch_column is not None:
+        table.horizontalHeader().setSectionResizeMode(stretch_column, QHeaderView.ResizeMode.Stretch)
+
+
+SORT_KEY_ROLE = Qt.ItemDataRole.UserRole + 1
+
+
+class SortableItem(QTableWidgetItem):
+    """Sorts by an explicit key (numbers stay numeric) with text fallback."""
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:  # type: ignore[override]
+        left = self.data(SORT_KEY_ROLE)
+        right = other.data(SORT_KEY_ROLE)
+        if left is not None and right is not None:
+            try:
+                return left < right
+            except TypeError:
+                pass
+        return super().__lt__(other)
+
+
 def make_item(
     text: str,
     *,
@@ -297,8 +359,9 @@ def make_item(
     mono: bool = False,
     tooltip: Optional[str] = None,
     user_data: Any = None,
+    sort_key: Any = None,
 ) -> QTableWidgetItem:
-    item = QTableWidgetItem(text)
+    item = SortableItem(text)
     if color:
         item.setForeground(QColor(color))
     if bold or mono:
@@ -309,7 +372,87 @@ def make_item(
         item.setToolTip(tooltip)
     if user_data is not None:
         item.setData(Qt.ItemDataRole.UserRole, user_data)
+    if sort_key is not None:
+        item.setData(SORT_KEY_ROLE, sort_key)
     return item
+
+
+class ChunkTable(QTableWidget):
+    """Pass-tab table: subtle full-row selection plus Ctrl-click / Ctrl-drag to
+    paint the selection checkboxes (column 0). A plain click just highlights the
+    row; Ctrl-click toggles a chunk's checkbox, and holding Ctrl while dragging
+    paints that same state onto every row the cursor passes over."""
+
+    def __init__(self, headers: Sequence[str]) -> None:
+        super().__init__(0, len(headers))
+        self.setHorizontalHeaderLabels(list(headers))
+        self.verticalHeader().setVisible(False)
+        self.verticalHeader().setDefaultSectionSize(28)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setAlternatingRowColors(True)
+        self.setWordWrap(False)
+        # full-row highlight via a faint slate-blue Highlight. Fusion draws the
+        # selection from the palette (a QSS ::item:selected rule does not win
+        # here), so override the palette to a soft bluish tint.
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Highlight, QColor(50, 62, 90))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor(224, 224, 224))
+        self.setPalette(palette)
+        self._owned = False  # we are handling the current press->release sequence
+        self._ctrl_drag = False  # paint checkboxes while dragging
+        self._paint_state = Qt.CheckState.Checked
+
+    def _check_item(self, row: int) -> Optional[QTableWidgetItem]:
+        return self.item(row, 0) if row >= 0 else None
+
+    def _row_at(self, event) -> int:
+        return self.indexAt(event.position().toPoint()).row()
+
+    def _toggle_row(self, row: int) -> bool:
+        item = self._check_item(row)
+        if item is None:
+            return False
+        self._paint_state = (
+            Qt.CheckState.Unchecked if item.checkState() == Qt.CheckState.Checked else Qt.CheckState.Checked
+        )
+        item.setCheckState(self._paint_state)
+        return True
+
+    def mousePressEvent(self, event) -> None:
+        self._owned = False
+        self._ctrl_drag = False
+        if event.button() == Qt.MouseButton.LeftButton:
+            index = self.indexAt(event.position().toPoint())
+            ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            # Toggle on PRESS for a checkbox-column click or any Ctrl-click; doing
+            # it here (not on release) keeps direct checkbox clicks from being
+            # swallowed as a drag-select. Ctrl additionally arms drag-painting.
+            if index.row() >= 0 and (ctrl or index.column() == 0) and self._toggle_row(index.row()):
+                self._owned = True
+                self._ctrl_drag = ctrl
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._owned:
+            if self._ctrl_drag:
+                item = self._check_item(self._row_at(event))
+                if item is not None and item.checkState() != self._paint_state:
+                    item.setCheckState(self._paint_state)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._owned:
+            self._owned = False
+            self._ctrl_drag = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class CollapsibleSection(QWidget):
@@ -734,7 +877,7 @@ class ManageWindow(QMainWindow):
             actions_layout.addWidget(chain_btn)
             actions_layout.addStretch(1)
             table.setCellWidget(row, 8, actions)
-        table.resizeColumnsToContents()
+        fit_table(table, 6)  # "Reason / message" absorbs the remaining width
         layout.addWidget(table, 1)
 
     def show_manage_events(self) -> None:
@@ -1055,11 +1198,17 @@ class ManageWindow(QMainWindow):
 
         show_btn = QPushButton("Show")
         show_btn.clicked.connect(render)
-        patch_btn = QPushButton("Patch zone overrides…")
-        patch_btn.clicked.connect(lambda: self.on_patch_zone_dialog(selected_path()))
 
         layout.addWidget(
-            widget_row(labeled("scene file", selector), labeled("find frame / time", search), show_btn, patch_btn)
+            widget_row(labeled("scene file", selector), labeled("find frame / time", search), show_btn)
+        )
+        layout.addWidget(
+            make_label(
+                "double-click a zone video_params cell to edit that scene's overrides; "
+                "for bulk command-based edits use Patch params… on the Fastpass / Mainpass tabs",
+                color=COLOR_GREY_600,
+                size=11,
+            )
         )
         self._render_scene_table(host_layout, selected_path(), "")
         selector.currentIndexChanged.connect(render)
@@ -1108,36 +1257,47 @@ class ManageWindow(QMainWindow):
             crf = analytics.parse_crf_from_video_params([str(token) for token in (params or [])])
             rows.append(
                 [
-                    make_item(str(position)),
-                    make_item(str(start)),
-                    make_item(str(end)),
-                    make_item(str(end - start)),
-                    make_item(fmt_frame_time(start, fps) if fps else "-"),
-                    make_item("-" if crf is None else f"{crf:g}"),
-                    make_item(params_text[:120], mono=True, tooltip=params_text),
+                    make_item(str(position), sort_key=position),
+                    make_item(str(start), sort_key=start),
+                    make_item(str(end), sort_key=end),
+                    make_item(str(end - start), sort_key=end - start),
+                    make_item(fmt_frame_time(start, fps) if fps else "-", sort_key=start),
+                    make_item("-" if crf is None else f"{crf:g}", sort_key=-1.0 if crf is None else float(crf)),
+                    make_item(
+                        params_text,
+                        mono=True,
+                        tooltip=params_text,
+                        user_data=(start, end, params_text),
+                    ),
                 ]
             )
         table.setRowCount(len(rows))
         for row_index, items in enumerate(rows):
             for col_index, item in enumerate(items):
                 table.setItem(row_index, col_index, item)
-        table.resizeColumnsToContents()
+        fit_table(table, 6)  # zone video_params absorbs the remaining width
+        table.setSortingEnabled(True)
+
+        def on_double_clicked(item: QTableWidgetItem) -> None:
+            if item.column() != 6:
+                return
+            meta = item.data(Qt.ItemDataRole.UserRole)
+            if not meta:
+                return
+            start, end, params_text = meta
+            self.on_edit_scene_zone(path, start, end, params_text)
+
+        table.itemDoubleClicked.connect(on_double_clicked)
         host_layout.addWidget(table, 1)
 
-    def on_patch_zone_dialog(self, scene_path: Path) -> None:
+    def on_edit_scene_zone(self, scene_path: Path, start: int, end: int, current_params: str) -> None:
         if not self.destructive_allowed():
             return
-        start_field = QLineEdit()
-        start_field.setFixedWidth(140)
-        end_field = QLineEdit()
-        end_field.setFixedWidth(170)
-        params_field = QLineEdit()
+        params_field = QLineEdit(current_params)
         params_field.setFont(mono_font())
         params_field.setMinimumWidth(480)
 
         def apply() -> None:
-            start = int(start_field.text().strip())
-            end = int(end_field.text().strip())
             params = [token for token in params_field.text().split() if token]
             tx = ManageTransaction(
                 workdir=self.ctx.workdir, operation="patch_zone", source=self.ctx.source, plan=self.ctx.plan_path
@@ -1152,17 +1312,15 @@ class ManageWindow(QMainWindow):
             self.notify(f"patched {len(result.patched_positions)} scene(s); downstream stages NOT reset automatically")
             self.refresh()
 
-        note = make_label(
-            "Scenes overlapping the frame range get their zone_overrides.video_params replaced. "
-            "A backup is written; reset the affected chain afterwards (see docs mapping).",
-            color=COLOR_GREY_400,
-            wrap=True,
-        )
         self.show_dialog_form(
-            f"Patch zone overrides — {scene_path.name}",
+            f"Edit zone params — scene [{start}, {end}) — {scene_path.name}",
             [
-                note,
-                widget_row(labeled("start frame", start_field), labeled("end frame (exclusive)", end_field)),
+                make_label(
+                    "Replaces zone_overrides.video_params for this scene. "
+                    "A backup is written; reset the affected chain afterwards.",
+                    color=COLOR_GREY_400,
+                    wrap=True,
+                ),
                 labeled("video_params (full list, e.g. --crf 25 --preset 4)", params_field),
             ],
             apply,
@@ -1182,34 +1340,6 @@ class ManageWindow(QMainWindow):
 
         rows = analytics.sort_pass_rows(state.rows, analytics.SortSpec(state.sort_field, state.sort_desc))
         rows = state.apply_filters(rows)
-        done_count = sum(1 for row in state.rows if row.done)
-        total_size = sum(row.output_size for row in state.rows)
-
-        sort_dd = QComboBox()
-        sort_dd.addItems(
-            [
-                "queue_position",
-                "index",
-                "done",
-                "start_frame",
-                "frames",
-                "duration_seconds",
-                "output_size",
-                "bitrate_kbps",
-                "crf",
-                "ssimu2_avg",
-                "ssimu2_p5",
-            ]
-        )
-        sort_dd.setCurrentText(state.sort_field)
-        sort_dd.setFixedWidth(170)
-        desc_cb = QCheckBox("desc")
-        desc_cb.setChecked(state.sort_desc)
-
-        def on_sort(*_args) -> None:
-            state.sort_field = sort_dd.currentText() or "queue_position"
-            state.sort_desc = desc_cb.isChecked()
-            self.rebuild()
 
         chapters = sorted({row.chapter for row in state.rows if row.chapter})
         done_dd = QComboBox()
@@ -1250,11 +1380,10 @@ class ManageWindow(QMainWindow):
             return button
 
         toolbar_widgets: List[QWidget] = [
-            labeled("sort by", sort_dd),
-            desc_cb,
             quarantine_cb,
             action_button("Reset chunk(s)", lambda: self.on_reset_chunks(pass_name, policy())),
             action_button("Edit params…", lambda: self.on_edit_chunk_params(pass_name, policy())),
+            action_button("Patch params…", lambda: self.on_patch_pass_params(pass_name, policy())),
             action_button("Split…", lambda: self.on_split_chunk(pass_name, policy())),
             action_button("Merge", lambda: self.on_merge_chunks(pass_name, policy())),
             action_button("Reshape…", lambda: self.on_reshape_range(pass_name, policy())),
@@ -1269,13 +1398,31 @@ class ManageWindow(QMainWindow):
         filter_widgets += [labeled("CRF ≥", crf_min_tf), labeled("CRF ≤", crf_max_tf), outliers_cb]
         layout.addWidget(widget_row(*filter_widgets))
 
-        filtered_note = f" | shown: {len(rows)}" if len(rows) != len(state.rows) else ""
-        layout.addWidget(
-            make_label(
-                f"chunks: {len(state.rows)} | done: {done_count} | encoded size: {fmt_size(total_size)}{filtered_note}",
-                color=COLOR_GREY_400,
-            )
-        )
+        all_rows = state.rows
+        shown_rows = rows
+        stats_host = QWidget()
+        stats_row = QHBoxLayout(stats_host)
+        stats_row.setContentsMargins(0, 0, 0, 0)
+        stats_row.setSpacing(0)
+        stats_row.addWidget(make_label(format_chunk_stats(all_rows), color=COLOR_GREY_400))
+        stats_row.addSpacing(48)
+        subset_label = make_label("", color=COLOR_GREY_500)
+        stats_row.addWidget(subset_label)
+        stats_row.addStretch(1)
+        layout.addWidget(stats_host)
+
+        def update_subset_label() -> None:
+            # after the gap: selected chunks (when 2+ ticked), else the filtered
+            # subset (when filters hide rows), else nothing
+            selected_rows = [row for row in all_rows if row.index in state.selected]
+            if len(selected_rows) > 1:
+                subset_label.setText("selected " + format_chunk_stats(selected_rows))
+            elif len(shown_rows) != len(all_rows):
+                subset_label.setText("shown " + format_chunk_stats(shown_rows))
+            else:
+                subset_label.setText("")
+
+        update_subset_label()
         if state.warnings:
             layout.addWidget(make_label("; ".join(state.warnings), color=COLOR_ORANGE, wrap=True))
 
@@ -1285,8 +1432,7 @@ class ManageWindow(QMainWindow):
             headers += ["ssimu2", "p5"]
         headers += ["chapter", ""]
 
-        table = make_table(headers)
-        table.verticalHeader().setDefaultSectionSize(28)
+        table = ChunkTable(headers)
         table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             select_item = QTableWidgetItem()
@@ -1334,18 +1480,68 @@ class ManageWindow(QMainWindow):
                 state.selected.add(index)
             else:
                 state.selected.discard(index)
+            update_subset_label()
 
         table.itemChanged.connect(on_item_changed)
-        table.resizeColumnsToContents()
+        fit_table(table, headers.index("chapter"))
         layout.addWidget(table, 1)
 
-        sort_dd.currentTextChanged.connect(on_sort)
-        desc_cb.toggled.connect(on_sort)
+        # Explorer-style sorting: click a column header to sort, click again to
+        # flip direction. Sorting is done on the row model (analytics.sort_pass_rows)
+        # so checkboxes and cell widgets stay attached to their rows.
+        sort_field_by_header = {
+            "idx": "index",
+            "queue": "queue_position",
+            "done": "done",
+            "start": "start_frame",
+            "end": "end_frame",
+            "frames": "frames",
+            "dur": "duration_seconds",
+            "size": "output_size",
+            "kbps": "bitrate_kbps",
+            "CRF": "crf",
+            "ssimu2": "ssimu2_avg",
+            "p5": "ssimu2_p5",
+        }
+        field_by_column = {
+            column: sort_field_by_header[name]
+            for column, name in enumerate(headers)
+            if name in sort_field_by_header
+        }
+        header = table.horizontalHeader()
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        sort_order = Qt.SortOrder.DescendingOrder if state.sort_desc else Qt.SortOrder.AscendingOrder
+        indicator_column = next(
+            (column for column, field_name in field_by_column.items() if field_name == state.sort_field), -1
+        )
+        header.setSortIndicator(indicator_column, sort_order)
+
+        def on_header_clicked(column: int) -> None:
+            field_name = field_by_column.get(column)
+            if field_name is None:
+                return
+            if state.sort_field == field_name:
+                state.sort_desc = not state.sort_desc
+            else:
+                state.sort_field = field_name
+                state.sort_desc = False
+            self.rebuild()
+
+        header.sectionClicked.connect(on_header_clicked)
+
+        def on_crf_edited(*_args) -> None:
+            # editingFinished also fires on plain focus changes; skip the
+            # rebuild when nothing actually changed
+            if state.filter_crf_min == crf_min_tf.text() and state.filter_crf_max == crf_max_tf.text():
+                return
+            on_filter()
+
         done_dd.currentTextChanged.connect(on_filter)
         chapter_dd.currentTextChanged.connect(on_filter)
         outliers_cb.toggled.connect(on_filter)
-        crf_min_tf.returnPressed.connect(on_filter)
-        crf_max_tf.returnPressed.connect(on_filter)
+        crf_min_tf.editingFinished.connect(on_crf_edited)
+        crf_max_tf.editingFinished.connect(on_crf_edited)
 
     def _selected_indices(self, pass_name: str) -> List[int]:
         return sorted(self.pass_states[pass_name].selected)
@@ -1434,43 +1630,126 @@ class ManageWindow(QMainWindow):
         if not self.destructive_allowed():
             return
         indices = self._selected_indices(pass_name)
-        if len(indices) != 1:
-            self.notify("select exactly one chunk")
+        if not indices:
+            self.notify("select one or more chunks")
             return
-        index = indices[0]
         pdir = av1an_state.pass_dir(self.ctx, pass_name)  # type: ignore[arg-type]
-        chunk = next((c for c in av1an_state.load_chunks(pdir) if c.index == index), None)
-        if chunk is None:
-            self.notify(f"chunk {index} not found", error=True)
+        by_index = {chunk.index: chunk for chunk in av1an_state.load_chunks(pdir)}
+        selected = [by_index[index] for index in indices if index in by_index]
+        if not selected:
+            self.notify("selected chunk(s) not found", error=True)
             return
-        params_field = QPlainTextEdit(" ".join(chunk.video_params))
+        target_indices = [chunk.index for chunk in selected]
+        multi = len(selected) > 1
+        if multi:
+            template_text = " ".join(av1an_state.merge_video_params([chunk.video_params for chunk in selected]))
+        else:
+            template_text = " ".join(selected[0].video_params)
+        params_field = QPlainTextEdit(template_text)
         params_field.setFont(mono_font())
-        params_field.setMinimumSize(540, 70)
+        params_field.setMinimumSize(560, 80)
 
         def apply() -> None:
-            tokens = [token for token in params_field.toPlainText().split() if token]
+            template_tokens = [token for token in params_field.toPlainText().split() if token]
             tx = self._geometry_tx("edit_chunk_params")
-            was_done = av1an_state.update_chunk_params(
-                pdir, index, av1an_state.ChunkPatch(video_params=tokens), policy=policy, tx=tx  # type: ignore[arg-type]
+            result = av1an_state.update_chunks_params(
+                pdir, target_indices, template_tokens, policy=policy, tx=tx  # type: ignore[arg-type]
             )
-            if was_done:
+            if not result.changed_indices:
+                self.notify("no changes")
+                return
+            if result.reset_indices:
                 self._post_geometry_cleanup(pass_name, tx)
-            tx.commit(message=f"chunk {index} video_params edited ({pass_name})")
-            self.notify(f"chunk {index} params saved" + ("; chunk was done -> reset + downstream cleared" if was_done else ""))
+            tx.commit(
+                message=f"edit video_params on {len(result.changed_indices)} chunk(s) ({pass_name})",
+                extra={"changed": result.changed_indices, "reset": result.reset_indices},
+            )
+            reset_note = (
+                f"; {len(result.reset_indices)} done-chunk(s) reset + downstream cleared"
+                if result.reset_indices
+                else ""
+            )
+            self.notify(f"params saved for {len(result.changed_indices)} chunk(s){reset_note}")
             self.refresh()
 
+        if multi:
+            title = f"Edit video_params — {len(selected)} chunks — {pass_name}"
+            note = make_label(
+                f"Editing {len(selected)} chunks at once. A param whose value differs across them is shown as "
+                f"<code>{av1an_state.VARIABLE_PLACEHOLDER}</code> — leave it to keep each chunk's own value, or replace "
+                "it to set one value for every selected chunk. Identical params apply to all; removing a param removes "
+                "it from all. Only video_params is editable; changed done-chunks are reset and downstream invalidated.",
+                color=COLOR_GREY_400,
+                wrap=True,
+            )
+        else:
+            title = f"Edit chunk {selected[0].index} video_params — {pass_name}"
+            note = make_label(
+                "Only video_params is editable (encoder/passes/target_quality stay in sync with av1an). "
+                "If the chunk was done it will be reset and downstream stages invalidated.",
+                color=COLOR_GREY_400,
+                wrap=True,
+            )
+        self.show_dialog_form(title, [note, labeled("video_params", params_field)], apply)
+
+    def on_patch_pass_params(self, pass_name: str, policy: str) -> None:
+        assert self.ctx is not None
+        if not self.destructive_allowed():
+            return
+        scene_path = zone_patch.pass_source_scene_file(self.ctx, pass_name)  # type: ignore[arg-type]
+        commands_field = QPlainTextEdit()
+        commands_field.setFont(mono_font())
+        commands_field.setMinimumSize(620, 150)
+        commands_field.setPlaceholderText("100f700 - --crf 25 --preset 4\n5s12 - --crf -10%\n# @preset and ! / ^ selectors supported")
+
+        def apply() -> None:
+            text = commands_field.toPlainText().strip()
+            if not text:
+                raise RuntimeError("enter at least one command")
+            pdir = av1an_state.pass_dir(self.ctx, pass_name)  # type: ignore[arg-type]
+            chunks = av1an_state.load_chunks(pdir)
+            total_frames = max((chunk.end_frame for chunk in chunks), default=0) or None
+            video = zone_patch.build_video_info(self.ctx.source, self._scene_fps())
+            commands = zone_patch.parse_patch_commands(text, video=video, total_frames=total_frames)
+            tx = self._geometry_tx("patch_pass_params")
+            result = zone_patch.apply_param_commands_to_chunks(pdir, commands, policy=policy, tx=tx)  # type: ignore[arg-type]
+            if not result.changed_indices:
+                self.notify("no chunks matched the command(s) — nothing changed")
+                return
+            scenes_updated = zone_patch.mirror_params_to_scene_file(scene_path, result.range_params, tx=tx)
+            if result.reset_indices:
+                self._post_geometry_cleanup(pass_name, tx)
+            tx.commit(
+                message=f"patch params on {len(result.changed_indices)} chunk(s) ({pass_name})",
+                extra={
+                    "changed": result.changed_indices,
+                    "reset": result.reset_indices,
+                    "scene_file": str(scene_path),
+                    "scene_entries_updated": scenes_updated,
+                },
+            )
+            reset_note = f"; {len(result.reset_indices)} done-chunk(s) reset + downstream cleared" if result.reset_indices else ""
+            scene_note = f"; {scenes_updated} scene entr(ies) in {scene_path.name} updated" if scenes_updated else ""
+            self.notify(f"patched {len(result.changed_indices)} chunk(s){reset_note}{scene_note}")
+            self.refresh()
+
+        note = make_label(
+            "Edit video_params for many chunks at once with the zone-edit command DSL "
+            "(one command per line). Selectors: <code>100f700</code> frames, <code>5s12</code> chunk indexes, "
+            "<code>1:00t2:00</code> time, or a chapter title; separators <code>-</code> (≥half overlap) / "
+            "<code>!</code> (any overlap) / <code>^</code> (fully inside). Actions are <code>--key value</code> "
+            "pairs; <code>--crf</code> also takes <code>+5</code> / <code>-10%</code> / <code>-</code> (delete). "
+            f"<code>@name</code> presets work. Boundary mode (| … |) is not supported here. Matched done-chunks are "
+            f"reset and downstream is invalidated; the same edit is mirrored into {scene_path.name}.",
+            color=COLOR_GREY_400,
+            wrap=True,
+        )
         self.show_dialog_form(
-            f"Edit chunk {index} video_params — {pass_name}",
-            [
-                make_label(
-                    "Only video_params is editable (encoder/passes/target_quality stay in sync with av1an). "
-                    "If the chunk was done it will be reset and downstream stages invalidated.",
-                    color=COLOR_GREY_400,
-                    wrap=True,
-                ),
-                labeled("video_params", params_field),
-            ],
+            f"Patch params — {pass_name}",
+            [note, labeled("zone-edit commands", commands_field)],
             apply,
+            submit_label="Patch",
+            width=720,
         )
 
     def _geometry_warning(self, pass_name: str) -> str:
@@ -1704,6 +1983,12 @@ class ManageWindow(QMainWindow):
             return
         layout.addWidget(make_label(str(logs_dir), color=COLOR_GREY_500))
         listing = QListWidget()
+        listing.setCursor(Qt.CursorShape.PointingHandCursor)
+        listing.setStyleSheet(
+            "QListWidget::item { border-bottom: 1px solid #3a3b40; padding: 6px; }"
+            "QListWidget::item:hover { background-color: #2c2d31; }"
+            f"QListWidget::item:selected {{ background-color: {COLOR_GREY_800}; }}"
+        )
         try:
             files = sorted(logs_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError:
@@ -1769,6 +2054,8 @@ class ManageWindow(QMainWindow):
 
 
 def run_gui(refs: Sequence[WorkdirRef]) -> int:
+    # must be set before the QApplication exists; ~115% feels right on desktop
+    os.environ.setdefault("QT_SCALE_FACTOR", "1.15")
     app = QApplication.instance()
     if app is None:
         app = QApplication([sys.argv[0] if sys.argv else "manage"])

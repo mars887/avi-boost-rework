@@ -3,10 +3,12 @@ from __future__ import annotations
 import copy
 import json
 import random
+import re
+import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 from utils.manage.backup import ManageTransaction, write_json_atomic
 from utils.manage.context import WorkdirContext
@@ -496,6 +498,158 @@ def update_chunk_params(
     return was_done
 
 
+# -- multi-chunk param editing ----------------------------------------------
+#
+# "Edit params" can target several chunks at once. The dialog shows a merged
+# view of their ``video_params`` where any key whose value is not identical
+# across the selection is rendered as the ``{variable}`` placeholder. Leaving
+# the placeholder keeps each chunk's own value; replacing it sets one value for
+# the whole selection. Editing matches single-chunk behaviour for identical
+# values.
+
+VARIABLE_PLACEHOLDER = "{variable}"
+
+
+def parse_video_param_pairs(tokens: Sequence[str]) -> List[Tuple[str, Optional[str]]]:
+    """Tokens -> ordered ``(--key, value | None)`` pairs (value None for flags).
+
+    Keys are ``--`` prefixed (so negative numeric values are kept as values);
+    a stray non-key token is preserved as a valueless pseudo-flag.
+    """
+    items = [str(token) for token in tokens]
+    pairs: List[Tuple[str, Optional[str]]] = []
+    index = 0
+    while index < len(items):
+        key = items[index]
+        if key.startswith("--"):
+            if index + 1 < len(items) and not items[index + 1].startswith("--"):
+                pairs.append((key, items[index + 1]))
+                index += 2
+            else:
+                pairs.append((key, None))
+                index += 1
+        else:
+            pairs.append((key, None))
+            index += 1
+    return pairs
+
+
+def format_video_param_pairs(pairs: Sequence[Tuple[str, Optional[str]]]) -> List[str]:
+    tokens: List[str] = []
+    for key, value in pairs:
+        tokens.append(key)
+        if value is not None:
+            tokens.append(value)
+    return tokens
+
+
+def _param_pairs_to_map(pairs: Sequence[Tuple[str, Optional[str]]]) -> Dict[str, Optional[str]]:
+    return {key: value for key, value in pairs}  # last occurrence wins
+
+
+def merge_video_params(param_lists: Sequence[Sequence[str]]) -> List[str]:
+    """Merge several ``video_params`` lists into one editable template.
+
+    A key present with the same value in every list keeps that value; any key
+    that differs (different value, or missing from some lists) becomes
+    ``{variable}``. Key order follows first appearance across the lists.
+    """
+    parsed = [parse_video_param_pairs(params) for params in param_lists]
+    maps = [_param_pairs_to_map(pairs) for pairs in parsed]
+    order: List[str] = []
+    seen = set()
+    for pairs in parsed:
+        for key, _value in pairs:
+            if key not in seen:
+                seen.add(key)
+                order.append(key)
+    tokens: List[str] = []
+    for key in order:
+        present = [mapping for mapping in maps if key in mapping]
+        values = [mapping[key] for mapping in present]
+        uniform = len(present) == len(maps) and all(value == values[0] for value in values)
+        tokens.append(key)
+        if uniform:
+            if values[0] is not None:
+                tokens.append(str(values[0]))
+        else:
+            tokens.append(VARIABLE_PLACEHOLDER)
+    return tokens
+
+
+def apply_param_template(template_tokens: Sequence[str], current_tokens: Sequence[str]) -> List[str]:
+    """Apply a merged-view template to one chunk's current ``video_params``.
+
+    ``{variable}`` keeps the chunk's own value for that key (or stays absent if
+    the chunk lacks it); any other value overrides; keys absent from the
+    template are dropped. Output order follows the template.
+    """
+    current_map = _param_pairs_to_map(parse_video_param_pairs(current_tokens))
+    out: List[Tuple[str, Optional[str]]] = []
+    for key, value in parse_video_param_pairs(template_tokens):
+        if value == VARIABLE_PLACEHOLDER:
+            if key in current_map:
+                out.append((key, current_map[key]))
+        else:
+            out.append((key, value))
+    return format_video_param_pairs(out)
+
+
+@dataclass
+class MultiParamResult:
+    changed_indices: List[int] = field(default_factory=list)
+    reset_indices: List[int] = field(default_factory=list)
+
+
+def update_chunks_params(
+    pass_dir: Path,
+    indices: Sequence[int],
+    template_tokens: Sequence[str],
+    *,
+    policy: EncodeOutputPolicy = "delete",
+    tx: Optional[ManageTransaction] = None,
+) -> MultiParamResult:
+    """Apply an Edit-Params template to several chunks at once.
+
+    Only chunks whose resulting ``video_params`` actually change (compared as a
+    key->value map, so a pure reorder is not a change) are rewritten; changed
+    chunks that were done are reset via ``policy``.
+    """
+    pass_dir = Path(pass_dir)
+    chunks = load_chunks(pass_dir)
+    by_index = {chunk.index: chunk for chunk in chunks}
+    targets: List[ChunkState] = []
+    for index in indices:
+        chunk = by_index.get(int(index))
+        if chunk is None:
+            raise Av1anStateError(f"chunk index {index} not found in {chunks_path(pass_dir)}")
+        targets.append(chunk)
+    if not targets:
+        raise Av1anStateError("no chunks selected")
+
+    done = load_done(pass_dir)
+    result = MultiParamResult()
+    for chunk in targets:
+        new_tokens = apply_param_template(template_tokens, chunk.video_params)
+        new_map = _param_pairs_to_map(parse_video_param_pairs(new_tokens))
+        old_map = _param_pairs_to_map(parse_video_param_pairs(chunk.video_params))
+        if new_map == old_map:
+            continue  # no semantic change -> leave the chunk untouched
+        chunk.data["video_params"] = [str(token) for token in new_tokens]
+        result.changed_indices.append(chunk.index)
+        if done.is_done(chunk.index):
+            result.reset_indices.append(chunk.index)
+
+    if not result.changed_indices:
+        return result
+    result.changed_indices.sort()
+    result.reset_indices.sort()
+    save_chunks(pass_dir, chunks, tx=tx)
+    for index in result.reset_indices:
+        mark_chunk_not_done(pass_dir, index, policy=policy, tx=tx)
+    return result
+
+
 # -- reindex -----------------------------------------------------------------
 
 
@@ -605,6 +759,111 @@ def reindex_chunks_transactionally(
     return result
 
 
+# -- chunk frame range / source command --------------------------------------
+#
+# av1an stores the *real* decoded frame range of a chunk inside ``source_cmd``
+# (and ``proxy_cmd``), not only in ``start_frame``/``end_frame``. On --resume
+# av1an runs ``source_cmd`` verbatim and rejects the chunk with a FRAME MISMATCH
+# if the piped frame count differs from ``end_frame - start_frame``. So every
+# geometry edit that moves a chunk boundary must rewrite the command too, or the
+# encode loops forever. Two command shapes are produced by av1an:
+#   * vspipe:         vspipe <script> -c y4m - -s <start> -e <end-1> [-a ...]
+#   * ffmpeg Select:  ffmpeg ... -vf select=between(n\,<start>\,<end-1>) ...
+# Tokens may be plain strings (``--chunks-cmd-format text``) or native OsStrings
+# (the default "safe" format: ``{"Windows": [u16, ...]}`` / ``{"Unix": [u8...]}``).
+
+OsToken = Union[str, Dict[str, Any]]
+
+_SELECT_BETWEEN_RE = re.compile(
+    r"(select\s*=\s*between\(\s*n\s*\\?,\s*)\d+(\s*\\?,\s*)\d+(\s*\))",
+    re.IGNORECASE,
+)
+
+
+def _os_token_text(token: OsToken) -> Optional[str]:
+    """Decode an av1an command token (str or native OsString) to text."""
+    if isinstance(token, str):
+        return token
+    if isinstance(token, dict):
+        windows = token.get("Windows")
+        if isinstance(windows, list):
+            try:
+                units = [int(unit) & 0xFFFF for unit in windows]
+                return struct.pack(f"<{len(units)}H", *units).decode("utf-16-le", "surrogatepass")
+            except Exception:
+                return None
+        unix = token.get("Unix")
+        if isinstance(unix, list):
+            try:
+                return bytes(int(byte) & 0xFF for byte in unix).decode("utf-8", "surrogateescape")
+            except Exception:
+                return None
+    return None
+
+
+def _os_token_like(template: OsToken, text: str) -> OsToken:
+    """Encode ``text`` in the same JSON representation as ``template``."""
+    if isinstance(template, dict):
+        if isinstance(template.get("Windows"), list):
+            data = text.encode("utf-16-le", "surrogatepass")
+            return {"Windows": list(struct.unpack(f"<{len(data) // 2}H", data))}
+        if isinstance(template.get("Unix"), list):
+            return {"Unix": list(text.encode("utf-8", "surrogateescape"))}
+    return text
+
+
+def _rewrite_cmd_frame_range(cmd: List[OsToken], start_frame: int, end_frame: int) -> List[OsToken]:
+    """Return a copy of ``cmd`` with the embedded frame range updated.
+
+    av1an's ``-e`` / select upper bound is the *last inclusive* frame, i.e.
+    ``end_frame - 1``. Commands with no recognizable frame range (e.g. ffmpeg
+    Segment, which reads a pre-split file) are returned unchanged.
+    """
+    end_inclusive = end_frame - 1
+    out: List[OsToken] = list(cmd)
+    index = 0
+    count = len(out)
+    while index < count:
+        text = _os_token_text(out[index])
+        # vspipe script args follow ``-a``; never interpret them as seek flags
+        if text in ("-a", "--arg") and index + 1 < count:
+            index += 2
+            continue
+        if text in ("-s", "--start") and index + 1 < count:
+            out[index + 1] = _os_token_like(out[index + 1], str(start_frame))
+            index += 2
+            continue
+        if text in ("-e", "--end") and index + 1 < count:
+            out[index + 1] = _os_token_like(out[index + 1], str(end_inclusive))
+            index += 2
+            continue
+        if text:
+            rewritten = _SELECT_BETWEEN_RE.sub(
+                lambda match: f"{match.group(1)}{start_frame}{match.group(2)}{end_inclusive}{match.group(3)}",
+                text,
+            )
+            if rewritten != text:
+                out[index] = _os_token_like(out[index], rewritten)
+        index += 1
+    return out
+
+
+def set_chunk_frame_range(chunk: ChunkState, start_frame: int, end_frame: int) -> None:
+    """Set a chunk's frame range and keep ``source_cmd``/``proxy_cmd`` in sync.
+
+    This is the single place that mutates chunk geometry so the decode command
+    av1an actually runs can never drift from ``start_frame``/``end_frame``.
+    """
+    start_frame = int(start_frame)
+    end_frame = int(end_frame)
+    chunk.data["start_frame"] = start_frame
+    chunk.data["end_frame"] = end_frame
+    for key in ("source_cmd", "proxy_cmd"):
+        cmd = chunk.data.get(key)
+        if isinstance(cmd, list) and cmd:
+            chunk.data[key] = _rewrite_cmd_frame_range(cmd, start_frame, end_frame)
+
+
 # -- geometry ----------------------------------------------------------------
 
 
@@ -645,11 +904,11 @@ def split_chunk(
         if item.index in mapping:
             item.index = mapping[item.index]
 
+    original_end = chunk.end_frame
     right = ChunkState(data=copy.deepcopy(chunk.data))
     right.index = old_index + 1
-    right.data["start_frame"] = int(frame)
-    right.data["end_frame"] = chunk.end_frame
-    chunk.data["end_frame"] = int(frame)
+    set_chunk_frame_range(right, int(frame), original_end)
+    set_chunk_frame_range(chunk, chunk.start_frame, int(frame))
     chunks.insert(position + 1, right)
 
     save_chunks(pass_dir, chunks, tx=tx)
@@ -729,7 +988,7 @@ def merge_chunks(
     for chunk in merged_chunks:
         if chunk.index in mapping:
             chunk.index = mapping[chunk.index]
-    first.data["end_frame"] = last.end_frame
+    set_chunk_frame_range(first, first.start_frame, last.end_frame)
 
     save_chunks(pass_dir, merged_chunks, tx=tx)
     done = load_done(pass_dir)
@@ -809,29 +1068,37 @@ __all__ = [
     "GeometryResult",
     "MoveOrder",
     "MoveTarget",
+    "MultiParamResult",
     "PASS_NAMES",
     "PassName",
     "ReindexResult",
+    "VARIABLE_PLACEHOLDER",
+    "apply_param_template",
     "chunk_name",
     "chunk_output_path",
     "chunks_path",
     "done_path",
+    "format_video_param_pairs",
     "load_chunks",
     "load_done",
     "mark_chunk_not_done",
     "merge_chunks",
+    "merge_video_params",
     "move_chunks",
+    "parse_video_param_pairs",
     "pass_dir",
     "quarantine_or_delete_encode_output",
     "reindex_chunks_transactionally",
     "reshape_chunk_range",
     "save_chunks",
     "save_done",
+    "set_chunk_frame_range",
     "sidecar_paths",
     "sort_chunks",
     "split_chunk",
     "swap_chunks",
     "update_chunk_params",
+    "update_chunks_params",
     "validate_chunks",
     "validate_done",
 ]

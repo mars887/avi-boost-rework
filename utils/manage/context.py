@@ -85,9 +85,12 @@ class WorkdirContext:
 def make_runner_item(ctx: WorkdirContext) -> RunnerItemAdapter:
     resolved = ctx.resolved_plan or _synthetic_resolved_plan(ctx.workdir, ctx.source, ctx.zone_file)
     source = ctx.source or resolved.paths.source
+    # Manage is mode-agnostic: even when the plan/batch ran in fastpass mode it
+    # must show and manage every pipeline stage, so the runner item is always
+    # built for the full pipeline. ctx.mode stays purely informational.
     return RunnerItemAdapter(
         resolved=resolved,
-        mode=ctx.mode or MODE_FULL,
+        mode=MODE_FULL,
         workdir=ctx.workdir,
         source=source,
         plan_path=ctx.plan_path or resolved.paths.plan_path,

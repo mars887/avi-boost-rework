@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from utils.manage import av1an_state, reset as manage_reset
+from utils.manage import av1an_state, reset as manage_reset, zone_patch
 from utils.manage.analytics import collect_pass_rows, sort_pass_rows, SortSpec
 from utils.manage.av1an_state import (
     ChunkPatch,
@@ -17,6 +17,7 @@ from utils.manage.av1an_state import (
     reindex_chunks_transactionally,
     reshape_chunk_range,
     save_chunks,
+    set_chunk_frame_range,
     sort_chunks,
     split_chunk,
     swap_chunks,
@@ -81,6 +82,17 @@ def make_chunk(index: int, start: int, end: int, temp: str, **extra):
     }
     chunk.update(extra)
     return chunk
+
+
+def win_token(text: str):
+    """Native OsString token as av1an's default 'safe' chunks-cmd-format emits."""
+    return {"Windows": [ord(ch) for ch in text]}
+
+
+def vspipe_cmd(start: int, end: int, *, native: bool = True):
+    """vspipe source_cmd for a chunk [start, end): ``-s start -e end-1``."""
+    tokens = ["vspipe", "main.vpy", "-c", "y4m", "-", "-s", str(start), "-e", str(end - 1), "-a", "src=x"]
+    return [win_token(tok) for tok in tokens] if native else list(tokens)
 
 
 class ManageFixture:
@@ -478,6 +490,314 @@ class GeometryTest(unittest.TestCase):
         # zone overrides inherited from covering old scene
         self.assertEqual(scene_file.split_scenes[2]["zone_overrides"]["video_params"], ["--crf", "30"])
         self.assertEqual(scene_file.data["pb_meta"], {"keep": "yes"})
+
+    def test_rebuild_keeps_scenes_mirroring_split_scenes(self) -> None:
+        # fixture scenes/split_scenes share boundaries -> both must follow chunks
+        split_chunk(self.pass_dir, 1, 150)
+        chunks = load_chunks(self.pass_dir)
+        scene_path = self.fixture.video_dir / "scenes.json"
+        rebuild_split_scenes_for_chunks(scene_path, chunks)
+        scene_file = load_scene_file(scene_path)
+        expected = [(0, 100), (100, 150), (150, 200), (200, 300)]
+        self.assertEqual([(s["start_frame"], s["end_frame"]) for s in scene_file.split_scenes], expected)
+        self.assertEqual([(s["start_frame"], s["end_frame"]) for s in scene_file.scenes], expected)
+
+
+def decode_cmd(cmd):
+    out = []
+    for token in cmd:
+        if isinstance(token, str):
+            out.append(token)
+        else:
+            out.append("".join(chr(unit) for unit in token["Windows"]))
+    return out
+
+
+def cmd_seek(cmd):
+    """Return (start, end-inclusive) parsed from a decoded vspipe command."""
+    tokens = decode_cmd(cmd)
+    start = int(tokens[tokens.index("-s") + 1])
+    end = int(tokens[tokens.index("-e") + 1])
+    return start, end
+
+
+class ChunkSourceCmdTest(unittest.TestCase):
+    """Geometry edits must rewrite source_cmd/proxy_cmd or av1an FRAME MISMATCHes."""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.pass_dir = self.fixture.fastpass
+        temp = str(self.pass_dir)
+        chunks = [
+            make_chunk(0, 0, 100, temp, source_cmd=vspipe_cmd(0, 100), proxy_cmd=vspipe_cmd(0, 100)),
+            make_chunk(1, 100, 200, temp, source_cmd=vspipe_cmd(100, 200), proxy_cmd=vspipe_cmd(100, 200)),
+            make_chunk(2, 200, 300, temp, source_cmd=vspipe_cmd(200, 300), proxy_cmd=vspipe_cmd(200, 300)),
+        ]
+        write_json(self.pass_dir / "chunks.json", chunks)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _seek_by_range(self):
+        return {
+            (c.start_frame, c.end_frame): (cmd_seek(c.data["source_cmd"]), cmd_seek(c.data["proxy_cmd"]))
+            for c in load_chunks(self.pass_dir)
+        }
+
+    def test_set_chunk_frame_range_rewrites_native_tokens(self) -> None:
+        chunk = load_chunks(self.pass_dir)[1]
+        set_chunk_frame_range(chunk, 100, 175)
+        self.assertEqual(chunk.start_frame, 100)
+        self.assertEqual(chunk.end_frame, 175)
+        self.assertEqual(cmd_seek(chunk.data["source_cmd"]), (100, 174))
+        self.assertEqual(cmd_seek(chunk.data["proxy_cmd"]), (100, 174))
+        # tokens stay in native OsString form, only the number changed
+        self.assertIsInstance(chunk.data["source_cmd"][6], dict)
+
+    def test_rewrite_text_and_select_formats(self) -> None:
+        text_chunk = av1an_state.ChunkState(
+            data=make_chunk(0, 0, 100, "t", source_cmd=vspipe_cmd(0, 100, native=False))
+        )
+        set_chunk_frame_range(text_chunk, 10, 60)
+        self.assertEqual(text_chunk.data["source_cmd"][6], "10")
+        self.assertEqual(text_chunk.data["source_cmd"][8], "59")
+
+        select_chunk = av1an_state.ChunkState(
+            data=make_chunk(0, 0, 100, "t", source_cmd=[
+                "ffmpeg", "-i", "in.mkv", "-vf", r"select=between(n\,0\,99)", "-f", "yuv4mpegpipe", "-",
+            ])
+        )
+        set_chunk_frame_range(select_chunk, 10, 60)
+        self.assertEqual(select_chunk.data["source_cmd"][4], r"select=between(n\,10\,59)")
+
+    def test_split_rewrites_both_sides(self) -> None:
+        split_chunk(self.pass_dir, 1, 150)
+        seeks = self._seek_by_range()
+        self.assertEqual(seeks[(100, 150)][0], (100, 149))  # left source
+        self.assertEqual(seeks[(100, 150)][1], (100, 149))  # left proxy
+        self.assertEqual(seeks[(150, 200)][0], (150, 199))  # right source
+        self.assertEqual(seeks[(150, 200)][1], (150, 199))  # right proxy
+        # untouched chunk keeps its command
+        self.assertEqual(seeks[(0, 100)][0], (0, 99))
+
+    def test_merge_rewrites_first_chunk(self) -> None:
+        merge_chunks(self.pass_dir, [0, 1])
+        seeks = self._seek_by_range()
+        self.assertEqual(seeks[(0, 200)][0], (0, 199))
+        self.assertEqual(seeks[(0, 200)][1], (0, 199))
+        self.assertEqual(seeks[(200, 300)][0], (200, 299))
+
+    def test_reshape_rewrites_seam_chunks(self) -> None:
+        reshape_chunk_range(self.pass_dir, FrameRange(50, 250))
+        for chunk in load_chunks(self.pass_dir):
+            self.assertEqual(
+                cmd_seek(chunk.data["source_cmd"]),
+                (chunk.start_frame, chunk.end_frame - 1),
+                msg=f"chunk {chunk.index} [{chunk.start_frame},{chunk.end_frame})",
+            )
+
+
+class ZonePatchTest(unittest.TestCase):
+    """Bulk command-driven video_params patching across many chunks + scenes."""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.pass_dir = self.fixture.fastpass
+        self.scene_path = self.fixture.video_dir / "scenes.json"
+        self.video = zone_patch.build_video_info(None, 24.0)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _patch(self, text: str):
+        commands = zone_patch.parse_patch_commands(text, video=self.video, total_frames=300)
+        return zone_patch.apply_param_commands_to_chunks(self.pass_dir, commands, policy="delete")
+
+    def test_command_selects_and_edits_many_chunks(self) -> None:
+        result = self._patch("100f300 - --crf 25 --preset 4")
+        self.assertEqual(result.changed_indices, [1, 2])
+        chunks = {c.index: c.video_params for c in load_chunks(self.pass_dir)}
+        self.assertEqual(chunks[0], ["--crf", "30"])  # untouched
+        self.assertEqual(chunks[1], ["--crf", "25.00", "--preset", "4"])
+        self.assertEqual(chunks[2], ["--crf", "25.00", "--preset", "4"])
+
+    def test_done_chunks_reset_and_outputs_removed(self) -> None:
+        result = self._patch("100f300 - --crf 25")
+        self.assertEqual(result.reset_indices, [1, 2])
+        done = load_done(self.pass_dir)
+        self.assertTrue(done.is_done(0))
+        self.assertFalse(done.is_done(1))
+        self.assertFalse(done.is_done(2))
+        self.assertFalse((self.pass_dir / "encode" / "00001.ivf").exists())
+
+    def test_relative_crf_uses_current_value(self) -> None:
+        self._patch("0f100 - --crf -5")
+        chunks = {c.index: c.video_params for c in load_chunks(self.pass_dir)}
+        self.assertEqual(chunks[0], ["--crf", "25.00"])  # 30 - 5, formatted 2dp
+        self.assertEqual(chunks[1], ["--crf", "30"])  # not selected
+
+    def test_mirror_to_scene_file_keeps_other_overrides(self) -> None:
+        result = self._patch("100f300 - --crf 25 --preset 4")
+        updated = zone_patch.mirror_params_to_scene_file(self.scene_path, result.range_params)
+        self.assertEqual(updated, 4)  # scenes[1,2] + split_scenes[1,2]
+        scene_file = load_scene_file(self.scene_path)
+        self.assertEqual(
+            scene_file.split_scenes[1]["zone_overrides"]["video_params"], ["--crf", "25.00", "--preset", "4"]
+        )
+        self.assertEqual(scene_file.split_scenes[1]["zone_overrides"]["min_scene_len"], 24)  # preserved
+        self.assertEqual(scene_file.scenes[2]["zone_overrides"]["video_params"], ["--crf", "25.00", "--preset", "4"])
+        self.assertIsNone(scene_file.scenes[0].get("zone_overrides"))  # untouched
+
+    def test_no_match_is_a_noop(self) -> None:
+        result = self._patch("5000f6000 - --crf 25")
+        self.assertEqual(result.changed_indices, [])
+        chunks = {c.index: c.video_params for c in load_chunks(self.pass_dir)}
+        self.assertEqual(chunks[0], ["--crf", "30"])
+
+    def test_boundary_mode_is_rejected(self) -> None:
+        with self.assertRaises(zone_patch.ZonePatchError):
+            zone_patch.parse_patch_commands("100f300 | min=9 | --crf 25", video=self.video, total_frames=300)
+
+    def test_scene_index_selector_matches_chunk_index(self) -> None:
+        result = self._patch("2s2 - --crf 20")
+        self.assertEqual(result.changed_indices, [2])
+
+
+class EditParamsMultiTest(unittest.TestCase):
+    """Multi-chunk Edit Params: merged {variable} view + per-chunk apply."""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.pass_dir = Path(self._tmp.name) / "video" / "fastpass"
+        (self.pass_dir / "encode").mkdir(parents=True)
+        temp = str(self.pass_dir)
+        write_json(
+            self.pass_dir / "chunks.json",
+            [
+                make_chunk(0, 0, 100, temp, video_params=["--crf", "30", "--preset", "2", "--scd", "0"]),
+                make_chunk(1, 100, 200, temp, video_params=["--crf", "31", "--preset", "2", "--scd", "0"]),
+                make_chunk(2, 200, 300, temp, video_params=["--crf", "32", "--preset", "2", "--scd", "0"]),
+            ],
+        )
+        write_json(
+            self.pass_dir / "done.json",
+            {"frames": 300, "done": {chunk_name(i): {"frames": 100, "size_bytes": 9} for i in range(3)}},
+        )
+        for i in range(3):
+            (self.pass_dir / "encode" / f"{chunk_name(i)}.ivf").write_bytes(b"v")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_merge_view_hides_differing_values(self) -> None:
+        lists = [chunk.video_params for chunk in load_chunks(self.pass_dir)]
+        self.assertEqual(
+            av1an_state.merge_video_params(lists),
+            ["--crf", "{variable}", "--preset", "2", "--scd", "0"],
+        )
+
+    def test_merge_identical_keeps_values(self) -> None:
+        same = [["--crf", "30", "--preset", "2"], ["--crf", "30", "--preset", "2"]]
+        self.assertEqual(av1an_state.merge_video_params(same), ["--crf", "30", "--preset", "2"])
+
+    def test_merge_partial_presence_is_variable(self) -> None:
+        lists = [["--crf", "30", "--preset", "2"], ["--crf", "30"]]
+        self.assertEqual(av1an_state.merge_video_params(lists), ["--crf", "30", "--preset", "{variable}"])
+
+    def test_apply_template_keeps_variable_drops_missing(self) -> None:
+        out = av1an_state.apply_param_template(
+            ["--crf", "{variable}", "--preset", "3"], ["--crf", "31", "--preset", "2", "--scd", "0"]
+        )
+        self.assertEqual(out, ["--crf", "31", "--preset", "3"])  # crf kept, preset set, scd dropped
+
+    def test_update_sets_uniform_value_across_all(self) -> None:
+        result = av1an_state.update_chunks_params(
+            self.pass_dir, [0, 1, 2], ["--crf", "25", "--preset", "2", "--scd", "0"]
+        )
+        self.assertEqual(result.changed_indices, [0, 1, 2])
+        self.assertEqual(result.reset_indices, [0, 1, 2])
+        crfs = [chunk.video_params[chunk.video_params.index("--crf") + 1] for chunk in load_chunks(self.pass_dir)]
+        self.assertEqual(crfs, ["25", "25", "25"])
+        done = load_done(self.pass_dir)
+        self.assertFalse(any(done.is_done(i) for i in range(3)))
+        self.assertFalse((self.pass_dir / "encode" / "00001.ivf").exists())
+
+    def test_variable_keeps_per_chunk_value(self) -> None:
+        # change only preset; crf stays {variable} -> each chunk keeps its own
+        result = av1an_state.update_chunks_params(
+            self.pass_dir, [0, 1, 2], ["--crf", "{variable}", "--preset", "3", "--scd", "0"]
+        )
+        self.assertEqual(result.changed_indices, [0, 1, 2])  # preset changed for all
+        chunks = {c.index: c.video_params for c in load_chunks(self.pass_dir)}
+        self.assertEqual(chunks[0], ["--crf", "30", "--preset", "3", "--scd", "0"])
+        self.assertEqual(chunks[1], ["--crf", "31", "--preset", "3", "--scd", "0"])
+        self.assertEqual(chunks[2], ["--crf", "32", "--preset", "3", "--scd", "0"])
+
+    def test_unchanged_template_is_noop(self) -> None:
+        merged = av1an_state.merge_video_params([c.video_params for c in load_chunks(self.pass_dir)])
+        result = av1an_state.update_chunks_params(self.pass_dir, [0, 1, 2], merged)
+        self.assertEqual(result.changed_indices, [])
+        self.assertEqual(result.reset_indices, [])
+        done = load_done(self.pass_dir)
+        self.assertTrue(all(done.is_done(i) for i in range(3)))  # nothing reset
+
+    def test_reorder_only_is_not_a_change(self) -> None:
+        temp = str(self.pass_dir)
+        write_json(
+            self.pass_dir / "chunks.json",
+            [
+                make_chunk(0, 0, 100, temp, video_params=["--preset", "2", "--crf", "30"]),
+                make_chunk(1, 100, 200, temp, video_params=["--crf", "31", "--preset", "2"]),
+            ],
+        )
+        merged = av1an_state.merge_video_params([c.video_params for c in load_chunks(self.pass_dir)])
+        self.assertEqual(merged, ["--preset", "2", "--crf", "{variable}"])
+        result = av1an_state.update_chunks_params(self.pass_dir, [0, 1], merged)
+        self.assertEqual(result.changed_indices, [])  # reorder alone must not reset/encode
+
+
+class ChunkStatsTest(unittest.TestCase):
+    """Header progress summary (done/total, time, size, avg bitrate, ? marker)."""
+
+    def _row(self, index: int, done: bool, frames: int, size: int, fps: float = 24.0):
+        from utils.manage.analytics import PassChunkRow
+
+        duration = frames / fps
+        bitrate = (size * 8 / 1000.0 / duration) if (size > 0 and duration > 0) else None
+        return PassChunkRow(
+            index=index, queue_position=index, done=done, start_frame=index * frames,
+            end_frame=(index + 1) * frames, frames=frames, duration_seconds=duration,
+            output_path="", output_exists=done, output_size=size, bitrate_kbps=bitrate,
+            crf=None, passes=1, encoder="svt", video_params="",
+        )
+
+    def _fmt(self, rows):
+        try:
+            from utils.manage.gui_qt import format_chunk_stats
+        except Exception as exc:  # PySide6 not installed
+            self.skipTest(f"gui_qt unavailable: {exc}")
+        return format_chunk_stats(rows)
+
+    def test_all_done_no_marker(self) -> None:
+        rows = [self._row(0, True, 240, 1_000_000), self._row(1, True, 240, 2_000_000)]
+        text = self._fmt(rows)
+        self.assertIn("chunks: 2\\2 - 0:20\\0:20", text)
+        self.assertNotIn("?", text)
+        self.assertIn("1200 kbps", text)  # 3MB*8/1000 / 20s
+
+    def test_partial_marks_question(self) -> None:
+        rows = [self._row(0, True, 240, 1_000_000), self._row(1, False, 240, 0)]
+        text = self._fmt(rows)
+        self.assertIn("chunks: 1\\2 - 0:10\\0:20", text)  # done time < total time
+        self.assertIn("?", text)  # partial size + bitrate marker
+
+    def test_nothing_done(self) -> None:
+        rows = [self._row(0, False, 240, 0), self._row(1, False, 240, 0)]
+        text = self._fmt(rows)
+        self.assertIn("chunks: 0\\2 - 0:00\\0:20", text)
+        self.assertIn("avg bitrate: -?", text)
 
 
 class ScenesTest(unittest.TestCase):

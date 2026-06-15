@@ -61,6 +61,27 @@ class SourceDirLock:
     def _pid_alive(pid: int) -> bool:
         if pid <= 0:
             return False
+        if os.name == "nt":
+            # os.kill(pid, 0) is NOT a liveness probe on Windows: signal 0 is
+            # CTRL_C_EVENT, so it sends Ctrl+C to the console process group
+            # (interrupting the runner/tests sharing the console). Query the
+            # process handle instead.
+            import ctypes
+            import ctypes.wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
         try:
             os.kill(pid, 0)
             return True

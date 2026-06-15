@@ -45,18 +45,18 @@ DEFAULT_SCENE_DETECTION_CONFIG = {
 #   the splitter starts looking for additional cuts even if the source does not
 #   contain a strong hard scenecut. Prefer 32*n+1 or 16*n+1 values so scene
 #   lengths line up better with common encoder hierarchical structures.
-    "scene_detection_extra_split": 241,
+    "scene_detection_extra_split": 289,
 
 #   Maximum length for nearly-still scenes whose frame-to-frame luma difference
 #   reaches the 0.0042 stillness band. This can be larger than
 #   scene_detection_extra_split because almost-static scenes usually tolerate
 #   longer chunks without visible quality instability.
-    "scene_detection_0042_still_scene_extra_split": 289,
+    "scene_detection_0042_still_scene_extra_split": 353,
 
 #   Maximum length for extremely still scenes whose frame-to-frame luma
 #   difference stays around the 0.0012 band. This can be the largest split
 #   target because there is very little motion to protect.
-    "scene_detection_0012_still_scene_extra_split": 385,
+    "scene_detection_0012_still_scene_extra_split": 481,
 
 #   Hard minimum scene length. The recursive splitter will not accept a split
 #   that creates a side shorter than this value. Raising it suppresses tiny

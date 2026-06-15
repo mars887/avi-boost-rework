@@ -278,20 +278,25 @@ def rebuild_split_scenes_for_chunks(
     *,
     tx: Optional[ManageTransaction] = None,
 ) -> None:
-    """Sync ``split_scenes`` with chunk frame ranges after split/merge edits.
+    """Sync ``split_scenes`` (and ``scenes``) with chunk ranges after edits.
 
     For each chunk range the override payload comes from the old split scene
     (or scene) that contains the range start, so zone settings survive edits.
-    Both arrays are written explicitly because av1an clones ``scenes`` when
-    ``split_scenes`` is absent.
+    ``split_scenes`` is what av1an chunks from, so it always tracks chunk
+    geometry 1:1. ``scenes`` (the pre-extra-split list) is rebuilt too whenever
+    it mirrored ``split_scenes`` or was absent — in this pipeline the two are
+    identical — so the file stays consistent "as if it had always been this
+    way"; a genuinely coarser ``scenes`` list is left untouched.
     """
     scene_file = load_scene_file(scene_path)
-    old_split = scene_file.split_scenes or scene_file.scenes
-    if not old_split:
+    old_scenes = scene_file.scenes
+    old_split = scene_file.split_scenes
+    base = old_split or old_scenes
+    if not base:
         raise SceneFileError(f"scene file has no scenes to rebuild from: {scene_path}")
 
     def covering_scene(frame: int) -> Optional[Dict[str, Any]]:
-        for scene in old_split:
+        for scene in base:
             if isinstance(scene, dict):
                 if int(scene.get("start_frame") or 0) <= frame < int(scene.get("end_frame") or 0):
                     return scene
@@ -310,9 +315,21 @@ def rebuild_split_scenes_for_chunks(
         new_split.append(scene)
 
     scene_file.data["split_scenes"] = new_split
-    if not scene_file.scenes:
+    if not old_scenes or _same_scene_boundaries(old_scenes, old_split):
         scene_file.data["scenes"] = [dict(scene) for scene in new_split]
     save_scene_file(scene_path, scene_file, tx=tx)
+
+
+def _same_scene_boundaries(left: List[Dict[str, Any]], right: List[Dict[str, Any]]) -> bool:
+    """True if both scene lists describe the same (start, end) sequence."""
+    def bounds(scenes: List[Dict[str, Any]]) -> List[tuple]:
+        out: List[tuple] = []
+        for scene in scenes:
+            if isinstance(scene, dict):
+                out.append((int(scene.get("start_frame") or 0), int(scene.get("end_frame") or 0)))
+        return out
+
+    return bool(left) and bool(right) and bounds(left) == bounds(right)
 
 
 __all__ = [
