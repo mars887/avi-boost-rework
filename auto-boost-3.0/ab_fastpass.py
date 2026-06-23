@@ -96,7 +96,9 @@ def run_fastpass_av1an(
     """Build and execute the av1an fast-pass command (or sc-only)."""
     encoder = normalize_encoder(encoder)
     sdm_mode = str(sdm).strip().lower()
-    if scenes_path is not None and sdm_mode in ("psd", "none"):
+    # A fast-pass encode (not --sc-only) consumes a pre-existing base scenes.json
+    # for every detector (psd/av1an/none); only --sc-only writes scenes as output.
+    if scenes_path is not None and not sc_only:
         ensure_exists(scenes_path, "Base scenes.json")
     ensure_dir(av1an_temp)
 

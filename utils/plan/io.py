@@ -514,6 +514,7 @@ def _load_file_plan(data: Dict[str, Any]) -> FilePlan:
                 vpy_wrapper=parse_bool_value(video_experimental_data.get("vpy_wrapper"), False),
                 source_loader=normalize_source_loader(video_experimental_data.get("source_loader") or DEFAULT_SOURCE_LOADER),
                 crop_resize_enabled=parse_bool_value(video_experimental_data.get("crop_resize_enabled"), False),
+                vpy_temp_split=parse_bool_value(video_experimental_data.get("vpy_temp_split"), False),
                 av1an_decoupled_enabled=parse_bool_value(
                     experimental_value("av1an_decoupled_enabled", "decoupled_enabled"),
                     False,
@@ -681,6 +682,7 @@ def _dump_file_plan(plan: FilePlan) -> str:
             f"vpy_wrapper = {_toml_scalar(plan.video.experimental.vpy_wrapper)}",
             f"source_loader = {_toml_string(normalize_source_loader(plan.video.experimental.source_loader))}",
             f"crop_resize_enabled = {_toml_scalar(plan.video.experimental.crop_resize_enabled)}",
+            f"vpy_temp_split = {_toml_scalar(plan.video.experimental.vpy_temp_split)}",
             f"av1an_decoupled_enabled = {_toml_scalar(plan.video.experimental.av1an_decoupled_enabled)}",
             f"source_workers = {_toml_optional_coerced_scalar(plan.video.experimental.source_workers)}",
             f"encoder_workers = {_toml_optional_coerced_scalar(plan.video.experimental.encoder_workers)}",

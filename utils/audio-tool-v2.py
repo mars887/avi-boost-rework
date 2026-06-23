@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.pipeline_runtime import read_json as read_json_file, setup_stage_logging, write_json as write_json_file
+from utils.pipeline_runtime import eprint, read_json, run_cmd, setup_stage_logging, write_json
 from utils.plan_model import resolve_file_plan
 
 TOOL_NAME = "audio-tool"
@@ -53,10 +53,6 @@ class AudioToolError(RuntimeError):
     def __init__(self, err_id: str, message: str):
         super().__init__(message)
         self.err_id = err_id
-
-
-def eprint(*a: Any) -> None:
-    print(*a, file=sys.stderr)
 
 
 def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
@@ -88,32 +84,6 @@ def which_or_path(p: str) -> str:
         return p
     found = shutil.which(p)
     return found or p
-
-
-def run_cmd(
-    cmd: List[str],
-    *,
-    check: bool,
-    capture: bool,
-    cwd: Optional[Path] = None,
-    text_mode: bool = True,
-) -> subprocess.CompletedProcess:
-    kwargs: Dict[str, Any] = {}
-    if cwd is not None:
-        kwargs["cwd"] = str(cwd)
-    if capture:
-        kwargs["stdout"] = subprocess.PIPE
-        kwargs["stderr"] = subprocess.PIPE
-    # For binary pipes (ffmpeg -> opusenc) we use Popen directly, not this helper.
-    return subprocess.run(cmd, check=check, text=text_mode, **kwargs)
-
-
-def read_json(p: Path) -> Any:
-    return read_json_file(p)
-
-
-def write_json(p: Path, obj: Any) -> None:
-    write_json_file(p, obj)
 
 
 
@@ -518,10 +488,10 @@ def encode_opus_with_opusenc(
         else:
             # FLAC lossless; opusenc reads FLAC input.
             ff_cmd = [ffmpeg] + ff_args + ["-f", "flac", "-compression_level", "0", str(tmp_in)]
-        run_cmd(ff_cmd, check=True, capture=True, text_mode=True)
+        run_cmd(ff_cmd, check=True, capture=True)
 
         op_cmd = opus_cmd + [str(tmp_in), str(out_opus)]
-        r = run_cmd(op_cmd, check=False, capture=True, text_mode=True)
+        r = run_cmd(op_cmd, check=False, capture=True)
         if r.returncode != 0:
             raise AudioToolError(
                 "opusenc_failed_encode",

@@ -5,21 +5,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from utils import workdir_layout as layout
 from utils.manage.av1an_state import ChunkState
 from utils.manage.backup import ManageTransaction, write_json_atomic
 from utils.manage.context import WorkdirContext
 
-# scene files known to the pipeline, relative to the workdir, in pipeline order
+_V = layout.VIDEO_DIRNAME
+
+# scene files known to the pipeline, relative to the workdir, in pipeline order.
+# Names are sourced from utils.workdir_layout (the on-disk-layout SSOT) so they
+# cannot drift from the paths the runner actually produces.
 KNOWN_SCENE_FILES = (
-    ("video/psd/scenes.psd.json", "PSD base scenes"),
-    ("video/fastpass/scenes.json", "av1an fastpass scenes"),
-    ("video/scenes.json", "auto-boost stage4 scenes"),
-    ("video/scenes-preview.json", "auto-boost stage4 scenes (fastpass mode)"),
-    ("video/scenes-boundaries.json", "zone boundaries"),
-    ("video/scenes-recalc.json", "zone CRF recalc"),
-    ("video/scenes-zoned.json", "zone edit"),
-    ("video/scenes-final.json", "final scenes (HDR patched)"),
-    ("video/mainpass/scenes.json", "av1an mainpass temp scenes"),
+    (f"{_V}/{layout.PSD_DIRNAME}/{layout.PSD_BASE_SCENES_NAME}", "PSD base scenes"),
+    (f"{_V}/{layout.FASTPASS_DIRNAME}/{layout.AV1AN_SCENES_NAME}", "av1an fastpass scenes"),
+    (f"{_V}/{layout.STAGE4_SCENES_FULL_NAME}", "auto-boost stage4 scenes"),
+    (f"{_V}/{layout.STAGE4_SCENES_PREVIEW_NAME}", "auto-boost stage4 scenes (fastpass mode)"),
+    (f"{_V}/{layout.BOUNDARY_SCENES_NAME}", "zone boundaries"),
+    (f"{_V}/{layout.RECALC_SCENES_NAME}", "zone CRF recalc"),
+    (f"{_V}/{layout.ZONED_SCENES_NAME}", "zone edit"),
+    (f"{_V}/{layout.FINAL_SCENES_NAME}", "final scenes (HDR patched)"),
+    (f"{_V}/{layout.MAINPASS_DIRNAME}/{layout.AV1AN_SCENES_NAME}", "av1an mainpass temp scenes"),
 )
 
 

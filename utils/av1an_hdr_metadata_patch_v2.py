@@ -42,14 +42,12 @@ Dependencies (must be in PATH, depending on enabled features):
 from __future__ import annotations
 
 import argparse
-import atexit
 import json
 import logging
 import re
 import shutil
 import subprocess
 import sys
-from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,7 +56,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.pipeline_runtime import TeeStream, read_json as read_json_file, write_json as write_json_file
+from utils.pipeline_runtime import read_json as read_json_file, setup_stage_logging, write_json as write_json_file
 
 
 LOG = logging.getLogger("av1an_hdrmeta_patch")
@@ -140,49 +138,11 @@ def normalize_x265_range(value: Any) -> Optional[str]:
 
 def setup_logging(log_path: str, verbose: bool, workdir: Optional[Path] = None) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    stream = sys.stdout
-    log_fh = None
-    orig_stdout = sys.stdout
-    orig_stderr = sys.stderr
-    tee_out = None
-    tee_err = None
-
     if log_path:
-        p = Path(log_path)
-        if not p.is_absolute() and workdir is not None:
-            p = workdir / p
-        p.parent.mkdir(parents=True, exist_ok=True)
-        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-        log_fh = p.open("a", encoding=enc, errors="replace")
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            log_fh.write(f"=== START hdr-patch {ts} ===\n")
-            log_fh.flush()
-        except Exception:
-            pass
-        tee_out = TeeStream(orig_stdout, log_fh)
-        tee_err = TeeStream(orig_stderr, log_fh)
-        sys.stdout = tee_out
-        sys.stderr = tee_err
-        stream = tee_out
-
-        def _cleanup() -> None:
-            ts_end = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                log_fh.write(f"=== END hdr-patch {ts_end} ===\n")
-                log_fh.flush()
-            except Exception:
-                pass
-            sys.stdout = orig_stdout
-            sys.stderr = orig_stderr
-            if tee_out is not None:
-                tee_out.close_log()
-            if tee_err is not None:
-                tee_err.close_log()
-
-        atexit.register(_cleanup)
-
-    handler = logging.StreamHandler(stream)
+        # Shared tee-to-file: swaps sys.stdout/stderr onto a TeeStream and writes
+        # the "=== START/END hdr-patch ===" markers + atexit cleanup.
+        setup_stage_logging(log_path, stage_name="hdr-patch", base_dir=workdir)
+    handler = logging.StreamHandler(sys.stdout)
     formatter = logging.Formatter(
         "%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%H:%M:%S",

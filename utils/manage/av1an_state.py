@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
+from utils import workdir_layout as layout
 from utils.manage.backup import ManageTransaction, write_json_atomic
 from utils.manage.context import WorkdirContext
 
@@ -128,7 +129,7 @@ def chunk_name(index: int) -> str:
 def pass_dir(ctx: WorkdirContext, pass_name: PassName) -> Path:
     if pass_name not in PASS_NAMES:
         raise Av1anStateError(f"unknown pass name: {pass_name}")
-    return ctx.workdir / "video" / pass_name
+    return layout.video_dir(ctx.workdir) / pass_name
 
 
 def chunks_path(pass_dir: Path) -> Path:

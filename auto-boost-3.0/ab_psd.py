@@ -35,7 +35,7 @@ def run_psd(
     ensure_dir(base_scenes_path.parent)
 
     py = str(psd_python) if psd_python else sys.executable
-    cmd = [py, str(psd_script), "-i", str(input_file), "-o", str(base_scenes_path)]
+    cmd = [py, str(psd_script), "-i", str(input_file), "-o", str(base_scenes_path), "--serial-passes", "--workers", "2"]
     if extra_args:
         cmd.extend(shlex.split(extra_args))
     for arg in [str(item) for item in (vspipe_args or []) if str(item).strip()]:

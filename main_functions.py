@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
+from utils import workdir_layout as layout
 from utils.pipeline_runtime import ROOT_DIR, UTILS_DIR, load_toolchain
 from utils.plan_model import FilePlan, load_plan, resolve_batch_plan, resolve_paths
 from utils.plan_support import collect_file_plan_paths, refresh_support_for_plan_paths
@@ -53,7 +54,7 @@ def enter_numbers(raw: str, min_value: int, max_value: int) -> List[int]:
 
 
 def is_supported_video_file(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in VIDEO_EXTS and not path.name.lower().endswith(("-av1.mkv", "-av1.mp4"))
+    return path.is_file() and path.suffix.lower() in VIDEO_EXTS and not layout.is_final_output_name(path.name)
 
 def is_supported_video_file_for_extract(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in VIDEO_EXTRACT_EXTS

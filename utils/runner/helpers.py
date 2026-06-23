@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List
 
+from utils import workdir_layout as layout
 from utils.pipeline_runtime import read_command_output
 from utils.plan_model import FilePlan, load_plan, resolve_file_plan
 from utils.runner_state import CACHED_STAGE_MESSAGE, display_stage_plan, stage_resume_marker_exists
@@ -66,19 +67,28 @@ def initial_stage_states(item: QueueItem) -> List[StageState]:
     return states
 
 
-def build_wrapper_vspipe_args(
+def build_vpy_vspipe_args(
     item: "QueueItem",
     *,
     user_vpy: str,
     pass_name: str,
 ) -> List[str]:
+    """Full vspipe-args set forwarded to a pass's .vpy.
+
+    Passed for every pass that runs a .vpy, **with or without** the wrapper, so a
+    user script launched directly (``av1an -i user.vpy``) receives the same
+    context the wrapper would. ``temp`` is a per-pass scratch directory the
+    script may use for its own temp files.
+    """
     plan = item.resolved.plan
     experimental = plan.video.experimental
+    temp = layout.vpy_temp_dir(item.workdir, pass_name, split=experimental.vpy_temp_split)
     return [
         f"src={item.source}",
         f"vpy={user_vpy or ''}",
         f"rules={item.resolved.paths.crop_resize_file}",
         f"pass_name={pass_name}",
+        f"temp={temp}",
         f"source_loader={experimental.source_loader or 'ffms2'}",
         f"crop_enabled={bool_arg(experimental.crop_resize_enabled)}",
         f"plan_path={item.plan_path}",

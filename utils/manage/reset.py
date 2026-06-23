@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Sequence
 
+from utils import workdir_layout as layout
 from utils.pipeline_runtime import final_output_path_for_source
 from utils.runner.stage_bank import downstream_stage_names
 from utils.runner_state import (
@@ -21,6 +22,7 @@ from utils.runner_state import (
     STAGE_ZONE_BOUNDARIES,
     STAGE_ZONE_EDIT,
     STAGE_ZONE_RECALC,
+    autoboost_base_scenes,
     autoboost_fastpass_output,
     autoboost_ssimu2_log,
     autoboost_stage4_scenes,
@@ -89,8 +91,6 @@ def stage_reset_actions(ctx: WorkdirContext, stage: str) -> List[FileAction]:
     """
     item = make_runner_item(ctx)
     workdir = ctx.workdir
-    video = workdir / "video"
-    meta = workdir / "00_meta"
     actions: List[FileAction] = []
 
     def marker(stage_name: str) -> None:
@@ -100,59 +100,68 @@ def stage_reset_actions(ctx: WorkdirContext, stage: str) -> List[FileAction]:
 
     if stage == STAGE_DEMUX:
         marker(stage)
-        actions.append(FileAction("delete", meta / "demux_manifest.json", "demux manifest"))
+        actions.append(FileAction("delete", layout.demux_manifest_path(workdir), "demux manifest"))
     elif stage == STAGE_ATTACHMENTS:
         marker(stage)
         actions.append(
-            FileAction("delete", workdir / "attachments" / "attachments_cleaner_report.json", "cleaner report")
+            FileAction("delete", layout.attachments_report_path(workdir), "cleaner report")
         )
     elif stage == STAGE_AUTOBOOST_PSD_SCENE:
         marker(stage)
-        actions.append(FileAction("delete_tree", video / "psd", "PSD scene detection output"))
-    elif stage in (STAGE_AUTOBOOST_SCENE, STAGE_FASTPASS):
-        # both share the FASTPASS_COMPLETED marker; scene detection results
-        # live inside video/fastpass for av1an scene detection
-        marker(STAGE_FASTPASS)
-        actions.append(FileAction("delete_tree", video / "fastpass", "fastpass temp (chunks, encode, scenes)"))
+        actions.append(FileAction("delete_tree", layout.psd_dir(workdir), "PSD scene detection output"))
+    elif stage == STAGE_AUTOBOOST_SCENE:
+        # Scene detection owns the base scenes: av1an `--sc-only` writes them (or
+        # the single-scene "none" mode). Delete them so detection actually re-runs
+        # instead of resuming. av1an detection uses video/fastpass as its av1an
+        # temp, so clear that too. Fastpass depends on SCD, so the reset chain
+        # re-runs Fastpass after this.
+        marker(stage)
+        actions.append(FileAction("delete", autoboost_base_scenes(item), "base scenes (scene detection output)"))
+        actions.append(FileAction("delete_tree", layout.fastpass_dir(workdir), "av1an detection + fastpass temp", required=False))
+    elif stage == STAGE_FASTPASS:
+        # Resetting Fastpass must NOT reset scene detection: drop only the encode
+        # output, keeping the base scenes (the SCD result) so SCD is not re-run.
+        marker(stage)
+        actions.append(FileAction("delete", autoboost_fastpass_output(item), "fastpass encode output"))
     elif stage == STAGE_SSIMU2:
         marker(stage)
         actions.append(FileAction("delete", autoboost_ssimu2_log(item), "SSIMU2 metrics log"))
         actions.append(FileAction("delete", autoboost_stage4_scenes(item), "auto-boost derived scenes"))
-        actions.append(FileAction("delete", video / "scenes-hdr.json", "legacy derived scenes", required=False))
+        actions.append(FileAction("delete", layout.legacy_hdr_scenes(workdir), "legacy derived scenes", required=False))
     elif stage == STAGE_ZONE_BOUNDARIES:
         marker(stage)
-        actions.append(FileAction("delete", video / "scenes-boundaries.json", "zone boundaries scenes"))
+        actions.append(FileAction("delete", layout.boundary_scenes(workdir), "zone boundaries scenes"))
     elif stage == STAGE_ZONE_RECALC:
         marker(stage)
-        actions.append(FileAction("delete", video / "scenes-recalc.json", "zone recalc scenes"))
+        actions.append(FileAction("delete", layout.recalc_scenes(workdir), "zone recalc scenes"))
     elif stage == STAGE_ZONE_EDIT:
         marker(stage)
-        actions.append(FileAction("delete", video / "scenes-zoned.json", "zone edited scenes"))
+        actions.append(FileAction("delete", layout.zoned_scenes(workdir), "zone edited scenes"))
     elif stage == STAGE_HDR_PATCH:
         marker(stage)
-        actions.append(FileAction("delete", video / "scenes-final.json", "final scenes"))
-        actions.append(FileAction("delete_tree", video / "hdr_tmp", "HDR patch temp", required=False))
+        actions.append(FileAction("delete", layout.final_scenes(workdir), "final scenes"))
+        actions.append(FileAction("delete_tree", layout.hdr_tmp_dir(workdir), "HDR patch temp", required=False))
         actions.append(
             FileAction(
                 "unlink_marker",
-                video / ".state" / "FINAL_SCENES_COMPLETED",
+                layout.video_state_dir(workdir) / "FINAL_SCENES_COMPLETED",
                 "legacy final scenes marker",
                 required=False,
             )
         )
     elif stage == STAGE_MAINPASS:
-        actions.append(FileAction("delete_tree", video / "mainpass", "mainpass temp (chunks, encode)"))
-        actions.append(FileAction("delete", video / "video-final.mkv", "mainpass output"))
+        actions.append(FileAction("delete_tree", layout.mainpass_dir(workdir), "mainpass temp (chunks, encode)"))
+        actions.append(FileAction("delete", layout.video_final_output(workdir), "mainpass output"))
     elif stage == STAGE_AUDIO:
         marker(stage)
-        actions.append(FileAction("delete", meta / "audio_manifest.json", "audio manifest"))
-        actions.append(FileAction("delete_tree", workdir / "audio", "audio outputs"))
+        actions.append(FileAction("delete", layout.audio_manifest_path(workdir), "audio manifest"))
+        actions.append(FileAction("delete_tree", layout.audio_dir(workdir), "audio outputs"))
     elif stage == STAGE_VERIFY:
         marker(stage)
-        actions.append(FileAction("delete", workdir / "00_logs" / "verify_error.txt", "verify error log", required=False))
+        actions.append(FileAction("delete", layout.logs_dir(workdir) / "verify_error.txt", "verify error log", required=False))
     elif stage == STAGE_MUX:
         marker(stage)
-        actions.append(FileAction("delete", meta / "mux_manifest.json", "mux manifest", required=False))
+        actions.append(FileAction("delete", layout.mux_manifest_path(workdir), "mux manifest", required=False))
         # the muxed file next to the source is kept on purpose: it is the
         # user-facing result and a re-run overwrites it anyway
     else:
@@ -230,6 +239,37 @@ def reset_stage(ctx: WorkdirContext, stage: str, chain: bool = False) -> ResetRe
     return apply_actions(ctx, plan, message=f"reset {'chain' if chain else 'stage'}: {stage}")
 
 
+def chunk_downstream_reset(ctx: WorkdirContext, pass_name: PassName) -> ResetPlan:
+    """Artifacts/markers to invalidate after editing a chunk in ``pass_name``.
+
+    Single source of truth for the fastpass/mainpass downstream-invalidation set
+    shared by :func:`preview_chunk_reset`, :func:`reset_chunk` and the manage
+    GUI's post-geometry cleanup, so the three never drift. Does NOT touch the
+    chunk's own encode output / done.json — that is the caller's job (the preview
+    lists it; ``reset_chunk`` delegates to ``mark_chunk_not_done``).
+    """
+    item = make_runner_item(ctx)
+    actions: List[FileAction] = []
+    if pass_name == "fastpass":
+        actions.append(FileAction("delete", autoboost_fastpass_output(item), "fastpass output container"))
+        fastpass_marker = stage_marker_path(item, STAGE_FASTPASS)
+        if fastpass_marker is not None:
+            actions.append(FileAction("unlink_marker", fastpass_marker, "Fastpass marker"))
+        downstream_plan = preview_stage_reset(ctx, STAGE_SSIMU2, chain=True)
+        stages = [STAGE_FASTPASS, *downstream_plan.stages]
+        actions.extend(downstream_plan.actions)
+    else:
+        actions.append(FileAction("delete", layout.video_final_output(ctx.workdir), "mainpass output"))
+        stages = [STAGE_MAINPASS, STAGE_VERIFY, STAGE_MUX]
+        for stage_name in (STAGE_VERIFY, STAGE_MUX):
+            stage_marker = stage_marker_path(item, stage_name)
+            if stage_marker is not None:
+                actions.append(FileAction("unlink_marker", stage_marker, f"{stage_name} marker"))
+    return ResetPlan(
+        workdir=ctx.workdir, operation="chunk_downstream", stages=stages, actions=_dedupe(actions)
+    )
+
+
 def preview_chunk_reset(
     ctx: WorkdirContext,
     pass_name: PassName,
@@ -244,7 +284,6 @@ def preview_chunk_reset(
     chunk = next((item for item in chunks if item.index == int(chunk_index)), None)
     if chunk is None:
         raise RuntimeError(f"chunk index {chunk_index} not found in {pass_name}")
-    item = make_runner_item(ctx)
 
     actions: List[FileAction] = []
     output = av1an_state.chunk_output_path(chunk, pdir)
@@ -258,21 +297,11 @@ def preview_chunk_reset(
     for sidecar in av1an_state.sidecar_paths(pdir, chunk.index):
         actions.append(FileAction("delete", sidecar, "chunk sidecar/probe file"))
 
-    plan = ResetPlan(workdir=ctx.workdir, operation="reset_chunk", stages=[], actions=[])
+    downstream = chunk_downstream_reset(ctx, pass_name)
+    actions.extend(downstream.actions)
+
+    plan = ResetPlan(workdir=ctx.workdir, operation="reset_chunk", stages=downstream.stages, actions=[])
     plan.notes.append(f"done.json entry {chunk.name} will be removed")
-    if pass_name == "fastpass":
-        actions.append(FileAction("delete", autoboost_fastpass_output(item), "fastpass output container"))
-        actions.append(
-            FileAction("unlink_marker", stage_marker_path(item, STAGE_FASTPASS), "Fastpass marker")
-        )
-        downstream_plan = preview_stage_reset(ctx, STAGE_SSIMU2, chain=True)
-        plan.stages = [STAGE_FASTPASS, *downstream_plan.stages]
-        actions.extend(downstream_plan.actions)
-    else:
-        actions.append(FileAction("delete", ctx.workdir / "video" / "video-final.mkv", "mainpass output"))
-        actions.append(FileAction("unlink_marker", stage_marker_path(item, STAGE_VERIFY), "Verify marker"))
-        actions.append(FileAction("unlink_marker", stage_marker_path(item, STAGE_MUX), "Mux marker"))
-        plan.stages = [STAGE_MAINPASS, STAGE_VERIFY, STAGE_MUX]
     plan.actions = _dedupe(actions)
     return plan
 
@@ -298,26 +327,12 @@ def reset_chunk(
     )
     changed = av1an_state.mark_chunk_not_done(pdir, chunk_index, policy=effective_policy, tx=tx)
 
-    item = make_runner_item(ctx)
-    if pass_name == "fastpass":
-        for path in (autoboost_fastpass_output(item), stage_marker_path(item, STAGE_FASTPASS)):
-            if path is not None and tx.delete_file(path):
-                changed.append(path)
-        downstream_plan = preview_stage_reset(ctx, STAGE_SSIMU2, chain=True)
-        for action in downstream_plan.actions:
-            if action.action == "delete_tree":
-                if tx.delete_tree(action.path):
-                    changed.append(action.path)
-            elif tx.delete_file(action.path):
+    for action in chunk_downstream_reset(ctx, pass_name).actions:
+        if action.action == "delete_tree":
+            if tx.delete_tree(action.path):
                 changed.append(action.path)
-    else:
-        for path in (
-            ctx.workdir / "video" / "video-final.mkv",
-            stage_marker_path(item, STAGE_VERIFY),
-            stage_marker_path(item, STAGE_MUX),
-        ):
-            if path is not None and tx.delete_file(path):
-                changed.append(path)
+        elif tx.delete_file(action.path):
+            changed.append(action.path)
 
     manifest = tx.commit(
         message=f"reset chunk {chunk_index} ({pass_name}, policy={effective_policy})",
@@ -336,7 +351,7 @@ def reset_crf_recalc(ctx: WorkdirContext) -> ResetResult:
     item = make_runner_item(ctx)
     actions = [
         FileAction("delete", autoboost_stage4_scenes(item), "auto-boost derived scenes"),
-        FileAction("delete", ctx.workdir / "video" / "scenes-hdr.json", "legacy derived scenes", required=False),
+        FileAction("delete", layout.legacy_hdr_scenes(ctx.workdir), "legacy derived scenes", required=False),
         *zone_plan.actions,
     ]
     plan = ResetPlan(
@@ -355,6 +370,7 @@ __all__ = [
     "ResetPlan",
     "ResetResult",
     "apply_actions",
+    "chunk_downstream_reset",
     "ensure_not_running",
     "preview_chunk_reset",
     "preview_file_changes",

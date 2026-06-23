@@ -3,7 +3,6 @@
 
 import argparse
 import json
-import re
 import shutil
 import subprocess
 import sys
@@ -21,87 +20,23 @@ from utils.media_helpers import (
     sanitize_component,
     subtitle_extension_from_codec as sub_ext_from_codec,
 )
-from utils.pipeline_runtime import setup_stage_logging, write_json as write_json_file
+from utils.pipeline_runtime import (
+    ensure_dir,
+    eprint,
+    run_cmd_streamed as run_cmd,
+    setup_stage_logging,
+    which_or,
+    write_json as write_json_file,
+)
 from utils.plan_model import resolve_file_plan
-
-
-def eprint(*args: Any) -> None:
-    print(*args, file=sys.stderr)
 
 
 def setup_logging(log_path: Optional[str], workdir: Optional[Path] = None) -> None:
     setup_stage_logging(log_path or "", stage_name="demux", base_dir=workdir)
 
 
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-
-def which_or(name: str, fallback: str) -> str:
-    return shutil.which(name) or fallback
-
-
 def safe_filename(name: str, max_len: int = 180) -> str:
     return sanitize_component(name, default="unnamed", max_len=max_len)
-
-
-PROGRESS_RE = re.compile(r"^(progress|processed)\s*[:\-]?\s*\d+%\s*$", re.IGNORECASE)
-
-
-def is_progress_line(line: str) -> bool:
-    s = line.strip()
-    if not s:
-        return False
-    if PROGRESS_RE.match(s):
-        return True
-    if s.endswith("%") and any(ch.isdigit() for ch in s) and len(s) <= 40:
-        return True
-    return False
-
-
-def run_cmd(cmd: List[str]) -> None:
-    # Важно: encoding/errors фиксируем, иначе Windows "charmap" может упасть.
-    print("[cmd]", " ".join(cmd))
-    p = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    progress_width = 0
-    had_progress = False
-    if p.stdout is not None:
-        for line in p.stdout:
-            if is_progress_line(line):
-                s = line.strip()
-                if len(s) < progress_width:
-                    s = s + (" " * (progress_width - len(s)))
-                progress_width = max(progress_width, len(s))
-                sys.stdout.write(s + "\r")
-                sys.stdout.flush()
-                had_progress = True
-                continue
-
-            if had_progress:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                had_progress = False
-                progress_width = 0
-
-            if line:
-                sys.stdout.write(line)
-                if not line.endswith("\n"):
-                    sys.stdout.write("\n")
-                sys.stdout.flush()
-
-    rc = p.wait()
-    if had_progress:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
-    if rc != 0:
-        raise RuntimeError(f"Command failed with code {rc}")
 
 
 def write_json(p: Path, obj: Any) -> None:

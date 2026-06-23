@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -10,6 +11,8 @@ from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Sequence, TextIO
+
+from utils.workdir_layout import final_output_path_for_source as _final_output_path_for_source
 
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -118,8 +121,10 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def final_output_path_for_source(source: Path) -> Path:
-    return source.parent / f"{source.stem}-av1.mkv"
+# Final-output naming lives in utils.workdir_layout (the single source of truth
+# for on-disk paths); re-exported here for the modules that already import it
+# from pipeline_runtime.
+final_output_path_for_source = _final_output_path_for_source
 
 
 class TeeStream:
@@ -221,6 +226,86 @@ def write_json(path: Path, obj: Any, *, indent: int = 2) -> None:
 
 def which_or(name: str, fallback: str = "") -> str:
     return shutil.which(name) or fallback or name
+
+
+def eprint(*args: Any) -> None:
+    """Print to stderr. Shared by the standalone stage tools."""
+    print(*args, file=sys.stderr)
+
+
+# Matches the bare "progress: NN%" / "processed - NN%" status lines emitted by
+# ffmpeg/mkvtoolnix wrappers so they can be collapsed onto a single console row.
+PROGRESS_RE = re.compile(r"^(progress|processed)\s*[:\-]?\s*\d+%\s*$", re.IGNORECASE)
+
+
+def is_progress_line(line: str, *, max_len: int = 40) -> bool:
+    """True for short, percentage-style status lines that should overwrite in place."""
+    s = line.strip()
+    if not s:
+        return False
+    if PROGRESS_RE.match(s):
+        return True
+    if s.endswith("%") and any(ch.isdigit() for ch in s) and len(s) <= max_len:
+        return True
+    return False
+
+
+def run_cmd_streamed(
+    cmd: Sequence[str],
+    *,
+    check: bool = True,
+    cwd: Optional[Path] = None,
+    echo: bool = True,
+) -> int:
+    """Run a command, streaming stdout live with in-place progress-line handling.
+
+    Progress lines (see :func:`is_progress_line`) are collapsed onto one
+    carriage-return-updated row; every other line is printed normally. Raises
+    ``RuntimeError`` on a nonzero exit when ``check`` is true. This is the single
+    streaming runner shared by the standalone stage tools (e.g. demux); use
+    :func:`run_cmd` instead when you need a captured, non-streaming result.
+    """
+    if echo:
+        print("[cmd]", " ".join(str(x) for x in cmd))
+    proc = subprocess.Popen(
+        [str(x) for x in cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=str(cwd) if cwd is not None else None,
+    )
+    progress_width = 0
+    had_progress = False
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            if is_progress_line(line):
+                s = line.strip()
+                if len(s) < progress_width:
+                    s = s + (" " * (progress_width - len(s)))
+                progress_width = max(progress_width, len(s))
+                sys.stdout.write(s + "\r")
+                sys.stdout.flush()
+                had_progress = True
+                continue
+            if had_progress:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                had_progress = False
+                progress_width = 0
+            if line:
+                sys.stdout.write(line)
+                if not line.endswith("\n"):
+                    sys.stdout.write("\n")
+                sys.stdout.flush()
+    rc = proc.wait()
+    if had_progress:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    if check and rc != 0:
+        raise RuntimeError(f"Command failed with code {rc}")
+    return rc
 
 
 def run_cmd(

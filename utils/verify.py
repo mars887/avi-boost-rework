@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.media_helpers import normalize_track_type as norm_type
+from utils.media_helpers import media_duration_seconds, normalize_track_type as norm_type
 from utils.pipeline_runtime import read_json as read_json_file, setup_stage_logging
 from utils.plan_model import resolve_file_plan
 
@@ -153,18 +153,9 @@ def ffprobe_has_stream(js: Dict[str, Any], codec_type: str) -> bool:
 
 
 def ffprobe_duration_ms(js: Dict[str, Any]) -> int:
-    fmt = js.get("format") or {}
-    dur = fmt.get("duration")
-    if dur is None:
-        # fallback: first stream duration
-        for s in js.get("streams") or []:
-            if s.get("duration") is not None:
-                dur = s.get("duration")
-                break
-    try:
-        return int(float(dur) * 1000.0) if dur is not None else 0
-    except Exception:
-        return 0
+    # Duration extraction (format.duration with per-stream fallback) lives in
+    # utils.media_helpers so the runner/verify/web exporters agree.
+    return int(media_duration_seconds(js) * 1000.0)
 
 
 def parse_int_ms(value: Any) -> int:

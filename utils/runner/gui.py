@@ -71,7 +71,7 @@ from .api import RunnerLaunchConfig, RunnerRuntime
 from .helpers import build_queue, normalize_mode
 from .integrations import attach_discord_integrations
 from .logs import RunnerLogLine
-from .stage_bank import StageBankConfig, load_stage_bank_config
+from .stage_bank import StageBankConfig, build_stage_bank_config, load_stage_bank_config
 from .terminal import TerminalScreen
 
 
@@ -793,7 +793,10 @@ class RunnerMainWindow(QMainWindow):
         self._refresh_queue_preview()
 
     def _stage_bank_config(self) -> StageBankConfig:
-        return StageBankConfig(
+        # Route through the validating constructor so an out-of-range capacity
+        # (e.g. below the cost of Fastpass/Mainpass) is rejected up front instead
+        # of producing a bank where those stages can never launch.
+        return build_stage_bank_config(
             capacity=int(self.capacity_spin.value()),
             max_active_plans=int(self.active_plans_spin.value()),
             max_running_stages=int(self.running_stages_spin.value()),
@@ -1159,6 +1162,11 @@ class RunnerMainWindow(QMainWindow):
             QMessageBox.warning(self, "Runner", "Add at least one .plan file first.")
             return
         plan_modes = {path: self._mode_for_path(path) for path in paths}
+        try:
+            stage_bank_config = self._stage_bank_config()
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "Stage bank", f"Invalid stage bank settings: {exc}")
+            return
         config = RunnerLaunchConfig(
             plans=paths,
             mode="",
@@ -1168,7 +1176,7 @@ class RunnerMainWindow(QMainWindow):
             exit_when_idle=self.exit_when_idle_check.isChecked(),
             no_interactive=True,
             session_id=str(getattr(self.args, "session_id", "") or ""),
-            stage_bank_config=self._stage_bank_config(),
+            stage_bank_config=stage_bank_config,
         )
         try:
             runtime = RunnerRuntime(config)

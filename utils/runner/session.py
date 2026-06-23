@@ -40,21 +40,27 @@ from utils.runner_state import (
     STAGE_ZONE_BOUNDARIES,
     STAGE_ZONE_EDIT,
     STAGE_ZONE_RECALC,
+    autoboost_stage4_scenes,
     clear_stage_marker,
     file_not_older_than,
+    final_scenes,
     is_cached_stage_message,
     public_stage_name,
     stage_completion_artifacts_valid,
     stage_resume_info,
     write_stage_marker,
+    zone_boundary_scenes,
+    zone_edit_scenes,
+    zone_recalced_scenes,
 )
+from utils import workdir_layout as layout
 from utils.zoned_commands import ensure_zoned_command_file
 
 from .helpers import (
     av1an_encoder_name,
     av1an_supports_progress_jsonl,
     bool_arg,
-    build_wrapper_vspipe_args,
+    build_vpy_vspipe_args,
     initial_stage_states,
     item_short_snapshot,
     resolve_optional_path,
@@ -81,7 +87,6 @@ def psd_scene_detection_args(primary: Any) -> List[str]:
     return args
 
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 PERCENT_RE = re.compile(r"(?<!\d)(100(?:\.0+)?|[0-9]{1,2}(?:\.[0-9]+)?)\s*%")
 AV1AN_PROGRESS_RE = re.compile(
     r"(?P<percent>100(?:\.0+)?|[0-9]{1,2}(?:\.[0-9]+)?)\s*%\s+"
@@ -711,7 +716,7 @@ class SessionController:
         raise ValueError(f"unknown command: {command}")
 
     def _write_item_state(self, item: QueueItem, event: RunnerEvent) -> None:
-        meta_dir = item.workdir / "00_meta"
+        meta_dir = layout.meta_dir(item.workdir)
         ensure_dir(meta_dir)
         state = {
             "session_id": self.session_id,
@@ -896,7 +901,7 @@ class SessionController:
             text += f" | {message}"
         print(text, flush=True)
 
-        meta_dir = item.workdir / "00_meta"
+        meta_dir = layout.meta_dir(item.workdir)
         ensure_dir(meta_dir)
         event_line = json.dumps(event.__dict__, ensure_ascii=False)
         with self.event_io_lock:
@@ -932,7 +937,7 @@ class SessionController:
     def _stage_capture_log_path(self, item: QueueItem, plan_run_id: str, stage: str) -> Path:
         safe_stage = self._safe_stage_name(stage)
         safe_run = re.sub(r"[^A-Za-z0-9_.-]+", "_", plan_run_id).strip("_") or "run"
-        return item.workdir / "00_logs" / f"runner_capture_{safe_stage}_{safe_run}.log"
+        return layout.logs_dir(item.workdir) / f"runner_capture_{safe_stage}_{safe_run}.log"
 
     def _ensure_console_ansi(self) -> None:
         if getattr(self, "_console_ansi_ready", False):
@@ -1309,7 +1314,7 @@ class SessionController:
         return {}
 
     def _refresh_running_stage_progress(self, item: QueueItem, stage_names: Optional[List[str]] = None) -> None:
-        log_dir = item.workdir / "00_logs"
+        log_dir = layout.logs_dir(item.workdir)
         progress_sources = {
             STAGE_FASTPASS: log_dir / "03.1_fastpass.log",
             STAGE_MAINPASS: log_dir / "06_av1an_mainpass.log",
@@ -1368,7 +1373,7 @@ class SessionController:
     @staticmethod
     def _stage_child_events_path(item: QueueItem, plan_run_id: str, stage: str) -> Path:
         safe_stage = SessionController._safe_stage_name(stage)
-        return item.workdir / "00_meta" / f"runner_child_{plan_run_id}_{safe_stage}.jsonl"
+        return layout.meta_dir(item.workdir) / f"runner_child_{plan_run_id}_{safe_stage}.jsonl"
 
     def _run_stage(
         self,
@@ -1642,14 +1647,14 @@ class SessionController:
         details = plan.video.details
         plan_path = str(paths.plan_path)
         workdir = paths.workdir
-        log_dir = workdir / "00_logs"
+        log_dir = layout.logs_dir(workdir)
         ensure_dir(log_dir)
-        ensure_dir(workdir / "00_meta")
-        ensure_dir(workdir / "audio")
-        ensure_dir(workdir / "video")
-        ensure_dir(workdir / "sub")
-        ensure_dir(workdir / "attachments")
-        ensure_dir(workdir / "chapters")
+        ensure_dir(layout.meta_dir(workdir))
+        ensure_dir(layout.audio_dir(workdir))
+        ensure_dir(layout.video_dir(workdir))
+        ensure_dir(layout.sub_dir(workdir))
+        ensure_dir(layout.attachments_dir(workdir))
+        ensure_dir(layout.chapters_dir(workdir))
         ensure_dir(paths.zone_file.parent)
         ensure_zoned_command_file(workdir, paths.zone_file)
 
@@ -1689,17 +1694,40 @@ class SessionController:
             proxy_vpy = resolve_optional_path(details.proxy_vpy, paths.plan_path)
             experimental = plan.video.experimental
             use_wrapper = bool(experimental.vpy_wrapper or experimental.crop_resize_enabled)
+            # vpy scratch dir(s): one shared video/vpy_temp/ by default, or per-pass
+            # video/vpy_temp/{proxy,fast,main}/ when video.experimental.vpy_temp_split.
+            if experimental.vpy_temp_split:
+                for _vpy_pass in layout.VPY_TEMP_PASSES:
+                    ensure_dir(layout.vpy_temp_dir(workdir, _vpy_pass, split=True))
+            else:
+                ensure_dir(layout.vpy_temp_dir(workdir, "", split=False))
+
+            # Each pass runs its own .vpy with a matching pass_name/temp context:
+            #   scene detection (av1an --sc-only / PSD) -> proxy.vpy  (pass_name=proxy)
+            #   fast-pass + ssimu2 metrics              -> fast.vpy   (pass_name=fast)
+            #   main-pass                               -> main.vpy   (pass_name=main)
+            # SCD falls back proxy->fast->source (like PSD). With the wrapper av1an's
+            # -i is wrapper.vpy and the user script is chosen via the vspipe
+            # vpy=/pass_name= args; the full set is forwarded for direct runs too,
+            # while raw-source passes (no vpy/wrapper) get nothing.
+            scd_source_vpy = proxy_vpy or fast_vpy
+            scene_input_vpy = str(WRAPPER_VPY) if use_wrapper else scd_source_vpy
             fastpass_input_vpy = str(WRAPPER_VPY) if use_wrapper else fast_vpy
             mainpass_input_vpy = str(WRAPPER_VPY) if use_wrapper else main_vpy
+            scene_vspipe_args = (
+                build_vpy_vspipe_args(item, user_vpy=scd_source_vpy, pass_name="proxy")
+                if (use_wrapper or scd_source_vpy)
+                else []
+            )
             fastpass_vspipe_args = (
-                build_wrapper_vspipe_args(item, user_vpy=fast_vpy, pass_name="fast")
-                if use_wrapper
-                else ([f"src={paths.source}"] if fast_vpy or proxy_vpy else [])
+                build_vpy_vspipe_args(item, user_vpy=fast_vpy, pass_name="fast")
+                if (use_wrapper or fast_vpy)
+                else []
             )
             mainpass_vspipe_args = (
-                build_wrapper_vspipe_args(item, user_vpy=main_vpy, pass_name="main")
-                if use_wrapper
-                else ([f"src={paths.source}"] if main_vpy or proxy_vpy else [])
+                build_vpy_vspipe_args(item, user_vpy=main_vpy, pass_name="main")
+                if (use_wrapper or main_vpy)
+                else []
             )
             auto_boost_cmd = [
                 self.toolchain.vs_python_exe,
@@ -1709,9 +1737,9 @@ class SessionController:
                 "--input",
                 str(paths.source),
                 "--out-scenes",
-                str(workdir / "video" / "scenes.json"),
+                str(layout.video_dir(workdir) / layout.STAGE4_SCENES_FULL_NAME),
                 "--temp",
-                str(workdir / "video"),
+                str(layout.video_dir(workdir)),
                 "--log",
                 str(log_dir / "03_autoboost.log"),
                 "--sdm",
@@ -1750,16 +1778,15 @@ class SessionController:
                 psd_args = psd_scene_detection_args(primary)
                 if psd_args:
                     auto_boost_cmd.extend(["--psd-args", subprocess.list2cmdline(psd_args)])
-            if primary.no_fastpass:
+            if primary.no_fastpass or scene_detection == "none":
                 auto_boost_cmd.append("--no-fastpass")
             if primary.fastpass_hdr:
                 auto_boost_cmd.append("--fastpass-hdr")
-            if fastpass_input_vpy:
-                auto_boost_cmd.extend(["--fastpass-vpy", fastpass_input_vpy])
-            for arg in fastpass_vspipe_args:
-                auto_boost_cmd.extend(["--fastpass-vspipe-arg", arg])
-            if proxy_vpy:
-                auto_boost_cmd.extend(["--fastpass-proxy", proxy_vpy])
+            # The per-pass vpy input (--fastpass-vpy) and vspipe args are injected
+            # per stage by auto_boost_cmd_for: scene detection gets the proxy
+            # context, fast-pass + ssimu2 the fast context. The av1an --proxy flag
+            # is gone — proxy.vpy is now the scene-detection input, not av1an's
+            # internal proxy (scenes come from scenes.json, quality from SSIMU2).
             if primary.fastpass_preset:
                 auto_boost_cmd.extend(["--fast-preset", str(primary.fastpass_preset)])
             if primary.preset:
@@ -1784,8 +1811,16 @@ class SessionController:
             if details.fastpass_filter:
                 auto_boost_cmd.extend(["-f", str(details.fastpass_filter)])
 
-            def auto_boost_cmd_for(*run_stages: str) -> List[str]:
+            def auto_boost_cmd_for(
+                *run_stages: str,
+                input_vpy: str = "",
+                vspipe_args: Optional[List[str]] = None,
+            ) -> List[str]:
                 cmd = list(auto_boost_cmd)
+                if input_vpy:
+                    cmd.extend(["--fastpass-vpy", input_vpy])
+                for arg in vspipe_args or []:
+                    cmd.extend(["--fastpass-vspipe-arg", arg])
                 if item.mode == "fastpass":
                     cmd.append("--stop-before-stage4")
                 cmd.extend(["--run-stages", ",".join(run_stages)])
@@ -1812,23 +1847,31 @@ class SessionController:
                 cmd.extend(["--run-stages", "base-scenes"])
                 return cmd
 
-            if primary.no_fastpass:
-                if scene_detection == "psd":
-                    commands.append((STAGE_AUTOBOOST_PSD_SCENE, auto_boost_cmd_for("psd", "base-scenes")))
-                elif scene_detection == "none":
-                    commands.append((STAGE_AUTOBOOST_SCENE, auto_boost_cmd_for("none", "base-scenes")))
-                else:
-                    commands.append((STAGE_AUTOBOOST_SCENE, auto_boost_cmd_for("fastpass", "base-scenes")))
+            # Scene detection (psd/av1an/none) is always its own stage that writes
+            # base_scenes_path. The fast-pass is a separate av1an encode that
+            # consumes those scenes; it is pointless without per-scene detection,
+            # so it is dropped when the user disabled it OR scene detection is
+            # "none" (a single scene has nothing to tune per-scene).
+            fastpass_active = not primary.no_fastpass and scene_detection != "none"
+            if scene_detection == "psd":
+                scene_stage, scene_token = STAGE_AUTOBOOST_PSD_SCENE, "psd"
+            elif scene_detection == "none":
+                scene_stage, scene_token = STAGE_AUTOBOOST_SCENE, "none"
             else:
-                if scene_detection == "psd":
-                    commands.append((STAGE_AUTOBOOST_PSD_SCENE, auto_boost_cmd_for("psd")))
-                commands.append((STAGE_FASTPASS, auto_boost_cmd_for("fastpass")))
-                commands.append((STAGE_SSIMU2, auto_boost_cmd_for("ssimu2", "base-scenes")))
+                scene_stage, scene_token = STAGE_AUTOBOOST_SCENE, "av1an-scene"
+
+            if fastpass_active:
+                commands.append((scene_stage, auto_boost_cmd_for(scene_token, input_vpy=scene_input_vpy, vspipe_args=scene_vspipe_args)))
+                commands.append((STAGE_FASTPASS, auto_boost_cmd_for("fastpass", input_vpy=fastpass_input_vpy, vspipe_args=fastpass_vspipe_args)))
+                commands.append((STAGE_SSIMU2, auto_boost_cmd_for("ssimu2", "base-scenes", input_vpy=fastpass_input_vpy, vspipe_args=fastpass_vspipe_args)))
+            else:
+                # No fast-pass: detect scenes and write uniform base CRF in one pass.
+                commands.append((scene_stage, auto_boost_cmd_for(scene_token, "base-scenes", input_vpy=scene_input_vpy, vspipe_args=scene_vspipe_args)))
 
             if item.mode == "full":
-                boundary_scenes_path = workdir / "video" / "scenes-boundaries.json"
-                recalced_scenes_path = workdir / "video" / "scenes-recalc.json"
-                zoned_scenes_path = workdir / "video" / "scenes-zoned.json"
+                boundary_scenes_path = zone_boundary_scenes(item)
+                recalced_scenes_path = zone_recalced_scenes(item)
+                zoned_scenes_path = zone_edit_scenes(item)
 
                 commands.append(
                     (
@@ -1839,7 +1882,7 @@ class SessionController:
                             "--source",
                             str(paths.source),
                             "--scenes",
-                            str(workdir / "video" / "scenes.json"),
+                            str(autoboost_stage4_scenes(item)),
                             "--out",
                             str(boundary_scenes_path),
                             "--command",
@@ -1880,9 +1923,9 @@ class SessionController:
                     "--scenes",
                     str(zoned_scenes_path),
                     "--output",
-                    str(workdir / "video" / "scenes-final.json"),
+                    str(final_scenes(item)),
                     "--workdir",
-                    str(workdir / "video" / "hdr_tmp"),
+                    str(layout.hdr_tmp_dir(workdir)),
                     "--encoder",
                     str(primary.encoder),
                     "--log",
@@ -1890,9 +1933,9 @@ class SessionController:
                 ]
                 if primary.strict_sdr_8bit:
                     hdr_cmd.append("--no-hdr10")
-                if primary.no_hdr10plus or primary.strict_sdr_8bit:
+                if primary.effective_no_hdr10plus:
                     hdr_cmd.append("--no-hdr10plus")
-                if primary.no_dolby_vision or primary.strict_sdr_8bit:
+                if primary.effective_no_dolby_vision:
                     hdr_cmd.append("--no-dv")
                 commands.append((STAGE_HDR_PATCH, hdr_cmd))
 
@@ -1902,11 +1945,11 @@ class SessionController:
                     "-i",
                     main_input,
                     "-o",
-                    str(workdir / "video" / "video-final.mkv"),
+                    str(layout.video_final_output(workdir)),
                     "--scenes",
-                    str(workdir / "video" / "scenes-final.json"),
+                    str(final_scenes(item)),
                     "--temp",
-                    str(workdir / "video" / "mainpass"),
+                    str(layout.mainpass_dir(workdir)),
                     "-n",
                     "--keep",
                     "--verbose",
@@ -1954,8 +1997,8 @@ class SessionController:
                         mainpass_cmd.extend(["--encoder-path", str(primary.encoder_path)])
                     if FAST_INTERRUPT:
                         mainpass_cmd.append("--fast-interrupt")
-                if proxy_vpy:
-                    mainpass_cmd.extend(["--proxy", proxy_vpy])
+                # No av1an --proxy: scenes come from scenes.json and quality from
+                # external SSIMU2, so a main-pass proxy clip would do nothing.
                 if mainpass_vspipe_args:
                     mainpass_cmd.append("--vspipe-args")
                     mainpass_cmd.extend(mainpass_vspipe_args)
@@ -2508,7 +2551,7 @@ class SessionController:
             text += f" | {message}"
         print(text, flush=True)
 
-        meta_dir = item.workdir / "00_meta"
+        meta_dir = layout.meta_dir(item.workdir)
         ensure_dir(meta_dir)
         event_line = json.dumps(event.__dict__, ensure_ascii=False)
         with self.event_io_lock:

@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.param_utils import apply_override
+from utils.pipeline_runtime import eprint
 from utils.plan_model import format_value, normalize_track_type, resolve_file_plan, to_optional_float
 from utils.crop_resize import load_crop_resize_plan, validate_crop_resize_plan
 from utils.zoned_commands import ZONED_COMMAND_NAME, project_zone_command_lines
@@ -43,10 +44,6 @@ class PipelineConfig:
     encode: str
     fastpass_vf: str
     mainpass_vf: str
-
-
-def eprint(*args: object) -> None:
-    print(*args, file=sys.stderr)
 
 
 def read_text_guess(path: Path) -> str:

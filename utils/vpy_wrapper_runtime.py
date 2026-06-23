@@ -101,6 +101,7 @@ def build_args(raw_globals: Dict[str, Any]) -> SimpleNamespace:
     rules = _arg_text(raw, "rules")
     plan_path = _arg_text(raw, "plan_path")
     workdir = _arg_text(raw, "workdir")
+    temp = _arg_text(raw, "temp")
     pass_name = _arg_text(raw, "pass_name", "main") or "main"
 
     return SimpleNamespace(
@@ -108,6 +109,7 @@ def build_args(raw_globals: Dict[str, Any]) -> SimpleNamespace:
         vpy=vpy,
         rules=rules,
         pass_name=pass_name,
+        temp=temp,
         source_loader=source_loader,
         crop_enabled=_bool_arg(raw.get("crop_enabled"), False),
         plan_path=plan_path,

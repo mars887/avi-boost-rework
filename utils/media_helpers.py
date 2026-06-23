@@ -2,12 +2,78 @@
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
+import subprocess
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 
 WIN_BAD = r'<>:"/\|?*'
 WIN_BAD_RE = re.compile(rf"[{re.escape(WIN_BAD)}]")
+
+
+def run_ffprobe_json(path: Path, *, ffprobe: Optional[str] = None, timeout: float = 30.0) -> Dict[str, Any]:
+    """Run ``ffprobe -show_format -show_streams`` and return the parsed JSON.
+
+    Single source for the full-probe invocation used across the pipeline. Returns
+    ``{}`` when ffprobe is missing, errors, or emits unparseable output (callers
+    decide how to treat the empty result).
+    """
+    exe = ffprobe or shutil.which("ffprobe")
+    if not exe:
+        return {}
+    cmd = [
+        exe,
+        "-hide_banner",
+        "-v", "error",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        str(path),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {}
+        parsed = json.loads(proc.stdout or "{}")
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def media_duration_seconds(payload: Dict[str, Any]) -> float:
+    """Best-effort media duration from an ffprobe payload.
+
+    Uses ``format.duration`` and falls back to the longest per-stream duration
+    (some containers, e.g. raw streams, only carry the latter). Returns ``0.0``
+    when nothing usable is found. Single source so the runner, verify and web
+    exporters agree on how a file's length is read.
+    """
+    candidates = []
+    fmt = payload.get("format")
+    if isinstance(fmt, dict) and fmt.get("duration") is not None:
+        candidates.append(fmt.get("duration"))
+    for stream in payload.get("streams") or []:
+        if isinstance(stream, dict) and stream.get("duration") is not None:
+            candidates.append(stream.get("duration"))
+    best = 0.0
+    for value in candidates:
+        try:
+            best = max(best, float(value))
+        except (TypeError, ValueError):
+            continue
+    return max(0.0, best)
 
 
 def normalize_track_type(value: Any) -> str:

@@ -9,6 +9,13 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from utils.runner_state import (
+    STAGE_ATTACHMENTS,
+    STAGE_AUTOBOOST_PSD_SCENE,
+    STAGE_AUTOBOOST_SCENE,
+    STAGE_FASTPASS,
+    STAGE_SSIMU2,
+)
 from utils.zoned_commands import ZONED_COMMAND_NAME
 
 MAX_EMBED_FIELD = 1024
@@ -20,13 +27,15 @@ PENDING_SQUARE = "\u2B1B"
 FAILED_SQUARE = "\U0001F7E5"
 PAUSED_SQUARE = "\U0001F7E7"
 IDLE_SQUARE = "\u2B1C"
+# Keys are the runner's canonical stage names (utils.runner_state.STAGE_*); the
+# values are the short labels shown in the Discord status embed.
 STAGE_DISPLAY_NAMES = {
-    "Attachments cleanup": "Fonts clean",
-    "Auto-Boost: Scene Detection": "Auto-Boost: SCD",
-    "Auto-Boost: PSD Scene Detection": "PSD Scene Detect",
+    STAGE_ATTACHMENTS: "Fonts clean",
+    STAGE_AUTOBOOST_SCENE: "Auto-Boost: SCD",
+    STAGE_AUTOBOOST_PSD_SCENE: "PSD Scene Detect",
 }
-AUTOBOOST_PARENT_STAGES = {"Auto-Boost: Scene Detection", "Auto-Boost: PSD Scene Detection"}
-AUTOBOOST_CHILD_STAGES = {"Fastpass", "SSIMU2 Metrics"}
+AUTOBOOST_PARENT_STAGES = {STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE}
+AUTOBOOST_CHILD_STAGES = {STAGE_FASTPASS, STAGE_SSIMU2}
 
 
 def sanitize_channel_component(value: str, *, fallback: str = "folder", limit: int = 70) -> str:

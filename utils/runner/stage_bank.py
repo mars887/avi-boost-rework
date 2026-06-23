@@ -14,7 +14,6 @@ from utils.runner_state import (
     STAGE_DEMUX,
     STAGE_FASTPASS,
     STAGE_HDR_PATCH,
-    STAGE_ITEM,
     STAGE_MAINPASS,
     STAGE_MUX,
     STAGE_SSIMU2,
@@ -69,6 +68,12 @@ KNOWN_STAGE_NAMES = {
 }
 
 
+# Fallback used only when StagesBankTree.toml is absent. The TOML is the
+# editable single source of truth and overrides every value here, so these
+# defaults are kept identical to it. Priority semantics: LOWER number is
+# scheduled first (see _ready_stage_candidates in session.py), so finishing
+# stages (Verify=1, Mux=1) outrank the expensive encodes (Fastpass=3,
+# Mainpass=3) when several plans have ready stages competing for the bank.
 DEFAULT_STAGE_BANK = StageBankConfig(
     capacity=10,
     max_active_plans=3,
@@ -80,7 +85,7 @@ DEFAULT_STAGE_BANK = StageBankConfig(
         STAGE_AUTOBOOST_PSD_SCENE: StageBankStage(cost=4, requires=(STAGE_DEMUX,)),
         STAGE_FASTPASS: StageBankStage(
             cost=10,
-            priority=1,
+            priority=3,
             requires=(STAGE_AUTOBOOST_SCENE, STAGE_AUTOBOOST_PSD_SCENE),
         ),
         STAGE_SSIMU2: StageBankStage(cost=5, requires=(STAGE_FASTPASS,)),
@@ -91,16 +96,38 @@ DEFAULT_STAGE_BANK = StageBankConfig(
         STAGE_ZONE_RECALC: StageBankStage(cost=2, requires=(STAGE_ZONE_BOUNDARIES,)),
         STAGE_ZONE_EDIT: StageBankStage(cost=2, requires=(STAGE_ZONE_RECALC,)),
         STAGE_HDR_PATCH: StageBankStage(cost=2, requires=(STAGE_ZONE_EDIT,)),
-        STAGE_MAINPASS: StageBankStage(cost=10, priority=1, requires=(STAGE_HDR_PATCH,)),
+        STAGE_MAINPASS: StageBankStage(cost=10, priority=3, requires=(STAGE_HDR_PATCH,)),
         STAGE_AUDIO: StageBankStage(cost=2, requires=(STAGE_DEMUX,)),
         STAGE_VERIFY: StageBankStage(
             cost=1,
-            priority=3,
+            priority=1,
             requires=(STAGE_ATTACHMENTS, STAGE_AUDIO, STAGE_MAINPASS),
         ),
-        STAGE_MUX: StageBankStage(cost=3, priority=3, requires=(STAGE_VERIFY,)),
+        STAGE_MUX: StageBankStage(cost=3, priority=1, requires=(STAGE_VERIFY,)),
     },
 )
+
+
+def build_stage_bank_config(
+    *,
+    capacity: int,
+    max_active_plans: int,
+    max_running_stages: int,
+    stages: Dict[str, StageBankStage],
+) -> StageBankConfig:
+    """Public constructor that applies the same guards as ``load_stage_bank_config``.
+
+    GUIs let the user tune capacity/parallelism at runtime; routing through this
+    keeps the ``cost <= capacity`` and acyclic-dependency checks instead of
+    building a ``StageBankConfig`` directly and silently producing an
+    unschedulable bank (a stage whose cost exceeds capacity can never launch).
+    """
+    return _validated_stage_bank_config(
+        capacity=capacity,
+        max_active_plans=max_active_plans,
+        max_running_stages=max_running_stages,
+        stages=stages,
+    )
 
 
 def _validated_stage_bank_config(

@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
+from utils import workdir_layout as layout
+from utils.media_helpers import media_duration_seconds
 from utils.pipeline_runtime import ensure_dir, final_output_path_for_source
 from utils.runner_state import (
     autoboost_fastpass_output,
@@ -25,7 +27,7 @@ def item_identity_key(item: Any) -> str:
 
 
 def source_info_path(item: Any) -> Path:
-    return item.workdir / "00_meta" / "source_info.json"
+    return layout.source_info_path(item.workdir)
 
 
 def output_path_for_item(item: Any) -> Path:
@@ -88,13 +90,6 @@ def source_signature(source: Path) -> Dict[str, Any]:
     }
 
 
-def _duration_from_ffprobe(payload: Dict[str, Any]) -> float:
-    try:
-        return max(0.0, float(dict(payload.get("format") or {}).get("duration") or 0.0))
-    except Exception:
-        return 0.0
-
-
 def build_source_info(item: Any) -> Dict[str, Any]:
     signature = source_signature(item.source)
     # TODO: Replace this coarse disabled hash with per-stage plan signatures.
@@ -134,7 +129,7 @@ def build_source_info(item: Any) -> Dict[str, Any]:
                 ffprobe_error = str(proc.stderr or proc.stdout or "").strip()[:4000]
         except Exception as exc:
             ffprobe_error = str(exc)
-    duration = _duration_from_ffprobe(ffprobe_payload)
+    duration = media_duration_seconds(ffprobe_payload)
     return {
         "schema": 1,
         "cache_state": "clean",

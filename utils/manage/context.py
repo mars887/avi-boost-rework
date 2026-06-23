@@ -15,6 +15,7 @@ from utils.plan import (
     load_plan,
     resolve_paths,
 )
+from utils import workdir_layout as layout
 from utils.runner.stage_bank import StageBankConfig, load_stage_bank_config
 from utils.runner_state import display_stage_plan
 from utils.zoned_commands import zoned_command_path
@@ -107,21 +108,20 @@ def load_json_file(path: Path) -> Optional[Any]:
 def read_meta_paths(workdir: Path) -> Dict[str, str]:
     """Best-effort recovery of source/plan/mode hints from 00_meta files."""
     out: Dict[str, str] = {}
-    meta_dir = Path(workdir) / "00_meta"
-    info = load_json_file(meta_dir / "source_info.json")
+    info = load_json_file(layout.source_info_path(workdir))
     if isinstance(info, dict):
         if str(info.get("source") or "").strip():
             out["source"] = str(info["source"])
         if str(info.get("plan") or "").strip():
             out["plan"] = str(info["plan"])
-    state = load_json_file(meta_dir / "runner_state.json")
+    state = load_json_file(layout.runner_state_path(workdir))
     if isinstance(state, dict):
         for key in ("source", "plan", "mode"):
             value = str(state.get(key) or "").strip()
             if value and key not in out:
                 out[key] = value
     if "mode" not in out or "source" not in out or "plan" not in out:
-        last = _last_runner_event(meta_dir / "runner_events.jsonl")
+        last = _last_runner_event(layout.runner_events_path(workdir))
         if last:
             if "mode" not in out and str(last.get("mode") or "").strip():
                 out["mode"] = str(last["mode"])
@@ -154,8 +154,8 @@ def _last_runner_event(path: Path) -> Optional[Dict[str, Any]]:
 
 
 def _guess_mode(workdir: Path) -> str:
-    video_dir = Path(workdir) / "video"
-    if (video_dir / "scenes-preview.json").exists() and not (video_dir / "mainpass").exists():
+    preview_scenes = layout.stage4_scenes(workdir, MODE_FASTPASS)
+    if preview_scenes.exists() and not layout.mainpass_dir(workdir).is_dir():
         return MODE_FASTPASS
     return MODE_FULL
 

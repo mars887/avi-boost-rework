@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from utils import workdir_layout as layout
 from utils.pipeline_runtime import load_toolchain
 from utils.plan_model import (
     FilePlan,
@@ -95,12 +96,11 @@ class EditMatch:
 
 
 def is_result_name(name: str) -> bool:
-    n = name.lower()
-    return n.endswith("-av1.mkv") or n.endswith("-av1.mp4")
+    return layout.is_final_output_name(name)
 
 
 def strip_av1_suffix(stem: str) -> str:
-    return stem[:-4] if stem.lower().endswith("-av1") else stem
+    return layout.strip_final_output_suffix(stem)
 
 
 def choose_source_path(source_dir: Path, base: str) -> Path:
@@ -150,8 +150,8 @@ def build_group_from_source(source: Path) -> SourceGroup:
         manager_bat=source_dir / "Batch Manager.bat",
         full_batch_plan=source_dir / "full-batch.plan",
         fastpass_batch_plan=source_dir / "fastpass-batch.plan",
-        result_mkv=source_dir / f"{base}-av1.mkv",
-        result_mp4=source_dir / f"{base}-av1.mp4",
+        result_mkv=layout.final_output_path_for_source(src),
+        result_mp4=layout.final_output_path_for_source(src, ext=".mp4"),
     )
 
 

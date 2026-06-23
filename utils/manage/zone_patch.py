@@ -21,6 +21,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from utils import workdir_layout as layout
 from utils.pipeline_runtime import ROOT_DIR
 
 from utils.manage import av1an_state
@@ -60,8 +61,8 @@ def _zone_editor() -> Any:
 def pass_source_scene_file(ctx: WorkdirContext, pass_name: PassName) -> Path:
     """The scenes file each pass's av1an reads (and we mirror edits into)."""
     if pass_name == "mainpass":
-        return ctx.workdir / "video" / "scenes-final.json"
-    return ctx.workdir / "video" / "scenes.json"
+        return layout.final_scenes(ctx.workdir)
+    return layout.stage4_scenes(ctx.workdir, ctx.mode)
 
 
 def build_video_info(source: Optional[Path], fallback_fps: float) -> Any:

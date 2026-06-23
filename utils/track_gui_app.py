@@ -751,9 +751,12 @@ class TrackConfigGui:
         for index, (label, variable) in enumerate(toggles):
             current_row = row + (index // 2)
             current_col = index % 2
-            ttk.Checkbutton(feature_section, text=label, variable=variable).grid(
-                row=current_row, column=current_col, sticky=tk.W, pady=4, padx=(0, 12)
-            )
+            check = ttk.Checkbutton(feature_section, text=label, variable=variable)
+            check.grid(row=current_row, column=current_col, sticky=tk.W, pady=4, padx=(0, 12))
+            if variable is self.no_fastpass_var:
+                # Kept so scene detection "none" can force + lock it (see
+                # _refresh_fastpass_availability).
+                self.no_fastpass_check = check
 
         tuning_section, row = self._build_section(
             grid,
@@ -853,6 +856,7 @@ class TrackConfigGui:
         for spec in PSD_SCENE_DETECTION_OPTION_SPECS:
             getattr(self, f"{spec['name']}_var").trace_add("write", self.on_defaults_change)
         self._refresh_scene_detection_config()
+        self._refresh_fastpass_availability()
 
     def _build_experimental_tab(self, frame):
         content = self._create_scrollable_area(frame)
@@ -1520,7 +1524,27 @@ class TrackConfigGui:
 
     def on_scene_detection_change(self, *_args):
         self._refresh_scene_detection_config()
+        self._refresh_fastpass_availability()
         self.on_defaults_change()
+
+    def _refresh_fastpass_availability(self):
+        """Lock the fast-pass off when scene detection is "none".
+
+        A single scene has nothing to tune per-scene, so the fast-pass is
+        meaningless. Force "No fast-pass" on and disable the toggle, making the
+        prohibition visible in the GUI instead of being applied silently at
+        runtime (auto_boost/session also enforce it as a backstop).
+        """
+        check = getattr(self, "no_fastpass_check", None)
+        if check is None:
+            return
+        mode = self.scene_detection_var.get().strip().lower() if hasattr(self, "scene_detection_var") else ""
+        if mode == "none":
+            if not bool(self.no_fastpass_var.get()):
+                self.no_fastpass_var.set(True)
+            check.state(["disabled"])
+        else:
+            check.state(["!disabled"])
 
     def on_av1an_decoupled_change(self, *_args):
         self._refresh_av1an_decoupled_state()

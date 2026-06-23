@@ -50,6 +50,7 @@ from utils.manage.status import (
 from utils.manage.store import WorkdirStore, import_workdir_files
 from utils.plan import FilePlan, PlanMeta, PlanPaths, VideoPlan, save_plan
 from utils.runner_state import (
+    STAGE_AUTOBOOST_SCENE,
     STAGE_DEMUX,
     STAGE_FASTPASS,
     STAGE_MAINPASS,
@@ -182,10 +183,15 @@ class ManageFixture:
         }
         write_json(self.video_dir / "scenes.json", scenes)
         write_json(self.fastpass / "scenes.json", scenes)
+        # av1an scene detection (--sc-only) writes the base scenes here.
+        self.psd = self.video_dir / "psd"
+        self.psd.mkdir(parents=True, exist_ok=True)
+        write_json(self.psd / "scenes.psd.json", scenes)
 
         # completed early stages
         (self.state_dir / "DEMUX_DONE").write_text("ok\n", encoding="utf-8")
         write_json(self.meta_dir / "demux_manifest.json", {"source": str(self.source), "subs": []})
+        (self.video_state / "SCENE_DETECTION_COMPLETED").write_text("ok\n", encoding="utf-8")
         (self.video_state / "FASTPASS_COMPLETED").write_text("ok\n", encoding="utf-8")
         (self.video_state / "SSIMU2_COMPLETED").write_text("ok\n", encoding="utf-8")
         (self.fastpass / "episode.fastpass.mkv").write_bytes(b"f" * 2048)
@@ -847,7 +853,10 @@ class ResetTest(unittest.TestCase):
         self.assertIn(STAGE_MAINPASS, plan.stages)
         self.assertIn(STAGE_MUX, plan.stages)
         paths = {str(action.path).lower() for action in plan.actions}
-        self.assertIn(str(self.fixture.fastpass).lower(), paths)
+        # Fastpass reset drops the encode output, not the whole av1an dir (its
+        # scenes are the scene-detection result and must survive).
+        self.assertIn(str(self.fixture.fastpass / "episode.fastpass.mkv").lower(), paths)
+        self.assertNotIn(str(self.fixture.fastpass / "scenes.json").lower(), paths)
         self.assertIn(str(self.fixture.mainpass).lower(), paths)
 
     def test_preview_single_stage(self) -> None:
@@ -860,7 +869,10 @@ class ResetTest(unittest.TestCase):
     def test_reset_stage_chain(self) -> None:
         (self.fixture.video_dir / "video-final.mkv").write_bytes(b"x" * 2048)
         result = manage_reset.reset_stage(self.ctx, STAGE_FASTPASS, chain=True)
-        self.assertFalse(self.fixture.fastpass.exists())
+        # Fastpass reset keeps scene detection: encode output gone, base scenes kept.
+        self.assertFalse((self.fixture.fastpass / "episode.fastpass.mkv").exists())
+        self.assertTrue((self.fixture.psd / "scenes.psd.json").exists())
+        self.assertTrue((self.fixture.video_state / "SCENE_DETECTION_COMPLETED").exists())
         self.assertFalse((self.fixture.video_dir / "video-final.mkv").exists())
         self.assertFalse((self.fixture.video_state / "FASTPASS_COMPLETED").exists())
         self.assertFalse((self.fixture.video_state / "SSIMU2_COMPLETED").exists())
@@ -875,6 +887,19 @@ class ResetTest(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         manifest = json.loads((backups[0] / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["operation"], "reset_chain")
+
+    def test_reset_scene_detection_chains_to_fastpass(self) -> None:
+        # Resetting scene detection (av1an) clears its own marker and chains
+        # downstream to Fastpass, the inverse of resetting Fastpass alone.
+        result = manage_reset.reset_stage(self.ctx, STAGE_AUTOBOOST_SCENE, chain=True)
+        # Scene-detection reset deletes the base scenes so detection re-runs (not
+        # just resumes), and chains downstream to Fastpass.
+        self.assertFalse((self.fixture.psd / "scenes.psd.json").exists())
+        self.assertFalse((self.fixture.fastpass / "scenes.json").exists())
+        self.assertFalse((self.fixture.video_state / "SCENE_DETECTION_COMPLETED").exists())
+        self.assertFalse((self.fixture.video_state / "FASTPASS_COMPLETED").exists())
+        self.assertFalse((self.fixture.video_state / "SSIMU2_COMPLETED").exists())
+        self.assertTrue(result.changed_paths)
 
     def test_reset_chunk_fastpass(self) -> None:
         result = manage_reset.reset_chunk(self.ctx, "fastpass", 1)

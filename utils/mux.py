@@ -38,13 +38,15 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from utils import workdir_layout as layout
 from utils.media_helpers import normalize_track_type as norm_type
 from utils.param_utils import apply_override, find_last_option, is_param_key, strip_param_tokens
 from utils.pipeline_runtime import (
+    ensure_dir,
     final_output_path_for_source,
-    read_json as read_json_file,
+    read_json,
     setup_stage_logging,
-    write_json as write_json_file,
+    write_json,
 )
 from utils.plan_model import resolve_file_plan
 
@@ -62,15 +64,6 @@ def setup_logging(log_path: str, workdir: Optional[Path] = None) -> None:
 
 def eprint(*a: Any) -> None:
     print(*a, file=sys.stderr)
-
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
-
-def read_json(p: Path) -> Any:
-    return read_json_file(p)
-
-def write_json(p: Path, obj: Any) -> None:
-    write_json_file(p, obj)
 
 def which_or(name: str) -> str:
     return shutil.which(name) or name
@@ -385,9 +378,9 @@ def update_scene_bitrates(
     include_source: bool = True,
     source_timeout_sec: Optional[float] = SOURCE_BITRATE_TIMEOUT_SEC,
 ) -> None:
-    video_dir = workdir / "video"
+    video_dir = layout.video_dir(workdir)
     scenes_path = None
-    for name in ("scenes-final.json", "scenes-zoned.json", "scenes-recalc.json", "scenes-boundaries.json", "scenes-hdr.json", "scenes.json"):
+    for name in layout.SCENE_FILE_FALLBACK_ORDER:
         p = video_dir / name
         if p.exists():
             scenes_path = p
@@ -579,7 +572,7 @@ def extract_scene_crf(scene: Dict[str, Any]) -> Optional[Decimal]:
     return parse_decimal_value(tokens[idx + 1])
 
 def build_crf_deviation_text(workdir: Path) -> Optional[str]:
-    scenes_path = workdir / "video" / "scenes-final.json"
+    scenes_path = layout.final_scenes(workdir)
     if not scenes_path.exists():
         print(f"[warn] scenes-final.json not found; CRF Deviation skipped: {scenes_path}")
         return None
@@ -720,7 +713,7 @@ def prepare_global_tags(
     if not tags:
         return None, []
 
-    tags_path = workdir / "00_meta" / "mux_global_tags.xml"
+    tags_path = layout.meta_dir(workdir) / "mux_global_tags.xml"
     write_global_tags_xml(tags_path, tags)
     print(f"[ok] global tags prepared: {tags_path}")
     return tags_path, [{"name": name, "value": value} for name, value in tags]
@@ -731,11 +724,11 @@ def prepare_global_tags(
 # ---------------------------
 
 def load_audio_manifest(workdir: Path) -> Optional[Dict[str, Any]]:
-    p = workdir / "00_meta" / "audio_manifest.json"
+    p = layout.audio_manifest_path(workdir)
     return read_json(p) if p.exists() else None
 
 def load_demux_manifest(workdir: Path) -> Optional[Dict[str, Any]]:
-    p = workdir / "00_meta" / "demux_manifest.json"
+    p = layout.demux_manifest_path(workdir)
     return read_json(p) if p.exists() else None
 
 def pick_chapters_path(workdir: Path, demux_manifest: Optional[Dict[str, Any]]) -> Optional[Path]:
@@ -889,7 +882,7 @@ def build_mux_command(
     attachments = pick_attachments(workdir, demux_manifest)
 
     # Decide video input
-    video_final = workdir / "video" / "video-final.mkv"
+    video_final = layout.video_final_output(workdir)
     have_video_final = video_final.exists() and video_final.stat().st_size > 0
 
     # Track lists from plan
@@ -1074,7 +1067,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         cmd, plan = build_mux_command(mkvmerge, source, workdir, tracks, global_tags_path=global_tags_path)
 
         # Save manifest for debugging/reproducibility
-        write_json(workdir / "00_meta" / "mux_manifest.json", {
+        write_json(layout.mux_manifest_path(workdir), {
             "source": str(source),
             "workdir": str(workdir),
             "mkvmerge": str(mkvmerge),

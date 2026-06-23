@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils import workdir_layout as layout
 from utils.pipeline_runtime import final_output_path_for_source
 
 
@@ -54,10 +55,15 @@ def public_stage_name(stage: str) -> str:
 
 
 def display_stage_plan(item: Any) -> List[str]:
+    primary = item.resolved.plan.video.primary
+    scene_detection = str(primary.scene_detection or "").strip().lower()
     stages = [STAGE_DEMUX, STAGE_ATTACHMENTS]
     if item.resolved.has_video_edit():
         stages.append(autoboost_scene_stage(item))
-        if not item.resolved.plan.video.primary.no_fastpass:
+        # Fast-pass + metrics only exist when there are per-scene CRF decisions to
+        # make: dropped when the user disabled the fast-pass or scene detection is
+        # "none" (a single scene). Keep in sync with _build_item_commands.
+        if not primary.no_fastpass and scene_detection != "none":
             stages.extend([STAGE_FASTPASS, STAGE_SSIMU2])
         if item.mode == "full":
             stages.extend([STAGE_ZONE_BOUNDARIES, STAGE_ZONE_RECALC, STAGE_ZONE_EDIT, STAGE_HDR_PATCH, STAGE_MAINPASS])
@@ -135,7 +141,7 @@ def valid_ssimu2_log(path: Path) -> bool:
 
 
 def valid_audio_manifest(item: Any) -> bool:
-    obj = load_json_object(item.workdir / "00_meta" / "audio_manifest.json")
+    obj = load_json_object(layout.audio_manifest_path(item.workdir))
     if obj is None:
         return False
     outputs = obj.get("outputs")
@@ -155,49 +161,52 @@ def valid_audio_manifest(item: Any) -> bool:
     return True
 
 
+# These item-based helpers are thin wrappers over utils.workdir_layout (the
+# single source of truth for the on-disk layout); they exist so callers holding
+# a runner item / RunnerItemAdapter don't have to unpack .workdir / .mode / .
+# source.stem themselves.
 def autoboost_project_dir(item: Any) -> Path:
-    return item.workdir / "video"
+    return layout.video_dir(item.workdir)
 
 
 def autoboost_state_dir(item: Any) -> Path:
-    return autoboost_project_dir(item) / ".state"
+    return layout.video_state_dir(item.workdir)
 
 
 def autoboost_base_scenes(item: Any) -> Path:
-    return autoboost_project_dir(item) / "psd" / "scenes.psd.json"
+    return layout.psd_base_scenes(item.workdir)
 
 
 def autoboost_av1an_scenes(item: Any) -> Path:
-    return autoboost_project_dir(item) / "fastpass" / "scenes.json"
+    return layout.av1an_scenes(item.workdir)
 
 
 def autoboost_fastpass_output(item: Any) -> Path:
-    return autoboost_project_dir(item) / "fastpass" / f"{item.source.stem}.fastpass.mkv"
+    return layout.fastpass_output(item.workdir, item.source.stem)
 
 
 def autoboost_ssimu2_log(item: Any) -> Path:
-    return autoboost_project_dir(item) / "fastpass" / f"{item.source.stem}_ssimu2.log"
+    return layout.ssimu2_log(item.workdir, item.source.stem)
 
 
 def autoboost_stage4_scenes(item: Any) -> Path:
-    name = "scenes-preview.json" if item.mode == "fastpass" else "scenes.json"
-    return autoboost_project_dir(item) / name
+    return layout.stage4_scenes(item.workdir, item.mode)
 
 
 def zone_boundary_scenes(item: Any) -> Path:
-    return autoboost_project_dir(item) / "scenes-boundaries.json"
+    return layout.boundary_scenes(item.workdir)
 
 
 def zone_recalced_scenes(item: Any) -> Path:
-    return autoboost_project_dir(item) / "scenes-recalc.json"
+    return layout.recalc_scenes(item.workdir)
 
 
 def zone_edit_scenes(item: Any) -> Path:
-    return autoboost_project_dir(item) / "scenes-zoned.json"
+    return layout.zoned_scenes(item.workdir)
 
 
 def final_scenes(item: Any) -> Path:
-    return autoboost_project_dir(item) / "scenes-final.json"
+    return layout.final_scenes(item.workdir)
 
 
 def file_not_older_than(path: Path, dependency: Path) -> bool:
@@ -209,7 +218,7 @@ def file_not_older_than(path: Path, dependency: Path) -> bool:
 
 def stage_marker_path(item: Any, stage: str) -> Optional[Path]:
     workdir = item.workdir
-    state_dir = workdir / ".state"
+    state_dir = layout.state_dir(workdir)
     if stage == STAGE_DEMUX:
         return state_dir / "DEMUX_DONE"
     if stage == STAGE_ATTACHMENTS:
@@ -217,7 +226,10 @@ def stage_marker_path(item: Any, stage: str) -> Optional[Path]:
     if stage == STAGE_AUTOBOOST_PSD_SCENE:
         return autoboost_state_dir(item) / "PSD_FINISHED"
     if stage == STAGE_AUTOBOOST_SCENE:
-        return autoboost_state_dir(item) / "FASTPASS_COMPLETED"
+        # Scene detection (av1an `--sc-only` or the single-scene "none" mode) owns
+        # its own marker, written by its own command and kept distinct from the
+        # Fastpass encode marker so the two stages reset independently.
+        return autoboost_state_dir(item) / "SCENE_DETECTION_COMPLETED"
     if stage == STAGE_FASTPASS:
         return autoboost_state_dir(item) / "FASTPASS_COMPLETED"
     if stage == STAGE_SSIMU2:
@@ -241,9 +253,9 @@ def stage_marker_path(item: Any, stage: str) -> Optional[Path]:
 
 def stage_marker_artifacts_valid(item: Any, stage: str) -> bool:
     if stage == STAGE_DEMUX:
-        return valid_json_file(item.workdir / "00_meta" / "demux_manifest.json")
+        return valid_json_file(layout.demux_manifest_path(item.workdir))
     if stage == STAGE_ATTACHMENTS:
-        return valid_json_file(item.workdir / "attachments" / "attachments_cleaner_report.json")
+        return valid_json_file(layout.attachments_report_path(item.workdir))
     if stage == STAGE_AUTOBOOST_PSD_SCENE:
         return valid_scenes_json(autoboost_base_scenes(item))
     if stage == STAGE_AUTOBOOST_SCENE:
@@ -290,14 +302,14 @@ def stage_marker_artifacts_valid(item: Any, stage: str) -> bool:
     if stage == STAGE_AUDIO:
         return valid_audio_manifest(item)
     if stage == STAGE_VERIFY:
-        if (item.workdir / "00_logs" / "verify_error.txt").exists():
+        if (layout.logs_dir(item.workdir) / "verify_error.txt").exists():
             return False
-        if not valid_json_file(item.workdir / "00_meta" / "demux_manifest.json"):
+        if not valid_json_file(layout.demux_manifest_path(item.workdir)):
             return False
         if not valid_audio_manifest(item):
             return False
         if item.resolved.has_video_edit() and not file_has_bytes(
-            item.workdir / "video" / "video-final.mkv",
+            layout.video_final_output(item.workdir),
             MIN_VALID_MEDIA_BYTES,
         ):
             return False
@@ -330,7 +342,7 @@ def stage_completion_artifacts_valid(item: Any, stage: str) -> bool:
             require_zone_overrides=True,
         )
     if stage == STAGE_MAINPASS:
-        return file_has_bytes(item.workdir / "video" / "video-final.mkv", MIN_VALID_MEDIA_BYTES)
+        return file_has_bytes(layout.video_final_output(item.workdir), MIN_VALID_MEDIA_BYTES)
     return stage_marker_artifacts_valid(item, stage)
 
 

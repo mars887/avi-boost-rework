@@ -126,6 +126,25 @@ parser.add_argument("--vspipe-arg", action="append", default=[],
                     help="Extra key=value argument for .vpy input. Can be repeated.")
 parser.add_argument("--vspipe-args", nargs="+", default=[],
                     help="Extra key=value arguments for .vpy input, forwarded to av1an.")
+parser.add_argument("--serial-passes", action="store_true",
+                    help="Fused single-pass mode: decode the proxy only once and feed both the "
+                         "VapourSynth (WWXD/luma) and the x264 scene detection from that single decode "
+                         "(x264 is run directly, bypassing av1an). Use this for very heavy proxies "
+                         "(e.g. QTGMC/DGDecNV) where decoding the source twice oversubscribes the "
+                         "CPU/NVDEC decoder and collapses throughput.")
+parser.add_argument("--workers", type=int, default=1,
+                    help="With --serial-passes, split the clip into this many contiguous chunks and run "
+                         "that many fused worker processes in parallel, then merge their signals and run "
+                         "the splitter on the whole clip (result matches 1 worker). The serial WWXD gate "
+                         "leaves the machine underused; ~2-3 workers saturate the DRAM bus. Default 1.")
+parser.add_argument("--chunk-overlap", type=int, default=128,
+                    help="With --workers >1, frames each chunk decodes beyond its borders for boundary "
+                         "parity. VS signals (WWXD/luma/diffs) are bit-identical to 1 worker regardless; "
+                         "this mainly controls x264 first-pass scenecut parity (>= rc-lookahead 120 is "
+                         "good). Larger = closer x264 cuts but more redundant decode. Default 128.")
+parser.add_argument("--chunk-start", type=int, help=argparse.SUPPRESS)
+parser.add_argument("--chunk-end", type=int, help=argparse.SUPPRESS)
+parser.add_argument("--chunk-out", type=Path, default=None, help=argparse.SUPPRESS)
 parser.add_argument("-v", "--verbose", action="count", default=0, help="Show more progress details")
 parser.add_argument("--scene-detection-vapoursynth-range",
                     choices=["limited", "full"],
@@ -339,6 +358,18 @@ class DefaultZone:
 zone_default = DefaultZone()
 zones = [{"start_frame": 0, "end_frame": zone_default.source_clip.num_frames, "zone": zone_default}]
 
+# Fused parallel scene detection (--serial-passes --workers N): the parent splits the clip into N
+# contiguous chunks and runs N child processes (--chunk-start/--chunk-end/--chunk-out each), then
+# merges their per-frame signals and runs the splitter on the whole clip, so the result matches a
+# single worker. A child decodes its chunk plus an overlap on both sides for boundary parity and
+# keeps only [chunk_start:chunk_end].
+if args.chunk_out is not None:
+    scene_detection_chunk_decode_start = max(0, args.chunk_start - args.chunk_overlap)
+    scene_detection_chunk_decode_end = min(zone_default.source_clip.num_frames, args.chunk_end + args.chunk_overlap)
+    zones = [{"start_frame": scene_detection_chunk_decode_start, "end_frame": scene_detection_chunk_decode_end, "zone": zone_default}]
+scene_detection_parallel = args.serial_passes and args.workers > 1 and args.chunk_out is None
+scene_detection_seq_zones = [] if scene_detection_parallel else zones
+
 
 print(f"\r\033[KTime {datetime.now().time().isoformat(timespec="seconds")} / Progressive Scene Detection started", end="\n", flush=True)
 
@@ -348,7 +379,8 @@ scene_detection_scenes_file = scene_detection_temp_dir.joinpath("scenes.json")
 scene_detection_x264_scenes_file = scene_detection_temp_dir.joinpath("x264.scenes.json")
 scene_detection_x264_temp_dir = scene_detection_temp_dir.joinpath("x264.tmp")
 scene_detection_x264_output_file = scene_detection_temp_dir.joinpath("x264.mkv")
-scene_detection_x264_stats_dir = scene_detection_temp_dir.joinpath("x264.logs")
+scene_detection_x264_stats_dir = scene_detection_temp_dir.joinpath(
+    "x264.logs" if args.chunk_out is None else f"x264.logs.chunk{args.chunk_start}")
 scene_detection_diffs_file = scene_detection_temp_dir.joinpath("luma-diff.txt")
 scene_detection_average_file = scene_detection_temp_dir.joinpath("luma-average.txt")
 scene_detection_min_file = scene_detection_temp_dir.joinpath("luma-min.txt")
@@ -422,8 +454,9 @@ for zone_i, zone in enumerate(zones):
 scene_detection_x264_scenes["frames"] = scene_detection_x264_total_frames
 scene_detection_x264_scenes["split_scenes"] = scene_detection_x264_scenes["scenes"]
 
-with scene_detection_x264_scenes_file.open("w") as scene_detection_x264_scenes_f:
-    json.dump(scene_detection_x264_scenes, scene_detection_x264_scenes_f, cls=NumpyEncoder)
+if not args.serial_passes:
+    with scene_detection_x264_scenes_file.open("w") as scene_detection_x264_scenes_f:
+        json.dump(scene_detection_x264_scenes, scene_detection_x264_scenes_f, cls=NumpyEncoder)
 
 if zone_default.source_clip_cache_reuse and zone_default.source_clip_cache is not None:
     scene_detection_x264_temp_dir_cache = scene_detection_x264_temp_dir / "split" / "cache"
@@ -454,7 +487,7 @@ command += [
     "--encoder", "x264",
     "--pix-format", "yuv420p10le",
     "--cache-mode", "temp",
-    "--workers", "2",
+    "--workers", "1" if args.serial_passes else "2",
     "--force", "--video-params", f"[K[0m[1;3m> Progressive Scene Detection [0m[3mx264-based-scene-detection[0m[1;3m <[0m",
     "--audio-params", "-an",
     "--concat", "mkvmerge"
@@ -464,7 +497,13 @@ if zone_default.source_provider_av1an:
 if vspipe_arg_list:
     command += ["--vspipe-args"]
     command += vspipe_arg_list
-scene_detection_x264_process = subprocess.Popen(command, text=True)
+# Default: the x264 scene-detection pass runs concurrently via av1an.
+# In --serial-passes (fused) mode av1an is NOT used: the x264 pass is fed inline from the
+# in-process VapourSynth pass below, so the heavy proxy is decoded only once for both
+# WWXD/luma and x264 (see scene_detection_start_fused_x264).
+scene_detection_x264_process = None
+if not args.serial_passes:
+    scene_detection_x264_process = subprocess.Popen(command, text=True)
 
 
 
@@ -489,10 +528,46 @@ if target_width < scene_detection_clip_base.width * 0.9:
     scene_detection_clip_base = scene_detection_clip_base.resize.Point(width=target_width, height=target_height, src_top=src_top, src_height=src_height,
                                                                        format=vs.YUV420P8, dither_type="none")
 
+scene_detection_x264_bin = shutil.which("x264") or "x264"
+
+
+def scene_detection_y4m_header(clip):
+    bits = clip.format.bits_per_sample
+    colorspace = f"420p{bits}" if bits > 8 else "420"
+    fps_num = clip.fps_num or 24000
+    fps_den = clip.fps_den or 1001
+    return f"YUV4MPEG2 W{clip.width} H{clip.height} F{fps_num}:{fps_den} Ip A0:0 C{colorspace}\n".encode()
+
+
+def scene_detection_start_fused_x264(clip, stats_file):
+    # One x264 fed directly from the in-process VapourSynth pass (no av1an): the proxy is
+    # decoded only once and shared between WWXD/luma detection and x264. The pixels fed here
+    # are scene_detection_clip; for SD sources that equals the full proxy (PlaneStats/WWXD are
+    # pass-through), so x264 sees the same frames av1an would. For downscaled (HD) detection
+    # clips x264 sees the downscaled clip, which only shifts cut confidence, not frame indices.
+    # keyint MUST be the whole-clip length (not the chunk length): x264's scenecut threshold
+    # scales with frames_since_keyframe / keyint, so a per-chunk keyint would bias borderline
+    # cuts and make --workers N disagree with --workers 1. With the whole-clip keyint, chunked
+    # x264 cuts are bit-identical to the single-pass.
+    cmd = [
+        scene_detection_x264_bin, "--demuxer", "y4m",
+        "--output-depth", "10", "--preset", "veryfast", "--qp", "80",
+        "--keyint", f"{zone_default.source_clip.num_frames + 240}", "--min-keyint", "1", "--scenecut", "40",
+        "--rc-lookahead", "120", "--ref", "1", "--aq-mode", "0", "--no-8x8dct",
+        "--partition", "none", "--no-weightb", "--weightp", "0", "--me", "dia",
+        "--subme", "2", "--no-psy", "--trellis", "0", "--no-cabac", "--no-deblock",
+        "--slow-firstpass", "--pass", "1", "--stats", str(stats_file), "-o", "NUL", "-",
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.stdin.write(scene_detection_y4m_header(clip))
+    return proc
+
+
 zones_diffs = {}
 zones_vapoursynth_scenecut = {}
 zones_luma_scenecut = {}
-for zone_i, zone in enumerate(zones):
+for zone_i, zone in enumerate(scene_detection_seq_zones):
 
     assert zone["zone"].scene_detection_vapoursynth_range in ["limited", "full"], "Invalid `scene_detection_vapoursynth_range`. Please check your config inside `Progressive-Scene-Detection.py`."
     assert zone["zone"].scene_detection_extra_split >= zone["zone"].scene_detection_min_scene_len * 2, "`scene_detection_extra_split` must be at least 2 times `scene_detection_min_scene_len`."
@@ -505,10 +580,21 @@ for zone_i, zone in enumerate(zones):
     luma_scenecut = np.zeros((scene_detection_clip.num_frames,), dtype=bool)
     luma_scenecut_prev = True
 
+    scene_detection_fused_x264 = None
+    if args.serial_passes:
+        scene_detection_fused_x264 = scene_detection_start_fused_x264(
+            scene_detection_clip, scene_detection_x264_stats_dir / f"{zone_i}.fused.log")
+
     start = time.time() - 0.000001
+    last_progress = 0.0
     for offset_frame, frame in enumerate(scene_detection_clip.frames(backlog=48)):
         current_frame = zone["start_frame"] + offset_frame
-        print(f"\r\033[K{frame_print(current_frame)} / Detecting scenes / {offset_frame / (time.time() - start):.2f} fps", end="", flush=True)
+        # Throttle the progress line: a flushed console write on every frame is slow on
+        # Windows and starves the VapourSynth pipeline. ~5 updates/sec is enough.
+        now = time.time()
+        if now - last_progress >= 0.20:
+            last_progress = now
+            print(f"\r\033[K{frame_print(current_frame)} / Detecting scenes / {offset_frame / (now - start):.2f} fps", end="", flush=True)
 
         if not scene_detection_diffs_available:
             scene_detection_diffs[current_frame] = frame.props["LumaDiff"]
@@ -529,22 +615,35 @@ for zone_i, zone in enumerate(zones):
             luma_scenecut[offset_frame] = True
         luma_scenecut_prev = luma_scenecut_current
 
+        if scene_detection_fused_x264 is not None:
+            scene_detection_fused_x264.stdin.write(b"FRAME\n")
+            for scene_detection_plane in range(frame.format.num_planes):
+                scene_detection_fused_x264.stdin.write(
+                    np.ascontiguousarray(np.asarray(frame[scene_detection_plane])).tobytes())
+
+    if scene_detection_fused_x264 is not None:
+        scene_detection_fused_x264.stdin.close()
+        if scene_detection_fused_x264.wait() != 0:
+            raise RuntimeError("x264 (fused scene detection) failed")
+
     zones_diffs[zone_i] = diffs
     zones_vapoursynth_scenecut[zone_i] = vapoursynth_scenecut
     zones_luma_scenecut[zone_i] = luma_scenecut
 
-print(f"\r\033[K{frame_print(current_frame + 1)} / VapourSynth based scene detection complete", end="\n", flush=True)
+if not scene_detection_parallel:
+    print(f"\r\033[K{frame_print(current_frame + 1)} / VapourSynth based scene detection complete", end="\n", flush=True)
 
 
 
-if scene_detection_x264_process.poll() is None:
-    print(f"\r\033[K{frame_print(0)} / Performing x264 based scene detection", end="", flush=True)
-scene_detection_x264_process.wait()
+if not args.serial_passes:
+    if scene_detection_x264_process.poll() is None:
+        print(f"\r\033[K{frame_print(0)} / Performing x264 based scene detection", end="", flush=True)
+    scene_detection_x264_process.wait()
 print(f"\r\033[K{frame_print(scene_detection_x264_total_frames_print)} / x264 based scene detection finished", end="\n", flush=True)
 
 zones_x264_scenecut = {}
 scene_detection_match_x264_I = re.compile(r"^in:(\d+) out:\d+ type:(\w)")
-for zone_i, zone in enumerate(zones):
+for zone_i, zone in enumerate(scene_detection_seq_zones):
     x264_scenecut = np.zeros((zone["end_frame"] - zone["start_frame"],), dtype=float)
     def scene_detection_write_x264_scenecut(name, start_frame, end_frame, skip_starting_frames=False):
         assert (scene_detection_x264_stats_dir / f"{name}.log").exists(), "Unexpected result from x264"
@@ -565,7 +664,9 @@ for zone_i, zone in enumerate(zones):
                 if match.group(2) == "I":
                     x264_scenecut[offset_frame + start_frame] = 1
 
-    if zone["end_frame"] - zone["start_frame"] < 120:
+    if args.serial_passes:
+        scene_detection_write_x264_scenecut(f"{zone_i}.fused", 0, zone["end_frame"] - zone["start_frame"])
+    elif zone["end_frame"] - zone["start_frame"] < 120:
         scene_detection_write_x264_scenecut(f"{zone_i}", 0, zone["end_frame"] - zone["start_frame"])
     else:
         scene_detection_write_x264_scenecut(f"{zone_i}_left", 0, math.floor((zone["end_frame"] - zone["start_frame"]) / 2) + 4)
@@ -573,6 +674,50 @@ for zone_i, zone in enumerate(zones):
                                                                skip_starting_frames=True)
 
     zones_x264_scenecut[zone_i] = x264_scenecut
+
+if args.chunk_out is not None:
+    # Child worker: drop the two-sided overlap, keep only [chunk_start:chunk_end], and dump signals.
+    scene_detection_chunk_front = args.chunk_start - scene_detection_chunk_decode_start
+    scene_detection_chunk_keep = slice(scene_detection_chunk_front,
+                                       scene_detection_chunk_front + (args.chunk_end - args.chunk_start))
+    np.savez(str(args.chunk_out),
+             diffs=zones_diffs[0][scene_detection_chunk_keep],
+             vsc=zones_vapoursynth_scenecut[0][scene_detection_chunk_keep],
+             lsc=zones_luma_scenecut[0][scene_detection_chunk_keep],
+             x264=zones_x264_scenecut[0][scene_detection_chunk_keep])
+    raise SystemExit(0)
+
+if scene_detection_parallel:
+    for zone_i, zone in enumerate(zones):
+        zone_total = zone["end_frame"] - zone["start_frame"]
+        n_workers = max(1, min(args.workers, zone_total))
+        bounds = [zone["start_frame"] + (zone_total * i) // n_workers for i in range(n_workers + 1)]
+        scene_detection_chunks = []
+        scene_detection_procs = []
+        for i in range(n_workers):
+            cs, ce = bounds[i], bounds[i + 1]
+            cf = scene_detection_x264_stats_dir.parent / f"chunk_{zone_i}_{cs}.npz"
+            scene_detection_chunks.append(cf)
+            worker_cmd = [sys.executable, str(Path(__file__).resolve()),
+                          "-i", str(input_file), "-o", str(scenes_file), "--serial-passes",
+                          "--chunk-start", str(cs), "--chunk-end", str(ce),
+                          "--chunk-overlap", str(args.chunk_overlap), "--chunk-out", str(cf)]
+            for vparg in (args.vspipe_arg or []):
+                worker_cmd += ["--vspipe-arg", str(vparg)]
+            if args.vspipe_args:
+                worker_cmd += ["--vspipe-args"] + [str(v) for v in args.vspipe_args]
+            print(f"\r\033[K{frame_scene_print(cs, ce)} / Fused worker {i + 1}/{n_workers} started", end="\n", flush=True)
+            scene_detection_procs.append(subprocess.Popen(worker_cmd, stdout=subprocess.DEVNULL))
+        for cf, proc in zip(scene_detection_chunks, scene_detection_procs):
+            if proc.wait() != 0:
+                raise RuntimeError(f"Fused worker failed ({cf.name})")
+        zones_diffs[zone_i] = np.concatenate([np.load(str(cf))["diffs"] for cf in scene_detection_chunks]).astype(float)
+        zones_vapoursynth_scenecut[zone_i] = np.concatenate([np.load(str(cf))["vsc"] for cf in scene_detection_chunks]).astype(float)
+        zones_luma_scenecut[zone_i] = np.concatenate([np.load(str(cf))["lsc"] for cf in scene_detection_chunks]).astype(bool)
+        zones_x264_scenecut[zone_i] = np.concatenate([np.load(str(cf))["x264"] for cf in scene_detection_chunks]).astype(float)
+        for cf in scene_detection_chunks:
+            cf.unlink(missing_ok=True)
+    print(f"\r\033[K{frame_print(zone_default.source_clip.num_frames)} / Fused parallel scene detection complete", end="\n", flush=True)
 
 
 scenes = {}

@@ -179,6 +179,17 @@ class VideoPrimary:
     ab_neg_multiplier: str = ""
     avg_func: str = ""
 
+    # strict_sdr_8bit forces an 8-bit SDR output, which implies dropping Dolby
+    # Vision and HDR10+ regardless of the dedicated flags. Derive the effective
+    # values here so the rule has one home (raw fields are still what gets saved).
+    @property
+    def effective_no_dolby_vision(self) -> bool:
+        return bool(self.no_dolby_vision or self.strict_sdr_8bit)
+
+    @property
+    def effective_no_hdr10plus(self) -> bool:
+        return bool(self.no_hdr10plus or self.strict_sdr_8bit)
+
 
 @dataclass
 class VideoDetails:
@@ -195,6 +206,9 @@ class VideoExperimental:
     vpy_wrapper: bool = False
     source_loader: str = DEFAULT_SOURCE_LOADER
     crop_resize_enabled: bool = False
+    # False (default): all passes share one video/vpy_temp/ scratch dir.
+    # True: split per pass into video/vpy_temp/{proxy,fast,main}/.
+    vpy_temp_split: bool = False
     av1an_decoupled_enabled: bool = False
     source_workers: str = "1"
     encoder_workers: str = ""
@@ -358,8 +372,8 @@ class ResolvedFilePlan:
             "noFastpass": bool_text(primary.no_fastpass),
             "fastpassHdr": bool_text(primary.fastpass_hdr),
             "strictSdr8bit": bool_text(primary.strict_sdr_8bit),
-            "noDolbyVision": bool_text(primary.no_dolby_vision or primary.strict_sdr_8bit),
-            "noHdr10Plus": bool_text(primary.no_hdr10plus or primary.strict_sdr_8bit),
+            "noDolbyVision": bool_text(primary.effective_no_dolby_vision),
+            "noHdr10Plus": bool_text(primary.effective_no_hdr10plus),
             "fastpassWorkers": str(primary.fastpass_workers),
             "mainpassWorkers": str(primary.mainpass_workers),
             "workers": str(primary.fastpass_workers),
@@ -378,6 +392,7 @@ class ResolvedFilePlan:
             "vpyWrapper": bool_text(experimental.vpy_wrapper),
             "sourceLoader": str(experimental.source_loader or DEFAULT_SOURCE_LOADER),
             "cropResizeEnabled": bool_text(experimental.crop_resize_enabled),
+            "vpyTempSplit": bool_text(experimental.vpy_temp_split),
             "av1anDecoupledEnabled": bool_text(experimental.av1an_decoupled_enabled),
             "sourceWorkers": str(experimental.source_workers or ""),
             "encoderWorkers": str(experimental.encoder_workers or ""),
@@ -483,18 +498,6 @@ class RunnerEvent:
     started_at: float = 0.0
     ended_at: float = 0.0
     elapsed_seconds: float = 0.0
-
-
-def default_video_primary() -> VideoPrimary:
-    return VideoPrimary()
-
-
-def default_video_details() -> VideoDetails:
-    return VideoDetails()
-
-
-def default_video_experimental() -> VideoExperimental:
-    return VideoExperimental()
 
 
 def normalize_encoder(value: Any) -> str:
@@ -667,9 +670,6 @@ __all__ = [
     "ResolvedPaths",
     "ResolvedFilePlan",
     "RunnerEvent",
-    "default_video_primary",
-    "default_video_details",
-    "default_video_experimental",
     "normalize_track_type",
     "normalize_encoder",
     "normalize_scene_detection",

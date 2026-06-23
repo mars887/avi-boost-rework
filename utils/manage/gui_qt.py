@@ -37,8 +37,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from utils import workdir_layout as wlayout
 from utils.pipeline_runtime import ROOT_DIR, load_toolchain
-from utils.plan import FilePlan
+from utils.plan import CHUNK_ORDER_OPTIONS, FilePlan, SCENE_DETECTION_OPTIONS
 
 from utils.manage import (
     analytics,
@@ -997,15 +998,28 @@ class ManageWindow(QMainWindow):
         mp_workers = QLineEdit(str(primary.mainpass_workers))
         mp_workers.setFixedWidth(130)
         chunk_order = QComboBox()
-        chunk_order.addItems(["long-biased-random", "random", "sequential", "short-to-long", "long-to-short"])
+        chunk_order.addItems(list(CHUNK_ORDER_OPTIONS))
         chunk_order.setCurrentText(primary.chunk_order)
         chunk_order.setFixedWidth(200)
         scene_detection = QComboBox()
-        scene_detection.addItems(["psd", "av1an", "none"])
+        scene_detection.addItems(list(SCENE_DETECTION_OPTIONS))
         scene_detection.setCurrentText(primary.scene_detection)
         scene_detection.setFixedWidth(140)
         no_fastpass = QCheckBox("no_fastpass")
         no_fastpass.setChecked(primary.no_fastpass)
+
+        def sync_fastpass_lock() -> None:
+            # Scene detection "none" yields a single scene, so the fast-pass (per-scene
+            # CRF tuning) is meaningless: force it off and lock the toggle so the
+            # prohibition is visible here rather than only enforced at runtime.
+            if scene_detection.currentText().strip().lower() == "none":
+                no_fastpass.setChecked(True)
+                no_fastpass.setEnabled(False)
+            else:
+                no_fastpass.setEnabled(True)
+
+        scene_detection.currentTextChanged.connect(lambda _text: sync_fastpass_lock())
+        sync_fastpass_lock()
 
         def params_text(params: Dict[str, Any]) -> str:
             return "\n".join(f"{key} {value}".rstrip() for key, value in params.items())
@@ -1552,11 +1566,11 @@ class ManageWindow(QMainWindow):
         pdir = av1an_state.pass_dir(self.ctx, pass_name)  # type: ignore[arg-type]
         chunks = av1an_state.load_chunks(pdir)
         targets: List[Path] = []
-        pass_scenes = pdir / "scenes.json"
+        pass_scenes = pdir / wlayout.AV1AN_SCENES_NAME
         if pass_scenes.exists():
             targets.append(pass_scenes)
         if pass_name == "mainpass":
-            final_scenes = self.ctx.workdir / "video" / "scenes-final.json"
+            final_scenes = wlayout.final_scenes(self.ctx.workdir)
             if final_scenes.exists():
                 targets.append(final_scenes)
         synced: List[str] = []
@@ -1572,31 +1586,17 @@ class ManageWindow(QMainWindow):
         )
 
     def _post_geometry_cleanup(self, pass_name: str, tx: ManageTransaction) -> None:
-        """Invalidate downstream artifacts after a chunks/done edit."""
-        assert self.ctx is not None
-        from utils.runner_state import STAGE_FASTPASS, STAGE_MUX, STAGE_SSIMU2, STAGE_VERIFY, stage_marker_path
-        from utils.runner_state import autoboost_fastpass_output
-        from utils.manage.context import make_runner_item
+        """Invalidate downstream artifacts after a chunks/done edit.
 
-        item = make_runner_item(self.ctx)
-        if pass_name == "fastpass":
-            for path in (autoboost_fastpass_output(item), stage_marker_path(item, STAGE_FASTPASS)):
-                if path is not None:
-                    tx.delete_file(path)
-            downstream = manage_reset.preview_stage_reset(self.ctx, STAGE_SSIMU2, chain=True)
-            for action in downstream.actions:
-                if action.action == "delete_tree":
-                    tx.delete_tree(action.path)
-                else:
-                    tx.delete_file(action.path)
-        else:
-            for path in (
-                self.ctx.workdir / "video" / "video-final.mkv",
-                stage_marker_path(item, STAGE_VERIFY),
-                stage_marker_path(item, STAGE_MUX),
-            ):
-                if path is not None:
-                    tx.delete_file(path)
+        Delegates to reset.chunk_downstream_reset so this and reset_chunk always
+        invalidate the identical artifact/marker set.
+        """
+        assert self.ctx is not None
+        for action in manage_reset.chunk_downstream_reset(self.ctx, pass_name).actions:
+            if action.action == "delete_tree":
+                tx.delete_tree(action.path)
+            else:
+                tx.delete_file(action.path)
 
     def on_reset_chunks(self, pass_name: str, policy: str) -> None:
         assert self.ctx is not None
@@ -1976,7 +1976,7 @@ class ManageWindow(QMainWindow):
 
     def build_logs_tab(self, layout: QVBoxLayout) -> None:
         assert self.ctx is not None
-        logs_dir = self.ctx.workdir / "00_logs"
+        logs_dir = wlayout.logs_dir(self.ctx.workdir)
         if not logs_dir.is_dir():
             layout.addWidget(make_label("no 00_logs directory", color=COLOR_GREY_500))
             layout.addStretch(1)
@@ -2025,12 +2025,12 @@ class ManageWindow(QMainWindow):
         assert self.ctx is not None
         candidates: List[Path] = []
         for pass_name in ("fastpass", "mainpass"):
-            pdir = self.ctx.workdir / "video" / pass_name
+            pdir = wlayout.video_dir(self.ctx.workdir) / pass_name
             candidates += [pdir / "chunks.json", pdir / "done.json"]
         candidates += [self.ctx.workdir / Path(rel) for rel, _ in manage_scenes.KNOWN_SCENE_FILES]
         candidates += [
-            self.ctx.meta_dir / "runner_state.json",
-            self.ctx.meta_dir / "source_info.json",
+            wlayout.runner_state_path(self.ctx.workdir),
+            wlayout.source_info_path(self.ctx.workdir),
             self.ctx.meta_dir / "manage_state.json",
         ]
         existing = [path for path in candidates if path.is_file()]

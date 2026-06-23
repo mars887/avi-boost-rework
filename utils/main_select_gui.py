@@ -6,6 +6,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from utils import workdir_layout as layout
 from utils.plan_model import FilePlan, gui_defaults_from_file_plan, load_plan, resolve_batch_plan, resolve_paths
 from utils.plan_support import collect_file_plan_paths
 from utils.zoned_commands import read_zoned_command_text
@@ -111,7 +112,7 @@ class MainSelectionResult:
 
 
 def is_supported_video_file(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() in VIDEO_EXTS and not path.name.lower().endswith(("-av1.mkv", "-av1.mp4"))
+    return path.is_file() and path.suffix.lower() in VIDEO_EXTS and not layout.is_final_output_name(path.name)
 
 
 def is_supported_video_file_for_input(path: Path) -> bool:

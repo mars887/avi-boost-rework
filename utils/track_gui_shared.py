@@ -17,6 +17,7 @@ from utils.plan_model import (
     DEFAULT_FASTPASS_PARAMS,
     DEFAULT_MAINPASS_PARAMS,
     DEFAULT_QUALITY,
+    DEFAULT_SCENE_DETECTION,
     DEFAULT_SOURCE_LOADER,
     DEFAULT_VIDEO_ENCODER,
     PSD_SCENE_DETECTION_OPTION_SPECS,
@@ -212,7 +213,7 @@ class DefaultSettings:
         self.mainpass = mainpass or ""
         sd = (scene_detection or "").strip().lower()
         if sd not in SCENE_DETECTION_OPTIONS:
-            sd = "av1an"
+            sd = DEFAULT_SCENE_DETECTION
         self.scene_detection = sd
         self.av1an_extra_split_sec = str(parse_int_value(av1an_extra_split_sec, DEFAULT_AV1AN_EXTRA_SPLIT_SEC))
         self.av1an_min_scene_len = str(parse_int_value(av1an_min_scene_len, DEFAULT_AV1AN_MIN_SCENE_LEN))
@@ -772,7 +773,7 @@ def build_default_defaults_dict():
         "zoning": "",
         "fastpass": "",
         "mainpass": "",
-        "scene_detection": "av1an",
+        "scene_detection": DEFAULT_SCENE_DETECTION,
         "av1an_extra_split_sec": str(DEFAULT_AV1AN_EXTRA_SPLIT_SEC),
         "av1an_min_scene_len": str(DEFAULT_AV1AN_MIN_SCENE_LEN),
         "chunk_order": DEFAULT_CHUNK_ORDER,
