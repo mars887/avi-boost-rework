@@ -286,8 +286,8 @@ def compute_source_bitrates(
 
 def compute_chunk_bitrates(av1an_temp: Path, scene_count: int) -> List[Optional[float]]:
     out: List[Optional[float]] = [None] * scene_count
-    chunks_path = av1an_temp / "chunks.json"
-    encode_dir = av1an_temp / "encode"
+    chunks_path = layout.chunks_json_path(av1an_temp)
+    encode_dir = layout.encode_dir(av1an_temp)
     if not chunks_path.exists() or not encode_dir.exists():
         return out
     try:
@@ -403,8 +403,8 @@ def update_scene_bitrates(
         return
 
     count = len(base_list)
-    fast_list = compute_chunk_bitrates(video_dir / "fastpass", count)
-    main_list = compute_chunk_bitrates(video_dir / "mainpass", count)
+    fast_list = compute_chunk_bitrates(layout.fastpass_dir(workdir), count)
+    main_list = compute_chunk_bitrates(layout.mainpass_dir(workdir), count)
     need_source_scan = bool(include_source)
     if need_source_scan:
         source_already_present = True

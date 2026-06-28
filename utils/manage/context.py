@@ -71,11 +71,11 @@ class WorkdirContext:
 
     @property
     def meta_dir(self) -> Path:
-        return self.workdir / "00_meta"
+        return layout.meta_dir(self.workdir)
 
     @property
     def video_dir(self) -> Path:
-        return self.workdir / "video"
+        return layout.video_dir(self.workdir)
 
     def has_video_edit(self) -> bool:
         if self.resolved_plan is not None:
@@ -83,15 +83,13 @@ class WorkdirContext:
         return self.video_dir.is_dir()
 
 
-def make_runner_item(ctx: WorkdirContext) -> RunnerItemAdapter:
+def make_runner_item(ctx: WorkdirContext, *, mode: Optional[str] = None) -> RunnerItemAdapter:
     resolved = ctx.resolved_plan or _synthetic_resolved_plan(ctx.workdir, ctx.source, ctx.zone_file)
     source = ctx.source or resolved.paths.source
-    # Manage is mode-agnostic: even when the plan/batch ran in fastpass mode it
-    # must show and manage every pipeline stage, so the runner item is always
-    # built for the full pipeline. ctx.mode stays purely informational.
+    effective_mode = str(mode if mode is not None else (ctx.mode or MODE_FULL)).strip().lower() or MODE_FULL
     return RunnerItemAdapter(
         resolved=resolved,
-        mode=MODE_FULL,
+        mode=effective_mode,
         workdir=ctx.workdir,
         source=source,
         plan_path=ctx.plan_path or resolved.paths.plan_path,
@@ -161,13 +159,13 @@ def _guess_mode(workdir: Path) -> str:
 
 
 def _synthetic_file_plan(workdir: Path, source: Optional[Path]) -> FilePlan:
-    video_dir = Path(workdir) / "video"
+    video_dir = layout.video_dir(workdir)
     plan = FilePlan(
         meta=PlanMeta(name=Path(workdir).name, created_by="manage (synthetic)"),
         paths=PlanPaths(source=str(source) if source else ""),
         video=VideoPlan(track_id=0, action="edit" if video_dir.is_dir() else "copy"),
     )
-    if (video_dir / "psd").is_dir():
+    if layout.psd_dir(workdir).is_dir():
         plan.video.primary.scene_detection = "psd"
     return plan
 
@@ -242,7 +240,7 @@ def context_from_plan(
         stage_names=[],
         stage_bank=bank,
     )
-    ctx.stage_names = display_stage_plan(make_runner_item(ctx))
+    ctx.stage_names = display_stage_plan(make_runner_item(ctx, mode=MODE_FULL))
     if not resolved.paths.source.exists():
         ctx.warnings.append(f"source file not found: {resolved.paths.source}")
     return ctx
@@ -270,7 +268,7 @@ def context_from_workdir(
                     f"plan {plan_path} resolves workdir to {ctx.workdir}, but {workdir} was requested; using {workdir}"
                 )
                 ctx.workdir = workdir
-                ctx.stage_names = display_stage_plan(make_runner_item(ctx))
+                ctx.stage_names = display_stage_plan(make_runner_item(ctx, mode=MODE_FULL))
             return ctx
     else:
         plan_error = ""
@@ -298,7 +296,7 @@ def context_from_workdir(
         ctx.warnings.append(f"plan recorded in 00_meta is missing: {plan_path}")
     if plan_error:
         ctx.warnings.append(f"failed to load plan {plan_path}: {plan_error}")
-    ctx.stage_names = display_stage_plan(make_runner_item(ctx))
+    ctx.stage_names = display_stage_plan(make_runner_item(ctx, mode=MODE_FULL))
     return ctx
 
 

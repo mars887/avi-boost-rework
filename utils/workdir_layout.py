@@ -58,6 +58,11 @@ HDR_TMP_DIRNAME = "hdr_tmp"
 VPY_TEMP_DIRNAME = "vpy_temp"                      # video/vpy_temp/<pass>/ scratch for .vpy scripts
 VPY_TEMP_PASSES = ("proxy", "fast", "main")        # per-pass scratch subdirs
 
+# --- av1an per-pass state files (inside video/<pass>/) --------------------
+CHUNKS_JSON_NAME = "chunks.json"                   # av1an encode queue (array)
+DONE_JSON_NAME = "done.json"                       # av1an completed-chunk state (object)
+ENCODE_DIRNAME = "encode"                          # video/<pass>/encode/<index>.<ext>
+
 # --- scene / output file names (inside video/, unless noted) --------------
 PSD_BASE_SCENES_NAME = "scenes.psd.json"          # video/psd/
 AV1AN_SCENES_NAME = "scenes.json"                 # video/fastpass/ (av1an SD)
@@ -148,6 +153,19 @@ def fastpass_dir(workdir: Path) -> Path:
 
 def mainpass_dir(workdir: Path) -> Path:
     return video_dir(workdir) / MAINPASS_DIRNAME
+
+
+def encode_dir(pass_dir: Path) -> Path:
+    """av1an encode-output directory of a pass temp dir (video/<pass>/encode)."""
+    return Path(pass_dir) / ENCODE_DIRNAME
+
+
+def chunks_json_path(pass_dir: Path) -> Path:
+    return Path(pass_dir) / CHUNKS_JSON_NAME
+
+
+def done_json_path(pass_dir: Path) -> Path:
+    return Path(pass_dir) / DONE_JSON_NAME
 
 
 def hdr_tmp_dir(workdir: Path) -> Path:

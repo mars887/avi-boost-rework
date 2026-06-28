@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from utils import workdir_layout as layout
 from utils.runner_state import (
     STAGE_ATTACHMENTS,
     STAGE_AUTOBOOST_PSD_SCENE,
@@ -138,7 +139,7 @@ def fastpass_output_size(item: Dict[str, Any]) -> int:
     workdir = str(item.get("workdir") or "").strip()
     source = str(item.get("source") or "").strip()
     if workdir and source:
-        candidates.append(Path(workdir) / "video" / "fastpass" / f"{Path(source).stem}.fastpass.mkv")
+        candidates.append(layout.fastpass_output(Path(workdir), Path(source).stem))
     for path in candidates:
         try:
             if path.exists() and path.is_file():
@@ -425,7 +426,7 @@ async def probe_media_duration_async(path: Path) -> str:
 
 def list_ivf_files(plan: Dict[str, Any], pass_name: str, *, count: int, sort_mode: str) -> List[Path]:
     workdir = Path(str(plan.get("workdir") or "")).resolve()
-    folder = workdir / "video" / f"{pass_name}pass" / "encode"
+    folder = layout.encode_dir(layout.video_dir(workdir) / f"{pass_name}pass")
     files = list(folder.glob("*.ivf")) if folder.exists() else []
     if sort_mode == "size":
         files.sort(key=lambda p: (p.stat().st_size, p.name.lower()))

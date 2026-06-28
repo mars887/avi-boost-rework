@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
 
+from utils import workdir_layout as layout
 from utils.plan import BatchPlan, FilePlan, load_plan, resolve_batch_plan, resolve_paths
 from utils.zoned_commands import (
     LEGACY_CROP_RESIZE_COMMAND_NAME,
@@ -34,9 +35,9 @@ def is_workdir(path: Path) -> bool:
     if not path.is_dir():
         return False
     return (
-        (path / "00_meta").is_dir()
-        or (path / ".state").is_dir()
-        or (path / "video").is_dir()
+        layout.meta_dir(path).is_dir()
+        or layout.state_dir(path).is_dir()
+        or layout.video_dir(path).is_dir()
         or (path / ZONED_COMMAND_NAME).is_file()
         or (path / LEGACY_ZONE_COMMAND_NAME).is_file()
         or (path / LEGACY_CROP_RESIZE_COMMAND_NAME).is_file()

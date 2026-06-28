@@ -4,6 +4,7 @@ import copy
 import json
 import random
 import re
+import shlex
 import struct
 import time
 from dataclasses import dataclass, field
@@ -133,11 +134,11 @@ def pass_dir(ctx: WorkdirContext, pass_name: PassName) -> Path:
 
 
 def chunks_path(pass_dir: Path) -> Path:
-    return Path(pass_dir) / "chunks.json"
+    return layout.chunks_json_path(pass_dir)
 
 
 def done_path(pass_dir: Path) -> Path:
-    return Path(pass_dir) / "done.json"
+    return layout.done_json_path(pass_dir)
 
 
 def load_chunks(pass_dir: Path) -> List[ChunkState]:
@@ -193,7 +194,7 @@ def save_done(pass_dir: Path, done: DoneState, *, tx: Optional[ManageTransaction
 
 def chunk_output_path(chunk: ChunkState, pass_dir: Optional[Path] = None) -> Path:
     base = Path(pass_dir) if pass_dir is not None else Path(str(chunk.data.get("temp") or "."))
-    return base / "encode" / f"{chunk.name}.{chunk.output_ext}"
+    return layout.encode_dir(base) / f"{chunk.name}.{chunk.output_ext}"
 
 
 def sidecar_paths(pass_dir: Path, index: int) -> List[Path]:
@@ -287,8 +288,11 @@ def quarantine_or_delete_encode_output(
             output.rename(target)
         return [output, target]
     if tx is not None:
-        tx.record_change(output)
-    output.unlink()
+        # back up (size permitting) + record before unlinking, so even the
+        # 'delete' policy is recoverable from the transaction / manifest
+        tx.delete_file(output)
+    else:
+        output.unlink()
     return [output]
 
 
@@ -509,6 +513,14 @@ def update_chunk_params(
 # values.
 
 VARIABLE_PLACEHOLDER = "{variable}"
+
+
+def tokenize_params(text: str) -> List[str]:
+    lexer = shlex.shlex(str(text), posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.escape = ""
+    return [token for token in lexer if token]
 
 
 def parse_video_param_pairs(tokens: Sequence[str]) -> List[Tuple[str, Optional[str]]]:
@@ -1098,6 +1110,7 @@ __all__ = [
     "sort_chunks",
     "split_chunk",
     "swap_chunks",
+    "tokenize_params",
     "update_chunk_params",
     "update_chunks_params",
     "validate_chunks",

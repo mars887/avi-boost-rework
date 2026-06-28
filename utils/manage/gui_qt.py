@@ -1312,26 +1312,43 @@ class ManageWindow(QMainWindow):
         params_field.setMinimumWidth(480)
 
         def apply() -> None:
-            params = [token for token in params_field.text().split() if token]
-            tx = ManageTransaction(
-                workdir=self.ctx.workdir, operation="patch_zone", source=self.ctx.source, plan=self.ctx.plan_path
+            params = av1an_state.tokenize_params(params_field.text())
+            downstream = manage_reset.scene_edit_downstream_reset(self.ctx, scene_path)
+            with ManageTransaction(
+                workdir=self.ctx.workdir,
+                operation="patch_zone",
+                source=self.ctx.source,
+                plan=self.ctx.plan_path,
+            ) as tx:
+                result = manage_scenes.patch_scene_region(
+                    scene_path,
+                    manage_scenes.SceneSelector(start_frame=start, end_frame=end),
+                    manage_scenes.ZonePatch(video_params=params),
+                    tx=tx,
+                )
+                for action in downstream.actions:
+                    if action.action == "delete_tree":
+                        tx.delete_tree(action.path)
+                    else:
+                        tx.delete_file(action.path)
+                tx.commit(
+                    message=f"zone patch {start}..{end} on {scene_path.name}",
+                    extra={"downstream_reset": downstream.stages},
+                )
+            reset_note = (
+                f"; downstream reset: {', '.join(downstream.stages)}"
+                if downstream.stages
+                else "; no mapped downstream stage (reset the chain manually if needed)"
             )
-            result = manage_scenes.patch_scene_region(
-                scene_path,
-                manage_scenes.SceneSelector(start_frame=start, end_frame=end),
-                manage_scenes.ZonePatch(video_params=params),
-                tx=tx,
-            )
-            tx.commit(message=f"zone patch {start}..{end} on {scene_path.name}")
-            self.notify(f"patched {len(result.patched_positions)} scene(s); downstream stages NOT reset automatically")
+            self.notify(f"patched {len(result.patched_positions)} scene(s){reset_note}")
             self.refresh()
 
         self.show_dialog_form(
             f"Edit zone params — scene [{start}, {end}) — {scene_path.name}",
             [
                 make_label(
-                    "Replaces zone_overrides.video_params for this scene. "
-                    "A backup is written; reset the affected chain afterwards.",
+                    "Replaces zone_overrides.video_params for this scene. A backup is written and the "
+                    "stages downstream of this scene file are invalidated automatically so the edit propagates.",
                     color=COLOR_GREY_400,
                     wrap=True,
                 ),
@@ -1347,7 +1364,7 @@ class ManageWindow(QMainWindow):
         assert self.ctx is not None
         state = self.pass_states[pass_name]
         pdir = av1an_state.pass_dir(self.ctx, pass_name)  # type: ignore[arg-type]
-        if not (pdir / "chunks.json").exists():
+        if not av1an_state.chunks_path(pdir).exists():
             layout.addWidget(make_label(f"{pass_name}: no chunks.json (pass not started)", color=COLOR_GREY_500))
             layout.addStretch(1)
             return
@@ -1618,9 +1635,9 @@ class ManageWindow(QMainWindow):
             return
 
         def apply() -> None:
-            for index in indices:
-                manage_reset.reset_chunk(self.ctx, pass_name, index, policy=policy)  # type: ignore[arg-type]
-            self.notify(f"reset {len(indices)} chunk(s)")
+            result = manage_reset.reset_chunks(self.ctx, pass_name, indices, policy=policy)  # type: ignore[arg-type]
+            backup_note = f"; backup: {result.backup_manifest.parent.name}" if result.backup_manifest else ""
+            self.notify(f"reset {len(indices)} chunk(s){backup_note}")
             self.refresh()
 
         self.confirm(f"Reset chunks — {pass_name}", previews, apply, confirm_label="Reset")
@@ -1650,20 +1667,20 @@ class ManageWindow(QMainWindow):
         params_field.setMinimumSize(560, 80)
 
         def apply() -> None:
-            template_tokens = [token for token in params_field.toPlainText().split() if token]
-            tx = self._geometry_tx("edit_chunk_params")
-            result = av1an_state.update_chunks_params(
-                pdir, target_indices, template_tokens, policy=policy, tx=tx  # type: ignore[arg-type]
-            )
-            if not result.changed_indices:
-                self.notify("no changes")
-                return
-            if result.reset_indices:
-                self._post_geometry_cleanup(pass_name, tx)
-            tx.commit(
-                message=f"edit video_params on {len(result.changed_indices)} chunk(s) ({pass_name})",
-                extra={"changed": result.changed_indices, "reset": result.reset_indices},
-            )
+            template_tokens = av1an_state.tokenize_params(params_field.toPlainText())
+            with self._geometry_tx("edit_chunk_params") as tx:
+                result = av1an_state.update_chunks_params(
+                    pdir, target_indices, template_tokens, policy=policy, tx=tx  # type: ignore[arg-type]
+                )
+                if not result.changed_indices:
+                    self.notify("no changes")
+                    return
+                if result.reset_indices:
+                    self._post_geometry_cleanup(pass_name, tx)
+                tx.commit(
+                    message=f"edit video_params on {len(result.changed_indices)} chunk(s) ({pass_name})",
+                    extra={"changed": result.changed_indices, "reset": result.reset_indices},
+                )
             reset_note = (
                 f"; {len(result.reset_indices)} done-chunk(s) reset + downstream cleared"
                 if result.reset_indices
@@ -1711,23 +1728,23 @@ class ManageWindow(QMainWindow):
             total_frames = max((chunk.end_frame for chunk in chunks), default=0) or None
             video = zone_patch.build_video_info(self.ctx.source, self._scene_fps())
             commands = zone_patch.parse_patch_commands(text, video=video, total_frames=total_frames)
-            tx = self._geometry_tx("patch_pass_params")
-            result = zone_patch.apply_param_commands_to_chunks(pdir, commands, policy=policy, tx=tx)  # type: ignore[arg-type]
-            if not result.changed_indices:
-                self.notify("no chunks matched the command(s) — nothing changed")
-                return
-            scenes_updated = zone_patch.mirror_params_to_scene_file(scene_path, result.range_params, tx=tx)
-            if result.reset_indices:
-                self._post_geometry_cleanup(pass_name, tx)
-            tx.commit(
-                message=f"patch params on {len(result.changed_indices)} chunk(s) ({pass_name})",
-                extra={
-                    "changed": result.changed_indices,
-                    "reset": result.reset_indices,
-                    "scene_file": str(scene_path),
-                    "scene_entries_updated": scenes_updated,
-                },
-            )
+            with self._geometry_tx("patch_pass_params") as tx:
+                result = zone_patch.apply_param_commands_to_chunks(pdir, commands, policy=policy, tx=tx)  # type: ignore[arg-type]
+                if not result.changed_indices:
+                    self.notify("no chunks matched the command(s) — nothing changed")
+                    return
+                scenes_updated = zone_patch.mirror_params_to_scene_file(scene_path, result.range_params, tx=tx)
+                if result.reset_indices:
+                    self._post_geometry_cleanup(pass_name, tx)
+                tx.commit(
+                    message=f"patch params on {len(result.changed_indices)} chunk(s) ({pass_name})",
+                    extra={
+                        "changed": result.changed_indices,
+                        "reset": result.reset_indices,
+                        "scene_file": str(scene_path),
+                        "scene_entries_updated": scenes_updated,
+                    },
+                )
             reset_note = f"; {len(result.reset_indices)} done-chunk(s) reset + downstream cleared" if result.reset_indices else ""
             scene_note = f"; {scenes_updated} scene entr(ies) in {scene_path.name} updated" if scenes_updated else ""
             self.notify(f"patched {len(result.changed_indices)} chunk(s){reset_note}{scene_note}")
@@ -1779,14 +1796,14 @@ class ManageWindow(QMainWindow):
         def apply() -> None:
             frame = int(frame_field.text().strip())
             pdir = av1an_state.pass_dir(self.ctx, pass_name)  # type: ignore[arg-type]
-            tx = self._geometry_tx("split_chunk")
-            result = av1an_state.split_chunk(pdir, index, frame, policy=policy, tx=tx)  # type: ignore[arg-type]
-            synced = self._sync_scenes_after_geometry(pass_name, tx)
-            self._post_geometry_cleanup(pass_name, tx)
-            tx.commit(
-                message=f"split chunk {index} at frame {frame} ({pass_name})",
-                extra={"reindexed": len(result.reindexed), "scenes_synced": synced},
-            )
+            with self._geometry_tx("split_chunk") as tx:
+                result = av1an_state.split_chunk(pdir, index, frame, policy=policy, tx=tx)  # type: ignore[arg-type]
+                synced = self._sync_scenes_after_geometry(pass_name, tx)
+                self._post_geometry_cleanup(pass_name, tx)
+                tx.commit(
+                    message=f"split chunk {index} at frame {frame} ({pass_name})",
+                    extra={"reindexed": len(result.reindexed), "scenes_synced": synced},
+                )
             self.notify(f"chunk {index} split; {len(result.reindexed)} chunks reindexed")
             self.refresh()
 
@@ -1811,14 +1828,14 @@ class ManageWindow(QMainWindow):
 
         def apply() -> None:
             pdir = av1an_state.pass_dir(self.ctx, pass_name)  # type: ignore[arg-type]
-            tx = self._geometry_tx("merge_chunks")
-            result = av1an_state.merge_chunks(pdir, indices, policy=policy, tx=tx)  # type: ignore[arg-type]
-            synced = self._sync_scenes_after_geometry(pass_name, tx)
-            self._post_geometry_cleanup(pass_name, tx)
-            tx.commit(
-                message=f"merge chunks {indices} ({pass_name})",
-                extra={"reindexed": len(result.reindexed), "scenes_synced": synced},
-            )
+            with self._geometry_tx("merge_chunks") as tx:
+                result = av1an_state.merge_chunks(pdir, indices, policy=policy, tx=tx)  # type: ignore[arg-type]
+                synced = self._sync_scenes_after_geometry(pass_name, tx)
+                self._post_geometry_cleanup(pass_name, tx)
+                tx.commit(
+                    message=f"merge chunks {indices} ({pass_name})",
+                    extra={"reindexed": len(result.reindexed), "scenes_synced": synced},
+                )
             self.notify(f"merged {len(indices)} chunks into {result.new_indices[0]}")
             self.refresh()
 
@@ -1845,14 +1862,14 @@ class ManageWindow(QMainWindow):
             if start is None or end is None:
                 raise RuntimeError("enter range as frame numbers or hh:mm:ss timestamps")
             pdir = av1an_state.pass_dir(self.ctx, pass_name)  # type: ignore[arg-type]
-            tx = self._geometry_tx("reshape_chunk_range")
-            result = av1an_state.reshape_chunk_range(pdir, FrameRange(start, end), policy=policy, tx=tx)  # type: ignore[arg-type]
-            synced = self._sync_scenes_after_geometry(pass_name, tx)
-            self._post_geometry_cleanup(pass_name, tx)
-            tx.commit(
-                message=f"reshape [{start}, {end}) into one chunk ({pass_name})",
-                extra={"reset_indices": result.reset_indices, "scenes_synced": synced},
-            )
+            with self._geometry_tx("reshape_chunk_range") as tx:
+                result = av1an_state.reshape_chunk_range(pdir, FrameRange(start, end), policy=policy, tx=tx)  # type: ignore[arg-type]
+                synced = self._sync_scenes_after_geometry(pass_name, tx)
+                self._post_geometry_cleanup(pass_name, tx)
+                tx.commit(
+                    message=f"reshape [{start}, {end}) into one chunk ({pass_name})",
+                    extra={"reset_indices": result.reset_indices, "scenes_synced": synced},
+                )
             self.notify(f"range [{start}, {end}) reshaped; reset chunks: {result.reset_indices}")
             self.refresh()
 
@@ -1876,6 +1893,8 @@ class ManageWindow(QMainWindow):
 
     def on_move_chunks(self, pass_name: str) -> None:
         assert self.ctx is not None
+        if not self.destructive_allowed():
+            return
         indices = self._selected_indices(pass_name)
         if not indices:
             self.notify("select chunk(s) to move")
@@ -1893,11 +1912,11 @@ class ManageWindow(QMainWindow):
             kind = kind_dd.currentText()
             anchor = int(anchor_field.text().strip()) if kind in ("before", "after") else None
             pdir = av1an_state.pass_dir(self.ctx, pass_name)  # type: ignore[arg-type]
-            tx = self._geometry_tx("move_chunks")
-            av1an_state.move_chunks(
-                pdir, indices, MoveTarget(kind=kind, anchor_index=anchor), order=order_dd.currentText(), tx=tx  # type: ignore[arg-type]
-            )
-            tx.commit(message=f"move chunks {indices} {kind} ({pass_name})")
+            with self._geometry_tx("move_chunks") as tx:
+                av1an_state.move_chunks(
+                    pdir, indices, MoveTarget(kind=kind, anchor_index=anchor), order=order_dd.currentText(), tx=tx  # type: ignore[arg-type]
+                )
+                tx.commit(message=f"move chunks {indices} {kind} ({pass_name})")
             self.notify("queue order updated (affects only not-done chunks on av1an resume)")
             self.refresh()
 
@@ -1922,6 +1941,8 @@ class ManageWindow(QMainWindow):
 
     def on_sort_queue(self, pass_name: str) -> None:
         assert self.ctx is not None
+        if not self.destructive_allowed():
+            return
         algo_dd = QComboBox()
         algo_dd.addItems(list(av1an_state.CHUNK_SORT_ALGORITHMS))
         algo_dd.setCurrentText("long-to-short")
@@ -1949,11 +1970,11 @@ class ManageWindow(QMainWindow):
                     }
                 if not key_values:
                     raise RuntimeError(f"no {algorithm} data available to sort by")
-            tx = self._geometry_tx("sort_chunks")
-            av1an_state.sort_chunks(
-                pdir, algorithm, key_values=key_values, descending=desc_cb.isChecked(), tx=tx
-            )
-            tx.commit(message=f"sort queue {algorithm} ({pass_name})")
+            with self._geometry_tx("sort_chunks") as tx:
+                av1an_state.sort_chunks(
+                    pdir, algorithm, key_values=key_values, descending=desc_cb.isChecked(), tx=tx
+                )
+                tx.commit(message=f"sort queue {algorithm} ({pass_name})")
             self.notify("queue order updated (affects only not-done chunks on av1an resume)")
             self.refresh()
 
@@ -2026,7 +2047,7 @@ class ManageWindow(QMainWindow):
         candidates: List[Path] = []
         for pass_name in ("fastpass", "mainpass"):
             pdir = wlayout.video_dir(self.ctx.workdir) / pass_name
-            candidates += [pdir / "chunks.json", pdir / "done.json"]
+            candidates += [av1an_state.chunks_path(pdir), av1an_state.done_path(pdir)]
         candidates += [self.ctx.workdir / Path(rel) for rel, _ in manage_scenes.KNOWN_SCENE_FILES]
         candidates += [
             wlayout.runner_state_path(self.ctx.workdir),

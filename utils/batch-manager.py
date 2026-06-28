@@ -1193,11 +1193,11 @@ def load_pass_chunks(pass_dir: Path) -> Dict[int, Dict[str, Any]]:
 
 
 def choose_scenes_path_for_analytics(workdir: Path) -> Path:
-    video_dir = workdir / "video"
-    p1 = video_dir / "scenes.json"
+    video_dir = layout.video_dir(workdir)
+    p1 = video_dir / layout.STAGE4_SCENES_FULL_NAME
     if p1.exists():
         return p1
-    p2 = video_dir / "scenes-preview.json"
+    p2 = video_dir / layout.STAGE4_SCENES_PREVIEW_NAME
     if p2.exists():
         return p2
     raise RuntimeError(f"Missing scenes file: expected {p1} or {p2}")

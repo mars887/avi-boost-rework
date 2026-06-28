@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils import workdir_layout as layout
 from utils.plan import BatchPlan, FilePlan, dump_plan, load_plan
 from utils.zoned_commands import (
     parse_zoned_payload,
@@ -15,7 +15,12 @@ from utils.zoned_commands import (
     zoned_command_path,
 )
 
-from utils.manage.backup import ManageTransaction, write_json_atomic, write_text_atomic
+from utils.manage.backup import (
+    ManageTransaction,
+    _sha256_file as _sha256_path,
+    write_json_atomic,
+    write_text_atomic,
+)
 from utils.manage.context import WorkdirContext, load_json_file
 from utils.manage.scenes import ValidationIssue
 
@@ -72,14 +77,7 @@ class ConfigFingerprint:
 def _sha256_file(path: Optional[Path]) -> str:
     if path is None:
         return ""
-    digest = hashlib.sha256()
-    try:
-        with Path(path).open("rb") as fh:
-            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError:
-        return ""
-    return digest.hexdigest()
+    return _sha256_path(Path(path))
 
 
 def list_config_files(ctx: WorkdirContext) -> List[ConfigFileRef]:
@@ -255,7 +253,7 @@ def stale_config_warnings(ctx: WorkdirContext) -> List[StaleConfigWarning]:
 
     plan_mtime = mtime(ctx.plan_path)
     zone_mtime = mtime(ctx.zone_file)
-    state_dir = ctx.workdir / ".state"
+    state_dir = layout.state_dir(ctx.workdir)
     markers = []
     if state_dir.is_dir():
         try:

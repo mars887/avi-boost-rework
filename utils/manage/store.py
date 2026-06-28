@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
+from utils import workdir_layout as layout
+
 STORE_FILE_NAME = "manage_store.sqlite"
 SCHEMA_VERSION = 1
 BUSY_TIMEOUT_MS = 5000
@@ -23,7 +25,7 @@ COLLECTION_MANAGE_EVENTS = "manage_events"
 
 
 def store_path_for_workdir(workdir: Path) -> Path:
-    return Path(workdir) / "00_meta" / STORE_FILE_NAME
+    return layout.meta_dir(workdir) / STORE_FILE_NAME
 
 
 class WorkdirStore:
@@ -291,7 +293,7 @@ def open_store(workdir: Path) -> WorkdirStore:
 def import_workdir_files(store: WorkdirStore, workdir: Path) -> Dict[str, int]:
     """Read-through import of runner files into the store cache."""
     workdir = Path(workdir)
-    meta_dir = workdir / "00_meta"
+    meta_dir = layout.meta_dir(workdir)
     stats: Dict[str, int] = {}
 
     stats["runner_events"] = store.import_jsonl_tail(

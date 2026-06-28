@@ -306,6 +306,56 @@ def preview_chunk_reset(
     return plan
 
 
+def reset_chunks(
+    ctx: WorkdirContext,
+    pass_name: PassName,
+    chunk_indices: Sequence[int],
+    *,
+    policy: Optional[EncodeOutputPolicy] = None,
+) -> ResetResult:
+    ensure_not_running(ctx)
+    indices = [int(value) for value in chunk_indices]
+    if not indices:
+        raise RuntimeError("no chunks selected to reset")
+    effective_policy: EncodeOutputPolicy = policy or DEFAULT_POLICY_BY_PASS[pass_name]
+    pdir = av1an_state.pass_dir(ctx, pass_name)
+    present = {chunk.index for chunk in av1an_state.load_chunks(pdir)}
+    missing = [index for index in indices if index not in present]
+    if missing:
+        raise RuntimeError(f"chunk indices not found in {pass_name}: {missing}")
+
+    downstream = chunk_downstream_reset(ctx, pass_name)
+    plan = ResetPlan(
+        workdir=ctx.workdir,
+        operation="reset_chunk",
+        stages=downstream.stages,
+        actions=_dedupe(downstream.actions),
+        notes=[f"done.json entries removed for chunk(s): {indices}"],
+    )
+
+    changed: List[Path] = []
+    with ManageTransaction(
+        workdir=ctx.workdir,
+        operation="reset_chunk",
+        source=ctx.source,
+        plan=ctx.plan_path,
+        notes=list(plan.notes),
+    ) as tx:
+        for index in indices:
+            changed.extend(av1an_state.mark_chunk_not_done(pdir, index, policy=effective_policy, tx=tx))
+        for action in downstream.actions:
+            if action.action == "delete_tree":
+                if tx.delete_tree(action.path):
+                    changed.append(action.path)
+            elif tx.delete_file(action.path):
+                changed.append(action.path)
+        manifest = tx.commit(
+            message=f"reset {len(indices)} chunk(s) ({pass_name}, policy={effective_policy})",
+            extra={"pass": pass_name, "chunk_indices": indices, "stages": plan.stages},
+        )
+    return ResetResult(plan=plan, changed_paths=changed, backup_manifest=manifest)
+
+
 def reset_chunk(
     ctx: WorkdirContext,
     pass_name: PassName,
@@ -313,32 +363,47 @@ def reset_chunk(
     *,
     policy: Optional[EncodeOutputPolicy] = None,
 ) -> ResetResult:
-    ensure_not_running(ctx)
-    effective_policy: EncodeOutputPolicy = policy or DEFAULT_POLICY_BY_PASS[pass_name]
-    plan = preview_chunk_reset(ctx, pass_name, chunk_index, policy=effective_policy)
-    pdir = av1an_state.pass_dir(ctx, pass_name)
+    """Single-chunk convenience wrapper over :func:`reset_chunks`."""
+    return reset_chunks(ctx, pass_name, [chunk_index], policy=policy)
 
-    tx = ManageTransaction(
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except OSError:
+        return str(left).lower() == str(right).lower()
+
+
+def scene_file_producing_stage(ctx: WorkdirContext, scene_path: Path) -> Optional[str]:
+    target = Path(scene_path)
+    candidates = [
+        (layout.boundary_scenes(ctx.workdir), STAGE_ZONE_BOUNDARIES),
+        (layout.recalc_scenes(ctx.workdir), STAGE_ZONE_RECALC),
+        (layout.zoned_scenes(ctx.workdir), STAGE_ZONE_EDIT),
+        (layout.final_scenes(ctx.workdir), STAGE_HDR_PATCH),
+        (layout.stage4_scenes(ctx.workdir, "full"), STAGE_SSIMU2),
+        (layout.stage4_scenes(ctx.workdir, "fastpass"), STAGE_SSIMU2),
+    ]
+    for path, stage in candidates:
+        if _same_path(path, target):
+            return stage
+    return None
+
+
+def scene_edit_downstream_reset(ctx: WorkdirContext, scene_path: Path) -> ResetPlan:
+    stage = scene_file_producing_stage(ctx, scene_path)
+    if stage is None:
+        return ResetPlan(workdir=ctx.workdir, operation="scene_edit_downstream", stages=[], actions=[])
+    downstream = list(downstream_stage_names(stage, ctx.stage_names, ctx.stage_bank))
+    actions: List[FileAction] = []
+    for stage_name in downstream:
+        actions.extend(stage_reset_actions(ctx, stage_name))
+    return ResetPlan(
         workdir=ctx.workdir,
-        operation="reset_chunk",
-        source=ctx.source,
-        plan=ctx.plan_path,
-        notes=list(plan.notes),
+        operation="scene_edit_downstream",
+        stages=downstream,
+        actions=_dedupe(actions),
     )
-    changed = av1an_state.mark_chunk_not_done(pdir, chunk_index, policy=effective_policy, tx=tx)
-
-    for action in chunk_downstream_reset(ctx, pass_name).actions:
-        if action.action == "delete_tree":
-            if tx.delete_tree(action.path):
-                changed.append(action.path)
-        elif tx.delete_file(action.path):
-            changed.append(action.path)
-
-    manifest = tx.commit(
-        message=f"reset chunk {chunk_index} ({pass_name}, policy={effective_policy})",
-        extra={"pass": pass_name, "chunk_index": int(chunk_index), "stages": plan.stages},
-    )
-    return ResetResult(plan=plan, changed_paths=changed, backup_manifest=manifest)
 
 
 def reset_crf_recalc(ctx: WorkdirContext) -> ResetResult:
@@ -376,7 +441,10 @@ __all__ = [
     "preview_file_changes",
     "preview_stage_reset",
     "reset_chunk",
+    "reset_chunks",
     "reset_crf_recalc",
     "reset_stage",
+    "scene_edit_downstream_reset",
+    "scene_file_producing_stage",
     "stage_reset_actions",
 ]

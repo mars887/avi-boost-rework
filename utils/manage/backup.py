@@ -8,7 +8,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from utils import workdir_layout as layout
 
 MANAGE_BACKUPS_DIR = "manage_backups"
 MANAGE_EVENTS_FILE = "manage_events.jsonl"
@@ -45,7 +47,7 @@ def write_text_atomic(path: Path, text: str, *, encoding: str = "utf-8") -> None
 
 
 def append_manage_event(workdir: Path, payload: Dict[str, Any]) -> None:
-    meta_dir = Path(workdir) / "00_meta"
+    meta_dir = layout.meta_dir(workdir)
     meta_dir.mkdir(parents=True, exist_ok=True)
     record = {"schema_version": 1, "event": "manage", "timestamp": time.time()}
     record.update(payload)
@@ -83,16 +85,27 @@ class ManageTransaction:
     _backed_up: set = field(default_factory=set)
     _backup_dir: Optional[Path] = None
     _committed: bool = False
+    _renames_done: List[Tuple[Path, Path]] = field(default_factory=list)
+    _created_paths: List[Path] = field(default_factory=list)
+    _rolled_back: bool = False
 
     def __post_init__(self) -> None:
         self.workdir = Path(self.workdir)
         self.created_at = datetime.now().astimezone()
 
+    def __enter__(self) -> "ManageTransaction":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is not None and not self._committed:
+            self.rollback()
+        return False  # never suppress the exception
+
     @property
     def backup_dir(self) -> Path:
         if self._backup_dir is None:
             stamp = self.created_at.strftime("%Y%m%d-%H%M%S")
-            base = self.workdir / "00_meta" / MANAGE_BACKUPS_DIR
+            base = layout.meta_dir(self.workdir) / MANAGE_BACKUPS_DIR
             candidate = base / f"{stamp}-{self.operation}"
             counter = 1
             while candidate.exists():
@@ -147,13 +160,19 @@ class ManageTransaction:
     # -- write/delete helpers -------------------------------------------
 
     def write_json(self, path: Path, payload: Any, *, indent: int = 2) -> None:
+        existed = Path(path).exists()
         self.backup(path)
         write_json_atomic(path, payload, indent=indent)
+        if not existed:
+            self._created_paths.append(Path(path))
         self.record_change(path)
 
     def write_text(self, path: Path, text: str, *, encoding: str = "utf-8") -> None:
+        existed = Path(path).exists()
         self.backup(path)
         write_text_atomic(path, text, encoding=encoding)
+        if not existed:
+            self._created_paths.append(Path(path))
         self.record_change(path)
 
     def delete_file(self, path: Path) -> bool:
@@ -182,8 +201,41 @@ class ManageTransaction:
         src, dst = Path(src), Path(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
         os.replace(src, dst)
+        self._renames_done.append((src, dst))
         self.record_change(src)
         self.record_change(dst)
+
+    def rollback(self) -> None:
+        if self._committed or self._rolled_back:
+            return
+        self._rolled_back = True
+        for src, dst in reversed(self._renames_done):
+            try:
+                if Path(dst).exists():
+                    Path(src).parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(dst, src)
+            except OSError:
+                pass
+        restored: set = set()
+        for entry in self._entries:
+            try:
+                original = Path(entry.path)
+                if not original.is_absolute():
+                    original = self.workdir / original
+                backup_path = self.backup_dir / entry.backup
+                if backup_path.is_file():
+                    original.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(backup_path, original)
+                    restored.add(str(original.absolute()).lower())
+            except OSError:
+                pass
+        for path in self._created_paths:
+            try:
+                if str(Path(path).absolute()).lower() in restored:
+                    continue  # had an original; already restored above
+                Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # -- finalize ----------------------------------------------------------
 
@@ -223,7 +275,7 @@ class ManageTransaction:
 
 
 def list_backups(workdir: Path) -> List[Path]:
-    base = Path(workdir) / "00_meta" / MANAGE_BACKUPS_DIR
+    base = layout.meta_dir(workdir) / MANAGE_BACKUPS_DIR
     if not base.is_dir():
         return []
     return sorted((entry for entry in base.iterdir() if entry.is_dir()), key=lambda p: p.name, reverse=True)

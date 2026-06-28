@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from utils import workdir_layout as layout
 from utils.manage import av1an_state, reset as manage_reset, zone_patch
 from utils.manage.analytics import collect_pass_rows, sort_pass_rows, SortSpec
 from utils.manage.av1an_state import (
@@ -29,7 +30,8 @@ from utils.manage.config import (
     stale_config_warnings,
     validate_zone_text,
 )
-from utils.manage.context import context_from_plan, context_from_workdir
+from utils.manage.backup import ManageTransaction
+from utils.manage.context import MODE_FULL, context_from_plan, context_from_workdir, make_runner_item
 from utils.manage.discovery import discover_workdirs, is_workdir, resolve_argument_to_refs
 from utils.manage.scenes import (
     SceneSelector,
@@ -53,11 +55,15 @@ from utils.runner_state import (
     STAGE_AUTOBOOST_SCENE,
     STAGE_DEMUX,
     STAGE_FASTPASS,
+    STAGE_HDR_PATCH,
     STAGE_MAINPASS,
     STAGE_MUX,
     STAGE_SSIMU2,
     STAGE_VERIFY,
     STAGE_ZONE_BOUNDARIES,
+    STAGE_ZONE_RECALC,
+    autoboost_stage4_scenes,
+    display_stage_plan,
 )
 
 
@@ -987,6 +993,102 @@ class AnalyticsTest(unittest.TestCase):
         result = collect_pass_rows(self.ctx, "fastpass")
         rows = sort_pass_rows(result.rows, SortSpec(field="output_size", descending=True))
         self.assertEqual([row.index for row in rows], [2, 1, 0])
+
+
+class ModeAndTransactionTest(unittest.TestCase):
+    """Regression tests for the review fixes: mode-aware artifact resolution,
+    transaction rollback, atomic multi-chunk reset, scene-edit propagation and
+    quote-aware param tokenizing."""
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory()
+        self.fixture = ManageFixture(Path(self._tmp.name))
+        self.ctx = self.fixture.context()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_runner_item_uses_real_mode_for_stage4_scenes(self) -> None:
+        # full-mode workdir resolves stage-4 scenes to scenes.json
+        item_full = make_runner_item(self.ctx)
+        self.assertEqual(item_full.mode, "full")
+        self.assertEqual(autoboost_stage4_scenes(item_full).name, "scenes.json")
+
+        # fastpass-mode workdir must resolve to scenes-preview.json, not scenes.json
+        self.ctx.mode = "fastpass"
+        item_fast = make_runner_item(self.ctx)
+        self.assertEqual(item_fast.mode, "fastpass")
+        self.assertEqual(
+            autoboost_stage4_scenes(item_fast), layout.stage4_scenes(self.ctx.workdir, "fastpass")
+        )
+        self.assertEqual(autoboost_stage4_scenes(item_fast).name, "scenes-preview.json")
+
+        # but the stage plan is still the full pipeline (mode override for display)
+        self.assertIn(STAGE_MAINPASS, display_stage_plan(make_runner_item(self.ctx, mode=MODE_FULL)))
+
+    def test_zone_patch_fastpass_mirror_targets_av1an_scenes(self) -> None:
+        self.ctx.mode = "fastpass"
+        self.assertEqual(
+            zone_patch.pass_source_scene_file(self.ctx, "fastpass"),
+            layout.av1an_scenes(self.ctx.workdir),
+        )
+        self.assertEqual(
+            zone_patch.pass_source_scene_file(self.ctx, "mainpass"),
+            layout.final_scenes(self.ctx.workdir),
+        )
+
+    def test_tokenize_params_is_quote_and_backslash_aware(self) -> None:
+        self.assertEqual(
+            av1an_state.tokenize_params('--crf 30 --svtav1-params "tune=0 film-grain=8"'),
+            ["--crf", "30", "--svtav1-params", "tune=0 film-grain=8"],
+        )
+        self.assertEqual(av1an_state.tokenize_params("--crf -10"), ["--crf", "-10"])
+        self.assertEqual(av1an_state.tokenize_params(r"--x C:\a\b"), ["--x", r"C:\a\b"])
+
+    def test_transaction_rolls_back_on_error(self) -> None:
+        target = self.fixture.fastpass / "chunks.json"
+        original = target.read_text(encoding="utf-8")
+        created = self.fixture.video_dir / "rollback_probe.json"
+        with self.assertRaises(RuntimeError):
+            with ManageTransaction(workdir=self.fixture.workdir, operation="probe") as tx:
+                tx.write_json(target, [{"index": 999}])  # modify existing
+                tx.write_json(created, {"x": 1})  # create new
+                raise RuntimeError("boom")
+        self.assertEqual(target.read_text(encoding="utf-8"), original)  # restored
+        self.assertFalse(created.exists())  # created file removed
+
+    def test_reset_chunks_is_atomic_for_multiple(self) -> None:
+        result = manage_reset.reset_chunks(self.ctx, "fastpass", [0, 2])
+        done = load_done(self.fixture.fastpass)
+        self.assertFalse(done.is_done(0))
+        self.assertFalse(done.is_done(2))
+        self.assertTrue(done.is_done(1))
+        self.assertFalse((self.fixture.fastpass / "encode" / "00000.ivf").exists())
+        self.assertFalse((self.fixture.fastpass / "encode" / "00002.ivf").exists())
+        self.assertEqual(len(load_chunks(self.fixture.fastpass)), 3)  # geometry untouched
+        self.assertTrue(result.backup_manifest is None or result.backup_manifest.exists())
+
+    def test_delete_policy_backs_up_encode_output(self) -> None:
+        result = manage_reset.reset_chunk(self.ctx, "fastpass", 0)  # fastpass default = delete
+        self.assertIsNotNone(result.backup_manifest)
+        manifest = json.loads(result.backup_manifest.read_text(encoding="utf-8"))
+        backed = [entry["path"] for entry in manifest["files"]]
+        self.assertTrue(any("00000.ivf" in path for path in backed), f"encode output not backed up: {backed}")
+
+    def test_scene_edit_downstream_reset_mapping(self) -> None:
+        recalc = layout.recalc_scenes(self.ctx.workdir)
+        self.assertEqual(manage_reset.scene_file_producing_stage(self.ctx, recalc), STAGE_ZONE_RECALC)
+        recalc_plan = manage_reset.scene_edit_downstream_reset(self.ctx, recalc)
+        self.assertIn(STAGE_MAINPASS, recalc_plan.stages)
+        self.assertNotIn(STAGE_ZONE_RECALC, recalc_plan.stages)  # the edited stage is kept
+
+        final_plan = manage_reset.scene_edit_downstream_reset(self.ctx, layout.final_scenes(self.ctx.workdir))
+        self.assertEqual(
+            manage_reset.scene_file_producing_stage(self.ctx, layout.final_scenes(self.ctx.workdir)),
+            STAGE_HDR_PATCH,
+        )
+        self.assertIn(STAGE_MAINPASS, final_plan.stages)
+        self.assertNotIn(STAGE_ZONE_BOUNDARIES, final_plan.stages)
 
 
 if __name__ == "__main__":
